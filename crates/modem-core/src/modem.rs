@@ -1,7 +1,7 @@
 //! The modem as the application sees it: commands and samples in, events and
 //! samples out.
 //!
-//! Stage 1: one text message is one frame. Sessions, acknowledgements,
+//! For now one text message is one frame. Sessions, acknowledgements,
 //! fragmentation and presets come with the link and transport layers
 //! (`plans/PLAN.md`).
 
@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use crate::SAMPLE_RATE;
 use crate::frame::{MAX_PAYLOAD, Mode};
+use crate::resample::Resampler;
 use crate::rx::{Receiver, RxEvent, RxStats};
 use crate::tx::{TxConfig, encode_frame};
 
@@ -17,7 +18,8 @@ const FRAME_GAP: usize = 1600;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Config {
-    /// Sample rate of the audio device, Hz. Only 16000 until the core gets its resampler.
+    /// Sample rate of the audio device, Hz: 8000 to 192000. The samples of
+    /// `push_rx` and `pull_tx` are at this rate; the core converts.
     pub sample_rate: u32,
     pub tx: TxConfig,
 }
@@ -61,6 +63,9 @@ pub enum Event {
 
 pub struct Modem {
     config: Config,
+    /// Device rate → core rate and back; None when they are the same.
+    rx_resampler: Option<Resampler>,
+    tx_resampler: Option<Resampler>,
     receiver: Receiver,
     tx: VecDeque<f32>,
     next_seq: u8,
@@ -69,11 +74,15 @@ pub struct Modem {
 
 impl Modem {
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        if config.sample_rate != SAMPLE_RATE {
-            return Err(ConfigError::UnsupportedSampleRate(config.sample_rate));
+        let rate = config.sample_rate;
+        if !(8000..=192_000).contains(&rate) {
+            return Err(ConfigError::UnsupportedSampleRate(rate));
         }
+        let converts = rate != SAMPLE_RATE;
         Ok(Self {
             config,
+            rx_resampler: converts.then(|| Resampler::new(rate, SAMPLE_RATE)),
+            tx_resampler: converts.then(|| Resampler::new(SAMPLE_RATE, rate)),
             receiver: Receiver::new(),
             tx: VecDeque::new(),
             next_seq: 0,
@@ -86,9 +95,18 @@ impl Modem {
             Command::SendText(text) => {
                 let frame = encode_frame(self.next_seq, Mode::R1, text.as_bytes(), &self.config.tx)
                     .map_err(|_| CommandError::TextTooLong { max: MAX_PAYLOAD })?;
+                let mut frame = frame;
                 self.next_seq = self.next_seq.wrapping_add(1);
-                self.tx.extend(frame);
-                self.tx.extend(std::iter::repeat_n(0.0, FRAME_GAP));
+                // The pause also pushes the end of the frame out of the resampler.
+                frame.resize(frame.len() + FRAME_GAP, 0.0);
+                match &mut self.tx_resampler {
+                    Some(resampler) => {
+                        let mut converted = Vec::new();
+                        resampler.process(&frame, &mut converted);
+                        self.tx.extend(converted);
+                    }
+                    None => self.tx.extend(frame),
+                }
                 Ok(())
             }
         }
@@ -96,7 +114,14 @@ impl Modem {
 
     /// Samples from the microphone.
     pub fn push_rx(&mut self, samples: &[f32]) {
-        self.receiver.push(samples);
+        match &mut self.rx_resampler {
+            Some(resampler) => {
+                let mut converted = Vec::new();
+                resampler.process(samples, &mut converted);
+                self.receiver.push(&converted);
+            }
+            None => self.receiver.push(samples),
+        }
         while let Some(event) = self.receiver.poll() {
             self.events.push_back(match event {
                 RxEvent::Frame { payload, stats, .. } => Event::MessageReceived {
@@ -200,15 +225,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_other_sample_rates_for_now() {
-        let config = Config {
-            sample_rate: 48_000,
-            ..Config::default()
-        };
-        assert_eq!(
-            Modem::new(config).err(),
-            Some(ConfigError::UnsupportedSampleRate(48_000))
-        );
+    fn works_at_the_sample_rates_of_sound_cards() {
+        for (from, to) in [
+            (48_000, 44_100),
+            (44_100, 48_000),
+            (8000, 16_000),
+            (16_000, 96_000),
+        ] {
+            let mut alice = Modem::new(Config {
+                sample_rate: from,
+                ..Config::default()
+            })
+            .unwrap();
+            let mut bob = Modem::new(Config {
+                sample_rate: to,
+                ..Config::default()
+            })
+            .unwrap();
+            alice.command(Command::SendText("any rate".into())).unwrap();
+            alice.command(Command::SendText("twice".into())).unwrap();
+            let sent = transmit(&mut alice);
+            // 5.06 s of frames and pauses, whatever the rate of the sender
+            let seconds = sent.len() as f32 / from as f32;
+            assert!((seconds - 5.064).abs() < 0.02, "{from}: {seconds} s");
+            // The air between two sound cards: a converter of its own.
+            let mut heard = Vec::new();
+            Resampler::new(from, to).process(&sent, &mut heard);
+            for block in heard.chunks(1000) {
+                bob.push_rx(block);
+            }
+            assert_eq!(texts(&mut bob), ["any rate", "twice"], "{from} → {to}");
+        }
+    }
+
+    #[test]
+    fn rejects_impossible_sample_rates() {
+        for rate in [0, 4000, 400_000] {
+            let config = Config {
+                sample_rate: rate,
+                ..Config::default()
+            };
+            assert_eq!(
+                Modem::new(config).err(),
+                Some(ConfigError::UnsupportedSampleRate(rate))
+            );
+        }
     }
 
     #[test]

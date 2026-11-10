@@ -8,12 +8,17 @@ as sound in the voice band; speed and modulation adapt to the channel.
 No server: a static, offline-capable web app (PWA). The signal-processing core
 is written in Rust and runs in the browser as WebAssembly inside a Web Worker.
 
-**Status: stage 1 of 7.** The core has its first, robust mode: 62.5 bit/s
-over 16 tones, received down to 15 dB below white noise and through speech
-codecs down to 6 kbit/s ([measurements](docs/measurements.md),
-[protocol](docs/protocol.md)). It works from the command line; the web page
-still only loads the core. The rest is being built stage by stage — see
-[plans/PLAN.md](plans/PLAN.md).
+**Status: stage 2 of 7.** One device can send a text to another through the
+air: open [the app](https://dmitryweiner.github.io/voice-modem/) on two
+devices next to each other, turn on the microphone on both and send a text
+from one. There are no acknowledgements or retries yet, and one robust mode
+only: 62.5 bit/s over 16 tones, received down to 15 dB below white noise and
+through speech codecs down to 4.75 kbit/s
+([measurements](docs/measurements.md), [protocol](docs/protocol.md),
+[sound in the browser](docs/web-audio.md)). The rest is being built stage by
+stage — see [plans/PLAN.md](plans/PLAN.md).
+
+The same modem from the command line:
 
 ```bash
 cargo run --release -p modem-cli -- encode "Hello over the air" -o hello.wav

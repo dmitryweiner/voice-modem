@@ -274,15 +274,17 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0 and 1 are done (2026-11-10). What stage 1 settled is in
-[docs/protocol.md](../docs/protocol.md) and
-[docs/measurements.md](../docs/measurements.md). It differs from the text
-above in three places: the code of mode R1 is the convolutional one (LDPC
-comes with the fast modes at stage 4); the core takes 16 kHz only — the
-resampler moves to stage 2, where a browser first needs it; the simulator has
-no fading, packet loss or time stretching yet (stage 6, with the presets).
-Open from stage 1: iLBC loses whole frames, and AMR/EVS could not be tested
-without a real call.
+**Progress**: stages 0–2 are done (2026-11-10). What they settled is in
+[docs/protocol.md](../docs/protocol.md),
+[docs/measurements.md](../docs/measurements.md) and
+[docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
+these places: the code of mode R1 is the convolutional one (LDPC comes with
+the fast modes at stage 4); the simulator has no fading, packet loss or time
+stretching yet (stage 6, with the presets); the web app shows the input level
+and spectrum but no output meter, and the spectrum is the browser's analyser,
+not the core's. Open: iLBC loses whole frames; AMR-WB/EVS and everything a
+real call adds to the codec are untested; nothing is measured between real
+devices yet.
 
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.
