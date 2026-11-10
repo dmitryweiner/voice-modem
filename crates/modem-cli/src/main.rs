@@ -1,6 +1,16 @@
-//! Native tool for the core: text/file ⇄ WAV, runs through the channel
-//! simulator. Only reports the core version until stage 1 (plans/PLAN.md).
+//! `modem-cli`: see `modem_cli::USAGE`.
 
-fn main() {
-    println!("modem-core {}", modem_core::VERSION);
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    match modem_cli::parse(std::env::args().skip(1)).and_then(modem_cli::run) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
 }
