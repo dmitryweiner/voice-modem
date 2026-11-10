@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use modem_core::{Frame, Kind, Mode, Receiver, RxEvent, SAMPLE_RATE, TxConfig, encode_frame};
-use modem_sim::{Awgn, Chain, Channel, ClockOffset, FreqShift, Pad, rms};
+use modem_sim::{Awgn, Chain, Channel, ClockOffset, FreqShift, Pad, Reverb, rms};
 
 fn received(samples: &[f32], payload: &[u8]) -> bool {
     let mut receiver = Receiver::new();
@@ -50,6 +50,37 @@ fn main() {
             })
             .count();
         println!("  {snr:>4} dB: {good}/{TRIALS}");
+    }
+
+    println!(
+        "40-byte frames received in a room (RT60, direct sound over reflections), noise 20 dB down; mean SNR estimate:"
+    );
+    for rt60 in [0.3f32, 0.5] {
+        for direct in [6, 3, 0, -3, -6, -9, -12] {
+            let mut estimates = Vec::new();
+            for seed in 0..TRIALS / 2 {
+                let mut channel = Chain::new()
+                    .then(Pad {
+                        before: 3000,
+                        after: 2000,
+                    })
+                    .then(Reverb::new(rt60, direct as f32, seed + 100))
+                    .then(Awgn::with_snr(level, 20.0, seed));
+                let mut receiver = Receiver::new();
+                receiver.push(&channel.process(&frame));
+                if let Some(RxEvent::Frame { frame, stats, .. }) = receiver.poll()
+                    && frame.payload == payload
+                {
+                    estimates.push(stats.snr_db);
+                }
+            }
+            let mean = estimates.iter().sum::<f32>() / estimates.len().max(1) as f32;
+            println!(
+                "  {rt60} s, {direct:>3} dB: {}/{}, {mean:.1} dB",
+                estimates.len(),
+                TRIALS / 2
+            );
+        }
     }
 
     println!("frequency offset at −10 dB (received/{TRIALS}, mean estimate):");

@@ -31,6 +31,41 @@ whole band up to 8 kHz; in a 3 kHz band the same noise is 4.3 dB weaker.
 a telephone band with echoes of 12–55 ms, clipping of a ten times overdriven
 signal and a signal 60 dB down.
 
+## Mode R1 in a room, simulated (2026-11-11)
+
+The same sweep. The room is a direct sound followed by a dense tail of
+reflections that decays by 60 dB in the time RT60 (`Reverb` in `modem-sim`);
+"direct" is the energy of the direct sound over that of all reflections — it
+falls by 6 dB with every doubling of the distance. Noise is 20 dB below the
+signal: it plays no part here. 40-byte frames, 25 rooms per point.
+
+| RT60  | Direct | One set of tones (stage 3) | Four sets in turn |
+| ----- | ------ | -------------------------- | ----------------- |
+| 0.3 s | 0 dB   | 24/25                      | 25/25             |
+| 0.3 s | −3 dB  | 12/25                      | 25/25             |
+| 0.3 s | −6 dB  | 4/25                       | 25/25             |
+| 0.3 s | −9 dB  | 1/25                       | 25/25             |
+| 0.3 s | −12 dB | 3/25                       | 12/25             |
+| 0.5 s | 0 dB   | 24/25                      | 25/25             |
+| 0.5 s | −3 dB  | 11/25                      | 25/25             |
+| 0.5 s | −6 dB  | 1/25                       | 25/25             |
+| 0.5 s | −9 dB  | 0/25                       | 24/25             |
+| 0.5 s | −12 dB | 1/25                       | 14/25             |
+
+- With one set of tones the modem stopped where the reflections equal the
+  direct sound, and the SNR it reported there was −6 to −8 dB — the numbers
+  seen in the real room at 3 m just before it stopped (below). The "noise" it
+  measured was its own echo.
+- Four sets of tones used in turn move the limit by 9 dB, which in a room is
+  nearly three times the distance. Whether a real room agrees is to be
+  measured.
+- Other things unchanged by the four sets: white noise (50/50 at −15 dB),
+  frequency offsets, the codecs below. One thing improved by accident: the
+  34 s frame now survives a clock offset of ±1000 ppm (it was ±500), because
+  a window that has slipped onto the previous symbol finds no energy in its
+  own tones instead of a wrong tone.
+- Beyond −9 dB the preamble is the next thing to fail.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through
@@ -116,6 +151,14 @@ The stage 2 build (one-way text, no repeats), by the author, in a room:
   tuning; unreadable headers after a clear preamble are now reported, which
   tells the two apart.
 - iPhone and a phone call in between: not tried yet.
+
+The stage 3 build (acknowledgements and repeats), same room, MacBook and
+Android phone: texts are delivered and acknowledged both ways, greetings and
+statuses work. Received texts show SNR −2, −4, −6 dB as the distance grows;
+**at about 3 m** frames are "heard but could not be read" and nothing gets
+through. The simulated room above gives the same picture, which is what
+pointed at reverberation; the four sets of tones are the answer to it and
+have not been tried in the room yet.
 
 On a Mac the display must be awake for a browser to process sound at all:
 with the display asleep an AudioContext reports "running" while its clock

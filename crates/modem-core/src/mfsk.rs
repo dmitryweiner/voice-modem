@@ -4,6 +4,13 @@
 //! phase nor the signal level — what survives vocoders and automatic gain
 //! control. Symbol values map to tones in Gray code: a drift into the
 //! neighbouring tone costs one bit, not several.
+//!
+//! In a room the tone of a symbol rings on for many symbols. If every symbol
+//! used the same tones, that echo would sit exactly where the receiver looks
+//! for the next ones, and beyond a few metres it is louder than the direct
+//! sound. So consecutive symbols use different sets of tones, interleaved on
+//! one grid: the echo of the last `sets - 1` symbols falls between the tones
+//! of the current one.
 
 use std::f32::consts::TAU;
 
@@ -17,9 +24,13 @@ pub struct MfskParams {
     pub symbol_len: usize,
     /// Frequency of the lowest tone, Hz.
     pub first_tone_hz: f32,
-    /// Distance between neighbouring tones, Hz. A multiple of
-    /// `SAMPLE_RATE / symbol_len` keeps the tones orthogonal.
+    /// Distance between neighbouring frequencies of the grid, Hz. A multiple
+    /// of `SAMPLE_RATE / symbol_len` keeps the tones orthogonal.
     pub spacing_hz: f32,
+    /// The grid is shared by this many sets of tones used in turn: symbol
+    /// `n` takes every `sets`-th frequency starting from number `n % sets`.
+    /// The echo of a symbol then falls between the tones of the next ones.
+    pub sets: usize,
 }
 
 impl MfskParams {
@@ -27,8 +38,9 @@ impl MfskParams {
         1 << self.bits_per_symbol
     }
 
-    pub fn tone_hz(&self, tone: usize) -> f32 {
-        self.first_tone_hz + self.spacing_hz * tone as f32
+    /// Frequency of a tone in symbol number `index` of a block.
+    pub fn tone_hz(&self, tone: usize, index: usize) -> f32 {
+        self.first_tone_hz + self.spacing_hz * (tone * self.sets + index % self.sets) as f32
     }
 }
 
@@ -53,6 +65,8 @@ pub struct Modulator {
     params: MfskParams,
     amplitude: f32,
     phase: f32,
+    /// Number of the next symbol.
+    index: usize,
 }
 
 impl Modulator {
@@ -61,13 +75,15 @@ impl Modulator {
             params,
             amplitude,
             phase: 0.0,
+            index: 0,
         }
     }
 
     /// Appends the samples of one symbol with the given value to `out`.
     pub fn symbol(&mut self, value: usize, out: &mut Vec<f32>) {
         debug_assert!(value < self.params.tones());
-        let step = TAU * self.params.tone_hz(tone_of(value)) / SAMPLE_RATE as f32;
+        let step = TAU * self.params.tone_hz(tone_of(value), self.index) / SAMPLE_RATE as f32;
+        self.index += 1;
         for _ in 0..self.params.symbol_len {
             out.push(self.amplitude * self.phase.sin());
             self.phase = (self.phase + step) % TAU;
@@ -75,13 +91,18 @@ impl Modulator {
     }
 }
 
-/// Energy of every tone in one symbol; `freq_offset_hz` is how far the
-/// received signal is shifted up from the nominal frequencies.
-pub fn tone_energies(params: &MfskParams, samples: &[f32], freq_offset_hz: f32) -> Vec<f32> {
+/// Energy of every tone of symbol number `index` of a block; `freq_offset_hz`
+/// is how far the received signal is shifted up from the nominal frequencies.
+pub fn tone_energies(
+    params: &MfskParams,
+    samples: &[f32],
+    index: usize,
+    freq_offset_hz: f32,
+) -> Vec<f32> {
     debug_assert_eq!(samples.len(), params.symbol_len);
     (0..params.tones())
         .map(|tone| {
-            let step = TAU * (params.tone_hz(tone) + freq_offset_hz) / SAMPLE_RATE as f32;
+            let step = TAU * (params.tone_hz(tone, index) + freq_offset_hz) / SAMPLE_RATE as f32;
             let (rotate_sin, rotate_cos) = step.sin_cos();
             let (mut cos, mut sin) = (1.0f32, 0.0f32);
             let (mut re, mut im) = (0.0f32, 0.0f32);
@@ -125,6 +146,7 @@ mod tests {
         symbol_len: 512,
         first_tone_hz: 750.0,
         spacing_hz: 125.0,
+        sets: 1,
     };
 
     fn hard(llrs: &[f32]) -> usize {
@@ -135,8 +157,60 @@ mod tests {
     #[test]
     fn tone_frequencies() {
         assert_eq!(PARAMS.tones(), 16);
-        assert_eq!(PARAMS.tone_hz(0), 750.0);
-        assert_eq!(PARAMS.tone_hz(15), 2625.0);
+        assert_eq!(PARAMS.tone_hz(0, 0), 750.0);
+        assert_eq!(PARAMS.tone_hz(15, 7), 2625.0);
+    }
+
+    const HOPPING: MfskParams = MfskParams {
+        spacing_hz: 31.25,
+        sets: 4,
+        ..PARAMS
+    };
+
+    #[test]
+    fn sets_of_tones_take_turns_on_one_grid() {
+        // symbol 0 uses 750, 875, …; symbol 1 the frequencies one grid step up; symbol 4 is back
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|index| HOPPING.tone_hz(0, index)),
+            [750.0, 781.25, 812.5, 843.75, 750.0]
+        );
+        assert_eq!(HOPPING.tone_hz(1, 0) - HOPPING.tone_hz(0, 0), 125.0);
+        assert_eq!(HOPPING.tone_hz(15, 3), 2718.75);
+    }
+
+    #[test]
+    fn every_value_comes_back_in_every_set() {
+        let mut modulator = Modulator::new(HOPPING, 0.5);
+        for index in 0..64 {
+            let value = (index * 7) % 16;
+            let mut samples = Vec::new();
+            modulator.symbol(value, &mut samples);
+            let mut llrs = Vec::new();
+            soft_bits(
+                &HOPPING,
+                &tone_energies(&HOPPING, &samples, index, 0.0),
+                &mut llrs,
+            );
+            assert_eq!(hard(&llrs), value, "symbol {index}");
+        }
+    }
+
+    #[test]
+    fn the_previous_symbols_are_not_where_the_receiver_looks() {
+        let mut modulator = Modulator::new(HOPPING, 1.0);
+        let mut samples = Vec::new();
+        for value in [5, 5, 5, 5, 5] {
+            modulator.symbol(value, &mut samples);
+        }
+        let own = tone_energies(&HOPPING, &samples[..512], 0, 0.0);
+        let sent = tone_of(5);
+        // the same samples seen as symbols 1–3 would be: nothing on any tone
+        for index in 1..4 {
+            let other = tone_energies(&HOPPING, &samples[..512], index, 0.0);
+            assert!(other.iter().all(|&e| e < own[sent] * 1e-4), "set {index}");
+        }
+        // four symbols later the same tones are in use again
+        assert!(tone_energies(&HOPPING, &samples[4 * 512..], 4, 0.0)[sent] > own[sent] * 0.99);
     }
 
     #[test]
@@ -147,7 +221,11 @@ mod tests {
             modulator.symbol(value, &mut samples);
             assert_eq!(samples.len(), PARAMS.symbol_len);
             let mut llrs = Vec::new();
-            soft_bits(&PARAMS, &tone_energies(&PARAMS, &samples, 0.0), &mut llrs);
+            soft_bits(
+                &PARAMS,
+                &tone_energies(&PARAMS, &samples, 0, 0.0),
+                &mut llrs,
+            );
             assert_eq!(hard(&llrs), value);
         }
     }
@@ -156,7 +234,7 @@ mod tests {
     fn only_the_sent_tone_has_energy() {
         let mut samples = Vec::new();
         Modulator::new(PARAMS, 1.0).symbol(0b0110, &mut samples);
-        let energies = tone_energies(&PARAMS, &samples, 0.0);
+        let energies = tone_energies(&PARAMS, &samples, 0, 0.0);
         let sent = tone_of(0b0110);
         let expected = (PARAMS.symbol_len as f32 / 2.0).powi(2);
         assert!((energies[sent] / expected - 1.0).abs() < 0.01);
@@ -210,7 +288,11 @@ mod tests {
         let mut samples = Vec::new();
         Modulator::new(shifted, 0.5).symbol(9, &mut samples);
         let mut llrs = Vec::new();
-        soft_bits(&PARAMS, &tone_energies(&PARAMS, &samples, 60.0), &mut llrs);
+        soft_bits(
+            &PARAMS,
+            &tone_energies(&PARAMS, &samples, 0, 60.0),
+            &mut llrs,
+        );
         assert_eq!(hard(&llrs), 9);
     }
 
@@ -219,9 +301,13 @@ mod tests {
         let mut samples = Vec::new();
         Modulator::new(PARAMS, 0.5).symbol(5, &mut samples);
         let (mut loud, mut quiet) = (Vec::new(), Vec::new());
-        soft_bits(&PARAMS, &tone_energies(&PARAMS, &samples, 0.0), &mut loud);
+        soft_bits(
+            &PARAMS,
+            &tone_energies(&PARAMS, &samples, 0, 0.0),
+            &mut loud,
+        );
         let half: Vec<f32> = samples.iter().map(|x| x * 0.5).collect();
-        soft_bits(&PARAMS, &tone_energies(&PARAMS, &half, 0.0), &mut quiet);
+        soft_bits(&PARAMS, &tone_energies(&PARAMS, &half, 0, 0.0), &mut quiet);
         for (a, b) in loud.iter().zip(&quiet) {
             assert!((a / b - 2.0).abs() < 0.01);
         }

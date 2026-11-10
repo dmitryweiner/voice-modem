@@ -15,8 +15,9 @@ pub const HEADER_BYTES: usize = 7;
 /// How the payload of a frame is modulated and coded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Robust: 16 tones 750–2625 Hz every 125 Hz, 32 ms symbols, rate 1/2
-    /// convolutional code; 62.5 bit/s.
+    /// Robust: 16 tones 125 Hz apart from four sets used in turn (64
+    /// frequencies 750–2719 Hz), 32 ms symbols, rate 1/2 convolutional code;
+    /// 62.5 bit/s.
     R1,
 }
 
@@ -43,7 +44,8 @@ impl Mode {
                 bits_per_symbol: 4,
                 symbol_len: 512,
                 first_tone_hz: 750.0,
-                spacing_hz: 125.0,
+                spacing_hz: 31.25,
+                sets: 4,
             },
         }
     }

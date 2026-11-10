@@ -152,6 +152,57 @@ impl Channel for Echo {
     }
 }
 
+/// A room: the direct sound followed by a dense, exponentially decaying tail
+/// of reflections. Unlike `Echo`, the tail lasts many symbols — what limits
+/// the range between a speaker and a microphone indoors.
+pub struct Reverb {
+    /// The impulse response after the direct sound, one sample apart.
+    tail: Vec<f32>,
+}
+
+impl Reverb {
+    /// `rt60` — the time in seconds for the reverberation to decay by 60 dB
+    /// (0.3–0.6 in a furnished room). `direct_db` — the energy of the direct
+    /// sound over that of all reflections: positive next to the speaker,
+    /// about 0 at a metre or two, negative across the room.
+    pub fn new(rt60: f32, direct_db: f32, seed: u64) -> Self {
+        let mut rng = Rng::new(seed);
+        // Down to −50 dB; the first reflections come a few milliseconds after the direct sound.
+        let len = (rt60 * 50.0 / 60.0 * SAMPLE_RATE as f32) as usize;
+        let decay = (-6.908 / (rt60 * SAMPLE_RATE as f32)).exp();
+        let mut envelope = 1.0f32;
+        let mut tail: Vec<f32> = (0..len)
+            .map(|n| {
+                envelope *= decay;
+                if n < 48 {
+                    0.0
+                } else {
+                    envelope * rng.gaussian()
+                }
+            })
+            .collect();
+        let energy: f32 = tail.iter().map(|h| h * h).sum();
+        let gain = (10f32.powf(-direct_db / 10.0) / energy).sqrt();
+        tail.iter_mut().for_each(|h| *h *= gain);
+        Self { tail }
+    }
+}
+
+impl Channel for Reverb {
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut output = input.to_vec();
+        output.resize(input.len() + self.tail.len(), 0.0);
+        for (i, &x) in input.iter().enumerate() {
+            if x != 0.0 {
+                for (out, &h) in output[i + 1..].iter_mut().zip(&self.tail) {
+                    *out += x * h;
+                }
+            }
+        }
+        output
+    }
+}
+
 /// A second-order filter section (RBJ cookbook), direct form 1.
 struct Biquad {
     b: [f32; 3],
@@ -360,6 +411,29 @@ mod tests {
     fn echo_adds_delayed_copies() {
         let output = Echo(vec![(2, 0.5), (3, -0.25)]).process(&[1.0, 0.0, 0.0]);
         assert_eq!(output, [1.0, 0.0, 0.5, -0.25, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn reverb_has_the_asked_decay_and_level() {
+        let mut click = vec![0.0; 16_000];
+        click[0] = 1.0;
+        let response = Reverb::new(0.4, -3.0, 5).process(&click);
+        assert_eq!(response[0], 1.0);
+        // the reflections together carry 3 dB more energy than the direct sound
+        let reflected: f32 = response[1..].iter().map(|h| h * h).sum();
+        assert!((10.0 * reflected.log10() - 3.0).abs() < 0.01, "{reflected}");
+        // 0.1 s later the tail is 15 dB down: a quarter of RT60
+        let level = |from: usize| {
+            10.0 * response[from..from + 800]
+                .iter()
+                .map(|h| h * h)
+                .sum::<f32>()
+                .log10()
+        };
+        let drop = level(160) - level(1760);
+        assert!((drop - 15.0).abs() < 1.5, "{drop}");
+        // the same seed, the same room
+        assert_eq!(response, Reverb::new(0.4, -3.0, 5).process(&click));
     }
 
     #[test]

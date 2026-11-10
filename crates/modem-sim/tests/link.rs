@@ -5,7 +5,7 @@ use modem_core::{
     Config, Event, Frame, Kind, Mode, Modem, Receiver, RxEvent, RxStats, TxConfig, encode_frame,
 };
 use modem_sim::{
-    Awgn, BandPass, Chain, Channel, Clip, ClockOffset, Echo, FreqShift, Gain, Pad, rms,
+    Awgn, BandPass, Chain, Channel, Clip, ClockOffset, Echo, FreqShift, Gain, Pad, Reverb, rms,
 };
 
 fn payload(len: usize) -> Vec<u8> {
@@ -120,6 +120,23 @@ fn telephone_band_with_room_echo_and_noise() {
         .then(Awgn::with_snr(rms(&frame), -6.0, 3))
         .process(&frame);
     stats_of(&receive(&heard), &payload);
+}
+
+#[test]
+fn across_a_reverberant_room() {
+    let payload = payload(40);
+    let frame = frame(&payload);
+    // The reflections carry four times the energy of the direct sound and
+    // take half a second to die away: several metres from a small speaker.
+    // With one set of tones the modem stops at equal energies (0 dB).
+    for seed in 0..12 {
+        let room = Reverb::new(0.5, -6.0, 100 + seed);
+        let heard = padded()
+            .then(room)
+            .then(Awgn::with_snr(rms(&frame), 10.0, seed))
+            .process(&frame);
+        stats_of(&receive(&heard), &payload);
+    }
 }
 
 #[test]
