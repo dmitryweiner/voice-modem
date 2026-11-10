@@ -7,7 +7,7 @@ import { SILENT, type Meter } from './audio/meter';
 import { LOCALE_NAMES, LOCALES } from './i18n';
 import { loadSettings, type KeyValueStorage } from './storage';
 import type { CoreClient } from './worker/client';
-import type { CoreEvent } from './worker/protocol';
+import type { CoreEvent, StationOptions } from './worker/protocol';
 
 function $<T extends Element>(selector: string, type: abstract new () => T): T {
   const el = document.querySelector(selector);
@@ -30,16 +30,24 @@ class MemoryStorage implements KeyValueStorage {
 /** A modem core that records what it is asked and says what the test tells it to. */
 function fakeCore(overrides: Partial<CoreClient> = {}) {
   const listeners = new Set<(event: CoreEvent) => void>();
-  const calls = { started: [] as [number, MessagePort][], sent: [] as string[], stopped: 0 };
+  const calls = { started: [] as [number, MessagePort, StationOptions][], sent: [] as string[], stopped: 0, hello: 0, ptt: 0 };
   const client: CoreClient = {
     version: () => Promise.resolve('1.2.3'),
-    start(sampleRate, port) {
-      calls.started.push([sampleRate, port]);
+    start(sampleRate, port, options) {
+      calls.started.push([sampleRate, port, options]);
       return Promise.resolve({ maxTextBytes: 10 });
     },
     sendText(message) {
       calls.sent.push(message);
-      return Promise.resolve({ seconds: 3.96 });
+      return Promise.resolve({ id: calls.sent.length });
+    },
+    hello() {
+      calls.hello++;
+      return Promise.resolve();
+    },
+    ptt() {
+      calls.ptt++;
+      return Promise.resolve();
     },
     stop() {
       calls.stopped++;
@@ -194,7 +202,7 @@ describe('microphone', () => {
   it('turns on: the audio device starts and its port goes to the modem', async () => {
     const { core, audio } = await listening();
     expect(audio.startAudio).toHaveBeenCalledTimes(1);
-    expect(core.calls.started).toEqual([[48_000, audio.port]]);
+    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false }]]);
     expect(text('#state')).toBe('Listening');
     expect(text('#mic')).toBe('Turn off');
     expect(exists('#level') && exists('#spectrum') && exists('#draft')).toBe(true);
@@ -278,11 +286,13 @@ describe('input meter', () => {
   });
 });
 
+const received = (message: string, snrDb = 3): CoreEvent => ({ kind: 'message', text: message, station: 7, snrDb, freqOffsetHz: 0 });
+
 describe('messages', () => {
   it('shows a received text with its quality', async () => {
     const { core } = await listening();
     expect(text('.empty')).toBe('Nothing yet. Texts sent and received appear here.');
-    core.emit({ kind: 'message', text: 'Привет!', snrDb: 11.6, freqOffsetHz: 2 });
+    core.emit(received('Привет!', 11.6));
     expect(text('#feed .received .text')).toBe('Привет!');
     expect(text('#feed .received small')).toBe('Received · signal +12 dB to noise');
     expect(exists('.empty')).toBe(false);
@@ -291,31 +301,54 @@ describe('messages', () => {
   it('says when a message was heard but not read', async () => {
     const { core } = await listening();
     core.emit({ kind: 'frameLost', snrDb: -20, freqOffsetHz: 0 });
-    expect(text('#feed .lost')).toBe('A message was heard but could not be read.');
+    expect(text('#feed .note')).toBe('A message was heard but could not be read.');
   });
 
-  it('sends a text: transmitting until the last sample is played', async () => {
+  it('sends a text and follows it to delivery', async () => {
     const { core } = await listening();
     expect($('#send', HTMLButtonElement).disabled).toBe(true);
     await send('  hello ');
     expect(core.calls.sent).toEqual(['hello']);
     expect(text('#feed .sent .text')).toBe('hello');
-    expect(text('#feed .sent small')).toBe('Sending… · 4.0 s');
-    expect(text('#state')).toBe('Transmitting…');
+    expect(text('#feed .sent small')).toBe('Sending…');
     expect($('#draft', HTMLInputElement).value).toBe('');
 
-    // nothing else goes out meanwhile
-    await send('again');
-    expect(core.calls.sent).toEqual(['hello']);
-    expect($('#send', HTMLButtonElement).disabled).toBe(true);
-
+    core.emit({ kind: 'txStart', seconds: 4 });
+    expect(text('#state')).toBe('Transmitting…');
     core.emit({ kind: 'txEnd' });
     expect(text('#state')).toBe('Listening');
-    expect(text('#feed .sent small')).toBe('Sent · 4.0 s');
-    expect($('#send', HTMLButtonElement).disabled).toBe(false);
+    expect(text('#feed .sent small')).toBe('Sending…');
+
+    core.emit({ kind: 'delivered', id: 1 });
+    expect(text('#feed .sent small')).toBe('Delivered');
+    expect($('#feed .sent', HTMLElement).dataset.status).toBe('delivered');
   });
 
-  it('does not send an empty text or one longer than a frame, counted in bytes', async () => {
+  it('shows the repeats and the failure of a text nobody answers', async () => {
+    const { core } = await listening();
+    await send('hello');
+    core.emit({ kind: 'retry', id: 1, attempt: 2 });
+    expect(text('#feed .sent small')).toBe('Sending… · attempt 2');
+    core.emit({ kind: 'retry', id: 1, attempt: 3 });
+    expect(text('#feed .sent small')).toBe('Sending… · attempt 3');
+    core.emit({ kind: 'failed', id: 1 });
+    expect(text('#feed .sent small')).toBe('Not delivered: no answer');
+    expect($('#feed .sent', HTMLElement).dataset.status).toBe('failed');
+  });
+
+  it('queues more texts while one is on its way, each with its own fate', async () => {
+    const { core } = await listening();
+    await send('one');
+    core.emit({ kind: 'txStart', seconds: 4 });
+    await send('two');
+    expect(core.calls.sent).toEqual(['one', 'two']);
+    core.emit({ kind: 'failed', id: 1 });
+    core.emit({ kind: 'delivered', id: 2 });
+    const notes = [...document.querySelectorAll('#feed .sent small')].map((note) => note.textContent);
+    expect(notes).toEqual(['Not delivered: no answer', 'Delivered']);
+  });
+
+  it('does not send an empty text or one that is too long, counted in bytes', async () => {
     const { core } = await listening();
     await send('   ');
     await send('12345678901');
@@ -334,17 +367,102 @@ describe('messages', () => {
     await send('hello');
     expect(text('#send-failed')).toBe('The text was not sent.');
     expect($('#draft', HTMLInputElement).value).toBe('hello');
-    expect(text('#state')).toBe('Listening');
     expect(exists('#feed')).toBe(false);
   });
 
   it('keeps the messages when the language changes and when the microphone is turned off', async () => {
     const { core } = await listening();
-    core.emit({ kind: 'message', text: 'stays', snrDb: 3, freqOffsetHz: 0 });
+    core.emit(received('stays'));
+    await send('pending');
     selectLocale('ru');
     expect(text('#feed .received small')).toBe('Принято · сигнал/шум +3 дБ');
     expect(text('#state')).toBe('Приём');
     await press(() => $('#mic', HTMLButtonElement).click());
     expect(text('#feed .received .text')).toBe('stays');
+    // what was on its way when the modem was turned off will not be acknowledged
+    expect(text('#feed .sent small')).toBe('Не доставлено: нет ответа');
+  });
+});
+
+const typeName = (name: string) => fireEvent.change($('#name', HTMLInputElement), { target: { value: name } });
+
+describe('station', () => {
+  it('remembers the name and the kind of radio, and gives them to the modem', async () => {
+    const { storage, core } = await start();
+    typeName('UB1XYZ');
+    fireEvent.click($('#ptt-mode', HTMLInputElement));
+    expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true });
+    await press(() => $('#mic', HTMLButtonElement).click());
+    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true });
+
+    cleanup();
+    await start({ storage });
+    expect($('#name', HTMLInputElement).value).toBe('UB1XYZ');
+    expect($('#ptt-mode', HTMLInputElement).checked).toBe(true);
+  });
+
+  it('cannot be changed while the modem runs', async () => {
+    await listening();
+    expect($('.station', HTMLFieldSetElement).disabled).toBe(true);
+    await press(() => $('#mic', HTMLButtonElement).click());
+    expect($('.station', HTMLFieldSetElement).disabled).toBe(false);
+  });
+
+  it('says hello and shows who is on the channel', async () => {
+    const { core } = await listening();
+    await press(() => $('#hello', HTMLButtonElement).click());
+    expect(core.calls.hello).toBe(1);
+    core.emit({ kind: 'hello', name: 'Боб', station: 9 });
+    core.emit({ kind: 'hello', name: '', station: 10 });
+    const notes = [...document.querySelectorAll('#feed .peer')].map((note) => note.textContent);
+    expect(notes).toEqual(['Боб is on the channel.', 'A station is on the channel.']);
+  });
+});
+
+/** The app as a push-to-talk radio, microphone on. */
+async function radio() {
+  const started = await start();
+  fireEvent.click($('#ptt-mode', HTMLInputElement));
+  await press(() => $('#mic', HTMLButtonElement).click());
+  return started;
+}
+
+describe('push-to-talk', () => {
+  it('asks for the button when the modem has something to transmit', async () => {
+    const { core } = await radio();
+    expect(exists('#ptt')).toBe(false);
+    core.emit({ kind: 'txRequest' });
+    expect(text('#ptt p')).toBe('Press and hold the button of the radio, then press here or the space bar.');
+
+    await press(() => $('#ptt-button', HTMLButtonElement).click());
+    expect(core.calls.ptt).toBe(1);
+    expect(exists('#ptt')).toBe(false);
+    core.emit({ kind: 'txStart', seconds: 5 });
+    expect(text('#state')).toBe('Transmitting… keep the button pressed');
+    core.emit({ kind: 'txEnd' });
+    expect(text('#state')).toBe('Listening');
+  });
+
+  it('takes the space bar for the button, but not while a text is typed', async () => {
+    const { core } = await radio();
+    core.emit({ kind: 'txRequest' });
+    fireEvent.keyDown($('#draft', HTMLInputElement), { code: 'Space' });
+    expect(core.calls.ptt).toBe(0);
+    fireEvent.keyDown(document.body, { code: 'Enter' });
+    expect(core.calls.ptt).toBe(0);
+    await press(() => fireEvent.keyDown(document.body, { code: 'Space' }));
+    expect(core.calls.ptt).toBe(1);
+    expect(exists('#ptt')).toBe(false);
+    // no request, no key
+    fireEvent.keyDown(document.body, { code: 'Space' });
+    expect(core.calls.ptt).toBe(1);
+  });
+
+  it('forgets the request when the microphone is turned off', async () => {
+    const { core } = await radio();
+    core.emit({ kind: 'txRequest' });
+    await press(() => $('#mic', HTMLButtonElement).click());
+    await press(() => $('#mic', HTMLButtonElement).click());
+    expect(exists('#ptt')).toBe(false);
   });
 });

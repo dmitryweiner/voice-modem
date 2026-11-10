@@ -8,6 +8,7 @@
   "scripts": {
     "wasm": "wasm-pack build crates/modem-wasm --target web --out-dir ../../src/wasm",
     "dev": "npm run wasm && vite",
+    "dev:lan": "npm run wasm && vite --host --mode lan",
     "build": "npm run wasm && tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
@@ -29,6 +30,7 @@
     "@types/node": "^24.19.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
     "@vitejs/plugin-react": "^6.0.4",
     "jsdom": "^29.1.1",
     "oxlint": "^1.90.0",

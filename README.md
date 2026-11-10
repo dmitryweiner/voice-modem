@@ -8,12 +8,17 @@ as sound in the voice band; speed and modulation adapt to the channel.
 No server: a static, offline-capable web app (PWA). The signal-processing core
 is written in Rust and runs in the browser as WebAssembly inside a Web Worker.
 
-**Status: stage 2 of 7.** One device can send a text to another through the
-air: open [the app](https://dmitryweiner.github.io/voice-modem/) on two
-devices next to each other, turn on the microphone on both and send a text
-from one. There are no acknowledgements or retries yet, and one robust mode
-only: 62.5 bit/s over 16 tones, received down to 15 dB below white noise and
-through speech codecs down to 4.75 kbit/s
+**Status: stage 3 of 7.** Two devices exchange texts through the air: open
+[the app](https://dmitryweiner.github.io/voice-modem/) on both, next to each
+other, turn on the microphone and write. Every text is acknowledged by the
+other side and repeated until it is, up to five times; the sender sees
+"delivered" or "not delivered". Stations take turns, can greet each other by
+name, and a radio with a push-to-talk button is supported: the app asks when
+to press it.
+
+One robust mode only so far: 62.5 bit/s over 16 tones, received down to 15 dB
+below white noise and through speech codecs down to 4.75 kbit/s; over the air
+between a laptop and a phone it has worked up to about 4 m
 ([measurements](docs/measurements.md), [protocol](docs/protocol.md),
 [sound in the browser](docs/web-audio.md)). The rest is being built stage by
 stage — see [plans/PLAN.md](plans/PLAN.md).
@@ -35,6 +40,7 @@ Needs Node (the version in `.node-version`), a Rust toolchain with the
 fnm use            # Node from .node-version
 npm ci
 npm run dev        # builds the WASM core, then the dev server
+npm run dev:lan    # the same on the local network over HTTPS, to test on a phone
 npm run check      # cargo fmt/clippy/test + WASM build + typecheck + lint + unit tests
 npm run smoke      # browser smoke (-- --preview for the build and offline)
 node scripts/codecs.mjs   # the modem through speech codecs (needs ffmpeg)

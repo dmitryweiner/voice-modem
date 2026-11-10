@@ -11,6 +11,8 @@ export const en = {
   coreLoading: 'Loading the modem core…',
   coreFailed: 'The modem core did not load.',
 
+  nameLabel: 'Your name or callsign',
+  pttLabel: 'A radio with a push-to-talk button that I press myself',
   micOn: 'Turn the microphone on',
   micOff: 'Turn off',
   micStarting: 'Starting…',
@@ -20,6 +22,9 @@ export const en = {
   micFailed: 'The audio device did not start.',
   listening: 'Listening',
   transmitting: 'Transmitting…',
+  pttPrompt: 'Press and hold the button of the radio, then press here or the space bar.',
+  pttButton: 'Transmit',
+  pttHold: 'Transmitting… keep the button pressed',
   inputLevel: 'Input level',
   clipping: 'Too loud: turn the volume down or move the devices apart.',
   spectrum: 'Spectrum of the input, 0 to 4 kHz',
@@ -27,16 +32,21 @@ export const en = {
   noMessages: 'Nothing yet. Texts sent and received appear here.',
   messageLabel: 'Text to send',
   send: 'Send',
+  hello: 'Say hello',
   received: 'Received',
   sending: 'Sending…',
   sent: 'Sent',
+  delivered: 'Delivered',
+  notDelivered: 'Not delivered: no answer',
+  peerAnonymous: 'A station is on the channel.',
   frameLost: 'A message was heard but could not be read.',
   sendFailed: 'The text was not sent.',
 
   coreReady: (version: string) => `Modem core ${version} is ready.`,
   tooLong: (bytes: number) => `Too long by ${bytes} ${plural('en', bytes, { one: 'byte', other: 'bytes' })}.`,
   snr: (db: number) => `signal ${signed(db)} dB to noise`,
-  seconds: (seconds: number) => `${seconds.toFixed(1)} s`,
+  attempt: (attempt: number) => `attempt ${attempt}`,
+  peerNamed: (name: string) => `${name} is on the channel.`,
 };
 
 export type Messages = typeof en;

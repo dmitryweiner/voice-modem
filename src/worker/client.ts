@@ -1,4 +1,4 @@
-import { isWorkerOut, type CoreEvent, type WorkerIn, type WorkerOut } from './protocol';
+import { isWorkerOut, type CoreEvent, type StationOptions, type WorkerIn, type WorkerOut } from './protocol';
 
 /** What the UI can ask the modem core for. */
 export interface CoreClient {
@@ -7,9 +7,13 @@ export interface CoreClient {
    * Connects the modem to an audio device: its sample rate and the page's end
    * of the channel to the AudioWorklet (the port is handed over to the worker).
    */
-  start(sampleRate: number, port: MessagePort): Promise<{ maxTextBytes: number }>;
-  /** Transmits a text; resolves when the sound is queued, with its length. */
-  sendText(text: string): Promise<{ seconds: number }>;
+  start(sampleRate: number, port: MessagePort, options: StationOptions): Promise<{ maxTextBytes: number }>;
+  /** Queues a text for transmission; events tell its fate under the returned id. */
+  sendText(text: string): Promise<{ id: number }>;
+  /** Transmits a greeting with the name of this station. */
+  hello(): Promise<void>;
+  /** Push-to-talk: the button of the radio is down, transmit what is waiting. */
+  ptt(): Promise<void>;
   stop(): Promise<void>;
   /** Calls the listener for every event of the modem; returns the unsubscribe function. */
   onEvent(listener: (event: CoreEvent) => void): () => void;
@@ -69,26 +73,30 @@ export function coreClient(createWorker: () => WorkerPort): CoreClient {
       worker.postMessage({ ...message, jobId }, transfer);
     });
 
+  const done = async (message: Request) => {
+    const reply = await request(message);
+    if (reply.type !== 'done') throw unexpected(reply);
+  };
+
   return {
     async version() {
       const reply = await request({ type: 'version' });
       if (reply.type !== 'version') throw unexpected(reply);
       return reply.version;
     },
-    async start(sampleRate, port) {
-      const reply = await request({ type: 'start', sampleRate, port }, [port]);
+    async start(sampleRate, port, options) {
+      const reply = await request({ type: 'start', sampleRate, port, ...options }, [port]);
       if (reply.type !== 'started') throw unexpected(reply);
       return { maxTextBytes: reply.maxTextBytes };
     },
     async sendText(text) {
       const reply = await request({ type: 'sendText', text });
-      if (reply.type !== 'sent') throw unexpected(reply);
-      return { seconds: reply.seconds };
+      if (reply.type !== 'queued') throw unexpected(reply);
+      return { id: reply.id };
     },
-    async stop() {
-      const reply = await request({ type: 'stop' });
-      if (reply.type !== 'stopped') throw unexpected(reply);
-    },
+    hello: () => done({ type: 'hello' }),
+    ptt: () => done({ type: 'ptt' }),
+    stop: () => done({ type: 'stop' }),
     onEvent(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);

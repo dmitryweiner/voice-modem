@@ -66,13 +66,26 @@ export async function ensureServer(preview) {
 }
 
 /**
- * Starts the server and a browser (with extra command-line `browserArgs`).
+ * On a Mac whose display sleeps, Chromium's audio stops: an AudioContext says
+ * "running" while its clock stands still, and a fake microphone is silent.
+ * `caffeinate -u` declares the user active (and wakes the display) for as long
+ * as this process lives.
+ */
+function keepAwake() {
+  if (process.platform !== 'darwin') return null;
+  return spawn('caffeinate', ['-u', '-d', '-w', String(process.pid)], { stdio: 'ignore' }).on('error', () => {});
+}
+
+/**
+ * Starts the server and a browser (with extra command-line `browserArgs`;
+ * `audio: true` when the page will use sound).
  * `open({ locale, viewport })` makes a fresh
  * context (empty storage, the given browser language) and loads the app.
  * Console errors and page errors of every page land in `errors`, tagged with
  * the step set by `label(text)`.
  */
-export async function launch({ preview = false, browserArgs = [] } = {}) {
+export async function launch({ preview = false, browserArgs = [], audio = false } = {}) {
+  const awake = audio ? keepAwake() : null;
   const { base, proc } = await ensureServer(preview);
   // In a cloud container Playwright may miss its own chromium while another
   // is installed: PLAYWRIGHT_BROWSER gives its path.
@@ -101,6 +114,7 @@ export async function launch({ preview = false, browserArgs = [] } = {}) {
     async close() {
       await browser.close();
       proc?.kill();
+      awake?.kill();
     },
   };
 }

@@ -7,19 +7,29 @@
 
 use std::time::Instant;
 
-use modem_core::{Mode, Receiver, RxEvent, SAMPLE_RATE, TxConfig, encode_frame};
+use modem_core::{Frame, Kind, Mode, Receiver, RxEvent, SAMPLE_RATE, TxConfig, encode_frame};
 use modem_sim::{Awgn, Chain, Channel, ClockOffset, FreqShift, Pad, rms};
 
 fn received(samples: &[f32], payload: &[u8]) -> bool {
     let mut receiver = Receiver::new();
     receiver.push(samples);
-    matches!(receiver.poll(), Some(RxEvent::Frame { payload: got, .. }) if got == payload)
+    matches!(receiver.poll(), Some(RxEvent::Frame { frame, .. }) if frame.payload == payload)
+}
+
+fn encode(payload: &[u8]) -> Vec<f32> {
+    let frame = Frame {
+        kind: Kind::Data,
+        station: 1,
+        seq: 1,
+        payload: payload.to_vec(),
+    };
+    encode_frame(&frame, Mode::R1, &TxConfig::default()).unwrap()
 }
 
 fn main() {
     const TRIALS: u64 = 50;
     let payload: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(37)).collect();
-    let frame = encode_frame(1, Mode::R1, &payload, &TxConfig::default()).unwrap();
+    let frame = encode(&payload);
     let level = rms(&frame);
 
     println!("40-byte frames received, white noise (SNR in the 8 kHz band):");
@@ -68,7 +78,7 @@ fn main() {
 
     println!("clock offset, a full 255-byte frame (34 s), no noise:");
     let long: Vec<u8> = (0..255u8).collect();
-    let long_frame = encode_frame(1, Mode::R1, &long, &TxConfig::default()).unwrap();
+    let long_frame = encode(&long);
     for ppm in [
         -1000.0f32, -700.0, -500.0, -300.0, -100.0, 100.0, 300.0, 500.0, 700.0, 1000.0,
     ] {

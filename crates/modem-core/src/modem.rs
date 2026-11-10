@@ -1,27 +1,39 @@
-//! The modem as the application sees it: commands and samples in, events and
-//! samples out.
+//! The modem as the application sees it: texts and samples in, events and
+//! samples out. Connects the link layer to the transmitter and the receiver.
 //!
-//! For now one text message is one frame. Sessions, acknowledgements,
-//! fragmentation and presets come with the link and transport layers
-//! (`plans/PLAN.md`).
+//! Time is counted in received samples, so the application must keep
+//! feeding `push_rx` — silence too — for anything to happen: transmissions
+//! start, acknowledgements time out and repeats go out while samples flow.
+//! Whatever `pull_tx` gives must be played at once: the modem takes its own
+//! transmission to last as long as its samples and does not listen meanwhile.
 
 use std::collections::VecDeque;
 
 use crate::SAMPLE_RATE;
-use crate::frame::{MAX_PAYLOAD, Mode};
+use crate::frame::{Kind, Mode};
+use crate::link::{GAP, Link, LinkConfig, LinkEvent, SendError};
 use crate::resample::Resampler;
 use crate::rx::{Receiver, RxEvent, RxStats};
-use crate::tx::{TxConfig, encode_frame};
+use crate::tx::{TxConfig, encode_frame, frame_len};
 
-/// Silence after every transmitted frame, samples (100 ms).
-const FRAME_GAP: usize = 1600;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Sample rate of the audio device, Hz: 8000 to 192000. The samples of
     /// `push_rx` and `pull_tx` are at this rate; the core converts.
     pub sample_rate: u32,
     pub tx: TxConfig,
+    /// The address of this station on the channel: pick it at random.
+    pub station: u16,
+    /// The name or callsign sent in a greeting; may be empty.
+    pub name: String,
+    /// True: frames are acknowledged and repeated. False: everything is sent
+    /// once and nothing is expected back.
+    pub reliable: bool,
+    /// True: every transmission waits for `ptt_pressed` (a radio with a
+    /// push-to-talk button held by a human).
+    pub manual_ptt: bool,
+    /// Seed of the random waits of the link layer.
+    pub seed: u64,
 }
 
 impl Default for Config {
@@ -29,6 +41,11 @@ impl Default for Config {
         Self {
             sample_rate: SAMPLE_RATE,
             tx: TxConfig::default(),
+            station: 1,
+            name: String::new(),
+            reliable: true,
+            manual_ptt: false,
+            seed: 1,
         }
     }
 }
@@ -38,37 +55,52 @@ pub enum ConfigError {
     UnsupportedSampleRate(u32),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
-    SendText(String),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandError {
-    /// The text does not fit into one frame; `max` is the limit in UTF-8 bytes.
-    TextTooLong { max: usize },
+    EmptyText,
+    /// `max` is the limit in UTF-8 bytes.
+    TextTooLong {
+        max: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     MessageReceived {
+        from: u16,
         text: String,
         stats: RxStats,
     },
-    /// A frame was heard but its payload could not be read.
-    FrameLost {
+    /// A station greeted with its name.
+    PeerHello {
+        from: u16,
+        name: String,
         stats: RxStats,
     },
+    /// A message of an unreliable modem has been transmitted.
+    MessageSent { id: u32 },
+    /// The other side acknowledged the whole message.
+    MessageDelivered { id: u32 },
+    /// The message was not acknowledged after every attempt.
+    MessageFailed { id: u32 },
+    /// No acknowledgement: part of the message goes out again, for the `attempt`-th time.
+    Retry { id: u32, attempt: u8 },
+    /// Something was transmitted nearby but could not be read.
+    FrameLost { stats: RxStats },
+    /// Push-to-talk: press the button and call `ptt_pressed`.
+    TxRequest,
 }
 
 pub struct Modem {
-    config: Config,
+    tx_config: TxConfig,
     /// Device rate → core rate and back; None when they are the same.
     rx_resampler: Option<Resampler>,
     tx_resampler: Option<Resampler>,
     receiver: Receiver,
+    link: Link,
+    /// Samples received so far, at the core rate: the time of the link layer.
+    clock: u64,
     tx: VecDeque<f32>,
-    next_seq: u8,
     events: VecDeque<Event>,
 }
 
@@ -79,56 +111,143 @@ impl Modem {
             return Err(ConfigError::UnsupportedSampleRate(rate));
         }
         let converts = rate != SAMPLE_RATE;
+        let Config {
+            tx,
+            station,
+            name,
+            reliable,
+            manual_ptt,
+            seed,
+            ..
+        } = config;
+        let ack_len = frame_len(Kind::Ack, Mode::R1, 0) as u64
+            + u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
         Ok(Self {
-            config,
+            tx_config: tx,
             rx_resampler: converts.then(|| Resampler::new(rate, SAMPLE_RATE)),
             tx_resampler: converts.then(|| Resampler::new(SAMPLE_RATE, rate)),
             receiver: Receiver::new(),
+            link: Link::new(
+                LinkConfig {
+                    station,
+                    name,
+                    reliable,
+                    manual_ptt,
+                    seed,
+                },
+                ack_len,
+            ),
+            clock: 0,
             tx: VecDeque::new(),
-            next_seq: 0,
             events: VecDeque::new(),
         })
     }
 
-    pub fn command(&mut self, command: Command) -> Result<(), CommandError> {
-        match command {
-            Command::SendText(text) => {
-                let frame = encode_frame(self.next_seq, Mode::R1, text.as_bytes(), &self.config.tx)
-                    .map_err(|_| CommandError::TextTooLong { max: MAX_PAYLOAD })?;
-                let mut frame = frame;
-                self.next_seq = self.next_seq.wrapping_add(1);
-                // The pause also pushes the end of the frame out of the resampler.
-                frame.resize(frame.len() + FRAME_GAP, 0.0);
-                match &mut self.tx_resampler {
-                    Some(resampler) => {
-                        let mut converted = Vec::new();
-                        resampler.process(&frame, &mut converted);
-                        self.tx.extend(converted);
-                    }
-                    None => self.tx.extend(frame),
-                }
-                Ok(())
-            }
-        }
+    /// Queues a text; its fate is reported in events under the returned id.
+    pub fn send_text(&mut self, text: &str) -> Result<u32, CommandError> {
+        self.link.send_text(text).map_err(|error| match error {
+            SendError::Empty => CommandError::EmptyText,
+            SendError::TooLong { max } => CommandError::TextTooLong { max },
+        })
+    }
+
+    /// Queues a greeting with the name of this station; stations that hear it answer with theirs.
+    pub fn hello(&mut self) {
+        self.link.hello(self.clock);
+    }
+
+    /// Push-to-talk: the button is down, transmit what is waiting.
+    pub fn ptt_pressed(&mut self) {
+        self.link.ptt_pressed();
     }
 
     /// Samples from the microphone.
     pub fn push_rx(&mut self, samples: &[f32]) {
-        match &mut self.rx_resampler {
+        let converted;
+        let samples = match &mut self.rx_resampler {
+            Some(resampler) => {
+                let mut out = Vec::new();
+                resampler.process(samples, &mut out);
+                converted = out;
+                &converted[..]
+            }
+            None => samples,
+        };
+        // While transmitting and right after, the microphone hears the modem itself.
+        if self.clock >= self.link.deaf_until() {
+            self.receiver.push(samples);
+        }
+        self.clock += samples.len() as u64;
+
+        while let Some(event) = self.receiver.poll() {
+            match event {
+                RxEvent::Frame { frame, stats, .. } => {
+                    self.link.on_frame(&frame, self.clock);
+                    self.take_link_events(Some(stats));
+                }
+                RxEvent::Damaged { stats, .. } | RxEvent::Unreadable { stats } => {
+                    self.events.push_back(Event::FrameLost { stats })
+                }
+            }
+        }
+        self.transmit();
+        self.take_link_events(None);
+    }
+
+    /// Asks the link layer what to transmit now and puts its samples into the queue.
+    fn transmit(&mut self) {
+        let frames = self.link.poll(self.clock, self.receiver.busy());
+        if frames.is_empty() {
+            return;
+        }
+        let mut burst = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            // The tone that opens the radio is needed once, at the start.
+            let config = if index == 0 {
+                self.tx_config
+            } else {
+                TxConfig {
+                    lead_in_ms: 0,
+                    ..self.tx_config
+                }
+            };
+            let samples = encode_frame(frame, Mode::R1, &config)
+                .expect("the link layer keeps frames within the limit");
+            burst.extend(samples);
+            // The pause also pushes the end of the frame out of the resampler.
+            burst.resize(burst.len() + GAP as usize, 0.0);
+        }
+        self.link.on_tx(self.clock, burst.len() as u64);
+        // What was being received is cut off by the transmission.
+        self.receiver.reset();
+        match &mut self.tx_resampler {
             Some(resampler) => {
                 let mut converted = Vec::new();
-                resampler.process(samples, &mut converted);
-                self.receiver.push(&converted);
+                resampler.process(&burst, &mut converted);
+                self.tx.extend(converted);
             }
-            None => self.receiver.push(samples),
+            None => self.tx.extend(burst),
         }
-        while let Some(event) = self.receiver.poll() {
-            self.events.push_back(match event {
-                RxEvent::Frame { payload, stats, .. } => Event::MessageReceived {
-                    text: String::from_utf8_lossy(&payload).into_owned(),
-                    stats,
-                },
-                RxEvent::Damaged { stats, .. } => Event::FrameLost { stats },
+    }
+
+    /// Moves the events of the link layer out; `stats` are those of the frame that caused them.
+    fn take_link_events(&mut self, stats: Option<RxStats>) {
+        while let Some(event) = self.link.poll_event() {
+            self.events.push_back(match (event, stats) {
+                (LinkEvent::Text { from, text }, Some(stats)) => {
+                    Event::MessageReceived { from, text, stats }
+                }
+                (LinkEvent::Hello { from, name, .. }, Some(stats)) => {
+                    Event::PeerHello { from, name, stats }
+                }
+                (LinkEvent::Text { .. } | LinkEvent::Hello { .. }, None) => {
+                    unreachable!("only a received frame brings a message")
+                }
+                (LinkEvent::Sent { id }, _) => Event::MessageSent { id },
+                (LinkEvent::Delivered { id }, _) => Event::MessageDelivered { id },
+                (LinkEvent::Failed { id }, _) => Event::MessageFailed { id },
+                (LinkEvent::Retry { id, attempt }, _) => Event::Retry { id, attempt },
+                (LinkEvent::TxRequest, _) => Event::TxRequest,
             });
         }
     }
@@ -140,9 +259,14 @@ impl Modem {
         }
     }
 
-    /// Samples waiting to be transmitted.
+    /// Samples waiting to be played.
     pub fn tx_pending(&self) -> usize {
         self.tx.len()
+    }
+
+    /// Nothing queued, nothing awaited, nothing left to play.
+    pub fn is_idle(&self) -> bool {
+        self.link.is_idle(self.clock) && self.tx.is_empty()
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -153,74 +277,226 @@ impl Modem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::MAX_TEXT_BYTES;
 
-    fn modem() -> Modem {
-        Modem::new(Config::default()).unwrap()
+    fn modem(station: u16) -> Modem {
+        Modem::new(Config {
+            station,
+            seed: u64::from(station),
+            ..Config::default()
+        })
+        .unwrap()
     }
 
-    /// Everything `from` has to transmit, in device-sized blocks.
-    fn transmit(from: &mut Modem) -> Vec<f32> {
-        let mut samples = Vec::new();
-        while from.tx_pending() > 0 {
-            let mut block = [0.0; 128];
-            from.pull_tx(&mut block);
-            samples.extend(block);
+    /// A perfect cable between sound cards: what each modem plays, the others hear a block later.
+    fn run(modems: &mut [&mut Modem], seconds: f32) {
+        const BLOCK: usize = 512;
+        let mut heard = vec![vec![0.0f32; BLOCK]; modems.len()];
+        for _ in 0..(seconds * SAMPLE_RATE as f32) as usize / BLOCK {
+            let mut played = vec![vec![0.0f32; BLOCK]; modems.len()];
+            for (modem, (block, incoming)) in modems.iter_mut().zip(played.iter_mut().zip(&heard)) {
+                modem.push_rx(incoming);
+                modem.pull_tx(block);
+            }
+            for (index, mix) in heard.iter_mut().enumerate() {
+                mix.fill(0.0);
+                for (other, block) in played.iter().enumerate() {
+                    // a modem hears itself too, as through a speaker next to its microphone
+                    let gain = if other == index { 0.5 } else { 1.0 };
+                    mix.iter_mut()
+                        .zip(block)
+                        .for_each(|(sum, sample)| *sum += gain * sample);
+                }
+            }
         }
-        samples
     }
 
-    fn texts(modem: &mut Modem) -> Vec<String> {
-        std::iter::from_fn(|| modem.poll_event())
-            .map(|event| match event {
-                Event::MessageReceived { text, .. } => text,
-                Event::FrameLost { .. } => panic!("frame lost"),
+    fn events(modem: &mut Modem) -> Vec<Event> {
+        std::iter::from_fn(|| modem.poll_event()).collect()
+    }
+
+    fn texts(events: &[Event]) -> Vec<(u16, &str)> {
+        events
+            .iter()
+            .filter_map(|e| {
+                if let Event::MessageReceived { from, text, .. } = e {
+                    Some((*from, text.as_str()))
+                } else {
+                    None
+                }
             })
             .collect()
     }
 
     #[test]
-    fn text_travels_from_one_modem_to_another() {
-        let (mut alice, mut bob) = (modem(), modem());
-        alice
-            .command(Command::SendText("Привет, модем! 👋".into()))
-            .unwrap();
-        alice.command(Command::SendText("second".into())).unwrap();
-        bob.push_rx(&transmit(&mut alice));
-        assert_eq!(texts(&mut bob), ["Привет, модем! 👋", "second"]);
-        assert_eq!(texts(&mut alice), [] as [&str; 0]);
+    fn a_text_is_delivered_and_the_sender_learns_it() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let id = alice.send_text("Привет, модем! 👋").unwrap();
+        run(&mut [&mut alice, &mut bob], 8.0);
+        assert_eq!(texts(&events(&mut bob)), [(1, "Привет, модем! 👋")]);
+        assert_eq!(events(&mut alice), [Event::MessageDelivered { id }]);
+        assert!(alice.is_idle() && bob.is_idle());
     }
 
     #[test]
-    fn idle_modem_transmits_silence() {
-        let mut modem = modem();
+    fn a_conversation_in_both_directions() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        alice.send_text("Как слышно?").unwrap();
+        run(&mut [&mut alice, &mut bob], 7.0);
+        bob.send_text("Слышу хорошо").unwrap();
+        // both speak at once now
+        alice.send_text("И ещё вопрос").unwrap();
+        run(&mut [&mut alice, &mut bob], 40.0);
+        let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
+        assert_eq!(texts(&at_bob), [(1, "Как слышно?"), (1, "И ещё вопрос")]);
+        assert_eq!(texts(&at_alice), [(2, "Слышу хорошо")]);
+        assert_eq!(
+            at_alice
+                .iter()
+                .filter(|e| matches!(e, Event::MessageDelivered { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            at_bob
+                .iter()
+                .filter(|e| matches!(e, Event::MessageDelivered { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !at_alice
+                .iter()
+                .chain(&at_bob)
+                .any(|e| matches!(e, Event::MessageFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn does_not_receive_its_own_transmission() {
+        let mut alone = modem(1);
+        let id = alone.send_text("anyone?").unwrap();
+        // its speaker is next to its microphone, nobody else is there
+        run(&mut [&mut alone], 60.0);
+        let all = events(&mut alone);
+        assert!(
+            all.iter()
+                .all(|e| matches!(e, Event::Retry { .. } | Event::MessageFailed { .. })),
+            "{all:?}"
+        );
+        assert_eq!(all.last(), Some(&Event::MessageFailed { id }));
+        assert!(alone.is_idle());
+    }
+
+    #[test]
+    fn a_long_text_arrives_whole() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(4);
+        let id = alice.send_text(&long).unwrap();
+        run(&mut [&mut alice, &mut bob], 40.0);
+        assert_eq!(texts(&events(&mut bob)), [(1, long.as_str())]);
+        assert_eq!(events(&mut alice), [Event::MessageDelivered { id }]);
+    }
+
+    #[test]
+    fn greetings_carry_the_names() {
+        let mut alice = Modem::new(Config {
+            station: 1,
+            name: "Alice".into(),
+            ..Config::default()
+        })
+        .unwrap();
+        let mut bob = Modem::new(Config {
+            station: 2,
+            name: "UB1XYZ".into(),
+            seed: 2,
+            ..Config::default()
+        })
+        .unwrap();
+        alice.hello();
+        run(&mut [&mut alice, &mut bob], 15.0);
+        assert!(
+            matches!(&events(&mut bob)[..], [Event::PeerHello { from: 1, name, .. }] if name == "Alice")
+        );
+        assert!(
+            matches!(&events(&mut alice)[..], [Event::PeerHello { from: 2, name, .. }] if name == "UB1XYZ")
+        );
+    }
+
+    #[test]
+    fn unreliable_mode_transmits_once_without_a_listener() {
+        let mut sender = Modem::new(Config {
+            reliable: false,
+            ..Config::default()
+        })
+        .unwrap();
+        let id = sender.send_text("to whom it may concern").unwrap();
+        let mut receiver = modem(2);
+        run(&mut [&mut sender, &mut receiver], 6.0);
+        assert_eq!(events(&mut sender), [Event::MessageSent { id }]);
+        assert_eq!(
+            texts(&events(&mut receiver)),
+            [(1, "to whom it may concern")]
+        );
+        // nothing came back
+        assert!(sender.is_idle() && receiver.is_idle());
+    }
+
+    #[test]
+    fn push_to_talk_transmits_only_after_the_button() {
+        let mut alice = Modem::new(Config {
+            manual_ptt: true,
+            tx: TxConfig {
+                lead_in_ms: 300,
+                ..TxConfig::default()
+            },
+            ..Config::default()
+        })
+        .unwrap();
+        let mut bob = modem(2);
+        let id = alice.send_text("over").unwrap();
+        run(&mut [&mut alice, &mut bob], 2.0);
+        assert_eq!(events(&mut alice), [Event::TxRequest]);
+        assert_eq!(alice.tx_pending(), 0);
+        alice.ptt_pressed();
+        run(&mut [&mut alice, &mut bob], 8.0);
+        assert_eq!(texts(&events(&mut bob)), [(1, "over")]);
+        assert_eq!(events(&mut alice), [Event::MessageDelivered { id }]);
+    }
+
+    #[test]
+    fn idle_modem_plays_silence() {
+        let mut modem = modem(1);
         let mut block = [1.0; 64];
         modem.pull_tx(&mut block);
         assert_eq!(block, [0.0; 64]);
         assert_eq!(modem.tx_pending(), 0);
+        assert!(modem.is_idle());
     }
 
     #[test]
-    fn frames_are_separated_by_a_pause() {
-        let mut modem = modem();
-        modem.command(Command::SendText("a".into())).unwrap();
-        let samples = transmit(&mut modem);
-        let frame = crate::tx::frame_len(Mode::R1, 1);
-        assert!(samples.len() >= frame + FRAME_GAP);
-        assert!(samples[frame..].iter().all(|&x| x == 0.0));
+    fn nothing_happens_without_incoming_samples() {
+        let mut modem = modem(1);
+        modem.send_text("waiting for the clock").unwrap();
+        assert_eq!(modem.tx_pending(), 0);
+        assert!(!modem.is_idle());
+        modem.push_rx(&[0.0; 512]);
+        assert!(modem.tx_pending() > 0);
     }
 
     #[test]
-    fn rejects_text_longer_than_a_frame() {
-        let mut modem = modem();
-        assert_eq!(modem.command(Command::SendText("x".repeat(255))), Ok(()));
+    fn rejects_texts_it_cannot_send() {
+        let mut modem = modem(1);
+        assert_eq!(modem.send_text(""), Err(CommandError::EmptyText));
+        assert_eq!(modem.send_text(&"x".repeat(MAX_TEXT_BYTES)), Ok(1));
         assert_eq!(
-            modem.command(Command::SendText("x".repeat(256))),
-            Err(CommandError::TextTooLong { max: 255 })
+            modem.send_text(&"x".repeat(MAX_TEXT_BYTES + 1)),
+            Err(CommandError::TextTooLong { max: 1000 })
         );
         // counted in bytes, not characters
         assert_eq!(
-            modem.command(Command::SendText("я".repeat(128))),
-            Err(CommandError::TextTooLong { max: 255 })
+            modem.send_text(&"я".repeat(501)),
+            Err(CommandError::TextTooLong { max: 1000 })
         );
     }
 
@@ -234,27 +510,39 @@ mod tests {
         ] {
             let mut alice = Modem::new(Config {
                 sample_rate: from,
+                reliable: false,
                 ..Config::default()
             })
             .unwrap();
             let mut bob = Modem::new(Config {
                 sample_rate: to,
+                station: 2,
                 ..Config::default()
             })
             .unwrap();
-            alice.command(Command::SendText("any rate".into())).unwrap();
-            alice.command(Command::SendText("twice".into())).unwrap();
-            let sent = transmit(&mut alice);
-            // 5.06 s of frames and pauses, whatever the rate of the sender
-            let seconds = sent.len() as f32 / from as f32;
-            assert!((seconds - 5.064).abs() < 0.02, "{from}: {seconds} s");
+            alice.send_text("any rate").unwrap();
+            alice.send_text("twice").unwrap();
             // The air between two sound cards: a converter of its own.
-            let mut heard = Vec::new();
-            Resampler::new(from, to).process(&sent, &mut heard);
-            for block in heard.chunks(1000) {
-                bob.push_rx(block);
+            let mut air = Resampler::new(from, to);
+            let block = from as usize / 50;
+            let mut seconds = 0.0;
+            while !alice.is_idle() {
+                alice.push_rx(&vec![0.0; block]);
+                let mut played = vec![0.0; block];
+                alice.pull_tx(&mut played);
+                let mut heard = Vec::new();
+                air.process(&played, &mut heard);
+                bob.push_rx(&heard);
+                seconds += 0.02;
             }
-            assert_eq!(texts(&mut bob), ["any rate", "twice"], "{from} → {to}");
+            bob.push_rx(&vec![0.0; to as usize]);
+            // two frames of 3.0 and 2.6 s with pauses, whatever the rate
+            assert!((seconds - 6.0f32).abs() < 0.2, "{from}: {seconds} s");
+            assert_eq!(
+                texts(&events(&mut bob)),
+                [(1, "any rate"), (1, "twice")],
+                "{from} → {to}"
+            );
         }
     }
 
@@ -273,17 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_lost_frame() {
-        let (mut alice, mut bob) = (modem(), modem());
-        alice
-            .command(Command::SendText("this one gets damaged on the way".into()))
-            .unwrap();
-        let mut samples = transmit(&mut alice);
-        for (n, x) in samples[20_000..45_000].iter_mut().enumerate() {
+    fn reports_what_was_heard_but_not_read() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        alice.send_text("this one gets damaged on the way").unwrap();
+        alice.push_rx(&[0.0; 512]);
+        let mut samples = vec![0.0; alice.tx_pending()];
+        alice.pull_tx(&mut samples);
+        for (n, x) in samples[25_000..50_000].iter_mut().enumerate() {
             *x = (n as f32 * 0.4).sin() * 0.5;
         }
         bob.push_rx(&samples);
-        assert!(matches!(bob.poll_event(), Some(Event::FrameLost { .. })));
-        assert_eq!(bob.poll_event(), None);
+        assert!(matches!(&events(&mut bob)[..], [Event::FrameLost { .. }]));
     }
 }
