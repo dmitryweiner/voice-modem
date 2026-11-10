@@ -1,0 +1,13 @@
+[package]
+name = "modem-sim"
+description = "Channel models for testing the Voice Modem core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+modem-core.workspace = true
+
+[lints]
+workspace = true

@@ -29,12 +29,12 @@ browser as WebAssembly; later the same core is linked into an Android app.
 
 A browser cannot mix sound into a cellular call, so the scenarios are:
 
-| Scenario | How it connects | Specifics |
-|---|---|---|
-| Over the air | speaker of one device → microphone of the other | room echo, noise, weak speakers |
-| Phone | a phone on speakerphone next to the device running the app, or a headset cable | vocoder (AMR/EVS), noise suppression, VAD cuts "non-speech" signal |
-| Radio | a radio next to the device, or an audio cable; a human presses PTT (or VOX) | half duplex, squelch tail, FM pre-emphasis, frequency offset on SSB |
-| Internet | a messenger call on the same or a neighbouring device | Opus codec, packet loss, time stretching by the jitter buffer, noise suppression |
+| Scenario     | How it connects                                                                | Specifics                                                                        |
+| ------------ | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| Over the air | speaker of one device → microphone of the other                                | room echo, noise, weak speakers                                                  |
+| Phone        | a phone on speakerphone next to the device running the app, or a headset cable | vocoder (AMR/EVS), noise suppression, VAD cuts "non-speech" signal               |
+| Radio        | a radio next to the device, or an audio cable; a human presses PTT (or VOX)    | half duplex, squelch tail, FM pre-emphasis, frequency offset on SSB              |
+| Internet     | a messenger call on the same or a neighbouring device                          | Opus codec, packet loss, time stretching by the jitter buffer, noise suppression |
 
 Consequence: the hardest case is a cellular phone through an acoustic coupling
 (vocoder + air). It needs a very robust slow mode.
@@ -44,14 +44,14 @@ supported option, not a requirement.
 
 ### Expected speeds (guidance, not promises)
 
-| Channel | Net speed | 10 KB file |
-|---|---|---|
-| Over the air, ~1 m, quiet | 0.5–2 kbit/s | 1–3 min |
-| Wired phone / G.711 | 1–3 kbit/s | 0.5–1.5 min |
-| Cellular (AMR/EVS) | 50–300 bit/s | 5–30 min |
-| FM radio | 0.3–1.5 kbit/s | 1–5 min |
-| SSB (HF) | 0.1–1 kbit/s | 1.5–15 min |
-| VoIP (Opus) | 0.3–2 kbit/s | 1–5 min |
+| Channel                   | Net speed      | 10 KB file  |
+| ------------------------- | -------------- | ----------- |
+| Over the air, ~1 m, quiet | 0.5–2 kbit/s   | 1–3 min     |
+| Wired phone / G.711       | 1–3 kbit/s     | 0.5–1.5 min |
+| Cellular (AMR/EVS)        | 50–300 bit/s   | 5–30 min    |
+| FM radio                  | 0.3–1.5 kbit/s | 1–5 min     |
+| SSB (HF)                  | 0.1–1 kbit/s   | 1.5–15 min  |
+| VoIP (Opus)               | 0.3–2 kbit/s   | 1–5 min     |
 
 The numbers are refined at stages 1 and 4 from simulation and from measurements
 on real channels.
@@ -127,11 +127,11 @@ while let Some(ev) = modem.poll_event() { .. }
 One protocol, several modes from "gets through anything" to "fast over a clean
 channel". The parameters are tentative and are fixed from simulation results.
 
-| Group | Modulation | Net speed | For |
-|---|---|---|---|
-| R (robust) | non-coherent MFSK, long symbols | ~30–150 bit/s | vocoders, heavy noise, time stretching |
-| M (medium) | OFDM, differential QPSK | ~300–900 bit/s | radio, VoIP, air with echo |
-| F (fast) | coherent OFDM with pilots, QPSK → 16QAM → 64QAM | ~1–5 kbit/s | clean air, wired line |
+| Group      | Modulation                                      | Net speed      | For                                    |
+| ---------- | ----------------------------------------------- | -------------- | -------------------------------------- |
+| R (robust) | non-coherent MFSK, long symbols                 | ~30–150 bit/s  | vocoders, heavy noise, time stretching |
+| M (medium) | OFDM, differential QPSK                         | ~300–900 bit/s | radio, VoIP, air with echo             |
+| F (fast)   | coherent OFDM with pilots, QPSK → 16QAM → 64QAM | ~1–5 kbit/s    | clean air, wired line                  |
 
 OFDM reference parameters: FFT 512 at 16 kHz (31.25 Hz spacing, 32 ms symbol) +
 8 ms cyclic prefix, ~99 carriers in the 300–3400 Hz band. Presets change the
@@ -226,14 +226,14 @@ mode and debugging).
 
 A preset is a set of starting parameters and limits; adaptation works inside it.
 
-| Preset | Band | Starting mode | Allowed modes | Specifics |
-|---|---|---|---|---|
-| Over the air | 300–3400 Hz | M | R, M, F | long cyclic prefix (echo) |
-| Phone | 300–3400 Hz | R | R, M (F only if probing shows a clean line) | lead-in tone, continuous "speech-like" spectrum against VAD |
-| FM radio | 500–2700 Hz | R | R, M, F | PTT/VOX, 300–500 ms lead-in tone, pre-emphasis accounted for |
-| SSB radio | 500–2500 Hz | R | R, M | frequency-offset search ±200 Hz, robustness to fading |
-| Internet | 300–3400 Hz | M | R, M, F | robustness to packet loss and time stretching, longer timeouts |
-| Custom | — | — | — | every parameter by hand |
+| Preset       | Band        | Starting mode | Allowed modes                               | Specifics                                                      |
+| ------------ | ----------- | ------------- | ------------------------------------------- | -------------------------------------------------------------- |
+| Over the air | 300–3400 Hz | M             | R, M, F                                     | long cyclic prefix (echo)                                      |
+| Phone        | 300–3400 Hz | R             | R, M (F only if probing shows a clean line) | lead-in tone, continuous "speech-like" spectrum against VAD    |
+| FM radio     | 500–2700 Hz | R             | R, M, F                                     | PTT/VOX, 300–500 ms lead-in tone, pre-emphasis accounted for   |
+| SSB radio    | 500–2500 Hz | R             | R, M                                        | frequency-offset search ±200 Hz, robustness to fading          |
+| Internet     | 300–3400 Hz | M             | R, M, F                                     | robustness to packet loss and time stretching, longer timeouts |
+| Custom       | —           | —             | —                                           | every parameter by hand                                        |
 
 ## 9. Web app
 
@@ -277,17 +277,17 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.
 
-| № | Stage | Result |
-|---|---|---|
-| 0 | Skeleton | workspace, CI, wasm build, an empty web app on GitHub Pages |
-| 1 | PHY minimum | one R mode (MFSK) + preamble + frame + FEC; `modem-cli` encodes text to WAV and decodes it back; tests through the simulator |
-| 2 | Web minimum | sound in the browser; one-way text over the air between two devices; level meters and spectrum |
-| 3 | Link layer | half duplex, ARQ, sessions (with the capabilities field); two-way chat with delivery statuses; PTT mode |
-| 4 | Fast modes and adaptation | OFDM (M, F), LDPC, probing, automatic mode choice and change on the fly |
-| 5 | Files, broadcast, encryption | file transfer, progress, cancel, resume, compression; broadcast mode with fountain codes; optional encryption by a shared password |
-| 6 | Presets | tuning for every channel from codec simulation and field measurements |
-| 7 | Polish | PWA, level wizard, localisation, protocol documentation |
-| — | Later | Android (core through UniFFI/JNI + Oboe), full duplex with frequency division, per-carrier bit loading, wideband modes |
+| №   | Stage                        | Result                                                                                                                             |
+| --- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 0   | Skeleton                     | workspace, CI, wasm build, an empty web app on GitHub Pages                                                                        |
+| 1   | PHY minimum                  | one R mode (MFSK) + preamble + frame + FEC; `modem-cli` encodes text to WAV and decodes it back; tests through the simulator       |
+| 2   | Web minimum                  | sound in the browser; one-way text over the air between two devices; level meters and spectrum                                     |
+| 3   | Link layer                   | half duplex, ARQ, sessions (with the capabilities field); two-way chat with delivery statuses; PTT mode                            |
+| 4   | Fast modes and adaptation    | OFDM (M, F), LDPC, probing, automatic mode choice and change on the fly                                                            |
+| 5   | Files, broadcast, encryption | file transfer, progress, cancel, resume, compression; broadcast mode with fountain codes; optional encryption by a shared password |
+| 6   | Presets                      | tuning for every channel from codec simulation and field measurements                                                              |
+| 7   | Polish                       | PWA, level wizard, localisation, protocol documentation                                                                            |
+| —   | Later                        | Android (core through UniFFI/JNI + Oboe), full duplex with frequency division, per-carrier bit loading, wideband modes             |
 
 Main risks: (1) cellular vocoders and noise suppression in messengers may leave
 only tens of bit/s — checked early, at stage 1, by running through codecs;
@@ -300,20 +300,20 @@ and encryption — it is split into three PRs (files, broadcast, encryption).
 
 Settled with the author on 2026-11-10.
 
-| № | Question | Decision |
-|---|---|---|
-| 1 | Priority channel for debugging and the first field tests | Over the air, then a cellular phone |
-| 2 | Phone scenario through the speakerphone (acoustic coupling) | Yes; a cable is an option |
-| 3 | UI framework | React + TypeScript |
-| 4 | Interface languages | English (default, fallback) + Russian |
-| 5 | Hosting | GitHub Pages, no server |
-| 6 | Duplex in the first version | Half duplex only |
-| 7 | Broadcast mode (no return channel) in the first version | Yes, **with fountain codes** (stage 5) — changed from the draft's "simple repetition" |
-| 8 | Encryption by a shared password | **In the first version**, optional, off by default (stage 5) — changed from the draft's "later"; warning on radio presets |
-| 9 | File size limit | Soft: a warning when the estimate exceeds 10 min |
-| 10 | iOS Safari | Supported as far as possible, does not block a release |
-| 11 | Own protocol with no compatibility | Yes |
-| 12 | License | GPL-3.0-or-later; dependencies are chosen to be compatible |
-| 13 | Repository layout | Web app in the root (as in `web-app-template`), Rust workspace in `crates/` |
-| 14 | Where the plan lives and in what language | `plans/PLAN.md`, English (this file; translated from the Russian draft `PLAN.md`) |
-| 15 | Stage for encryption | Stage 5, with files; the capabilities field is laid down at stage 3 |
+| №   | Question                                                    | Decision                                                                                                                  |
+| --- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Priority channel for debugging and the first field tests    | Over the air, then a cellular phone                                                                                       |
+| 2   | Phone scenario through the speakerphone (acoustic coupling) | Yes; a cable is an option                                                                                                 |
+| 3   | UI framework                                                | React + TypeScript                                                                                                        |
+| 4   | Interface languages                                         | English (default, fallback) + Russian                                                                                     |
+| 5   | Hosting                                                     | GitHub Pages, no server                                                                                                   |
+| 6   | Duplex in the first version                                 | Half duplex only                                                                                                          |
+| 7   | Broadcast mode (no return channel) in the first version     | Yes, **with fountain codes** (stage 5) — changed from the draft's "simple repetition"                                     |
+| 8   | Encryption by a shared password                             | **In the first version**, optional, off by default (stage 5) — changed from the draft's "later"; warning on radio presets |
+| 9   | File size limit                                             | Soft: a warning when the estimate exceeds 10 min                                                                          |
+| 10  | iOS Safari                                                  | Supported as far as possible, does not block a release                                                                    |
+| 11  | Own protocol with no compatibility                          | Yes                                                                                                                       |
+| 12  | License                                                     | GPL-3.0-or-later; dependencies are chosen to be compatible                                                                |
+| 13  | Repository layout                                           | Web app in the root (as in `web-app-template`), Rust workspace in `crates/`                                               |
+| 14  | Where the plan lives and in what language                   | `plans/PLAN.md`, English (this file; translated from the Russian draft `PLAN.md`)                                         |
+| 15  | Stage for encryption                                        | Stage 5, with files; the capabilities field is laid down at stage 3                                                       |

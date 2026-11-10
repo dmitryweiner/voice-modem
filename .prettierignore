@@ -1,0 +1,5 @@
+dist/
+package-lock.json
+shots/
+target/
+src/wasm/

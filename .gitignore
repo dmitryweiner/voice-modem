@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+shots/
+target/
+# wasm-pack output, built by `npm run wasm` (and in CI)
+src/wasm/

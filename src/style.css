@@ -1,0 +1,109 @@
+/* Mobile first: base rules are for a phone, min-width queries add room.
+   Logical properties (inline/block) mirror the layout for RTL by themselves. */
+
+:root {
+  --bg: #f4f6fc;
+  --fg: #17223e;
+  --muted: #5b6685;
+  --accent: #294edb;
+  --accent-fg: #fff;
+  --surface: #fff;
+  --focus: #e6af00;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11162a;
+    --fg: #e7ebf7;
+    --muted: #9aa4c4;
+    --accent: #6c8cff;
+    --accent-fg: #0b1020;
+    --surface: #1b2240;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    16px/1.5 system-ui,
+    sans-serif;
+}
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+button,
+select {
+  font: inherit;
+}
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+header,
+main,
+footer {
+  inline-size: 100%;
+  max-inline-size: 720px;
+  margin-inline: auto;
+  padding-inline: 16px;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-block: 12px;
+}
+.brand {
+  font-weight: 700;
+}
+select {
+  min-block-size: 44px;
+  padding-inline: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--muted);
+  background: var(--surface);
+  color: var(--fg);
+}
+main {
+  flex: 1;
+  padding-block: 16px 32px;
+}
+h1 {
+  margin-block: 8px;
+  font-size: 1.75rem;
+  line-height: 1.2;
+}
+output {
+  display: block;
+  margin-block-start: 24px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--muted);
+}
+output[data-status='ready'] {
+  color: var(--fg);
+}
+footer {
+  padding-block: 16px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+footer a {
+  color: inherit;
+}
+
+@media (min-width: 600px) {
+  h1 {
+    font-size: 2.25rem;
+  }
+}

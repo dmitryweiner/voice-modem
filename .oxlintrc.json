@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "vitest", "react"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "env": { "browser": true, "es2024": true },
+  "ignorePatterns": ["dist/**", "target/**", "src/wasm/**"],
+  "rules": {
+    // Styles are imported for their side effect.
+    "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }],
+    // The automatic JSX runtime ("jsx": "react-jsx") imports what it needs itself.
+    "react/react-in-jsx-scope": "off",
+    // Build-time constants injected by Vite's `define` are spelled __LIKE_THIS__.
+    "no-underscore-dangle": ["error", { "allow": ["__APP_ID__"] }]
+  },
+  "overrides": [
+    {
+      // Test doubles implement only the part of a browser API that the code uses.
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "rules": { "typescript/no-unsafe-type-assertion": "off" }
+    },
+    {
+      // Browser scripts run their steps one after another on purpose: they share
+      // one server and browser, and their output must stay in order.
+      "files": ["scripts/**"],
+      "rules": { "no-await-in-loop": "off" }
+    }
+  ]
+}
