@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
+import type { StartAudio } from './audio/engine';
 import { detectLocale, direction, isLocale, LOCALE_NAMES, LOCALES, messages, type Messages } from './i18n';
+import { ModemPanel } from './ModemPanel';
 import { loadSettings, saveSettings, type KeyValueStorage, type Settings } from './storage';
 import type { CoreClient } from './worker/client';
 
@@ -8,6 +10,8 @@ export interface AppProps {
   /** Browser languages in preference order (`navigator.languages`). */
   languages: readonly string[];
   core: CoreClient;
+  /** Opens the microphone and the speaker. */
+  startAudio: StartAudio;
 }
 
 type CoreState = { status: 'loading' } | { status: 'ready'; version: string } | { status: 'failed' };
@@ -17,7 +21,7 @@ function coreText(t: Messages, core: CoreState): string {
   return core.status === 'failed' ? t.coreFailed : t.coreLoading;
 }
 
-export function App({ storage, languages, core }: AppProps) {
+export function App({ storage, languages, core, startAudio }: AppProps) {
   const [settings, setSettings] = useState<Settings>(() => loadSettings(storage));
   const [coreState, setCoreState] = useState<CoreState>({ status: 'loading' });
   const locale = detectLocale(settings.locale, languages);
@@ -69,11 +73,12 @@ export function App({ storage, languages, core }: AppProps) {
       <main>
         <h1>{t.title}</h1>
         <p>{t.intro}</p>
+        <ModemPanel t={t} core={core} startAudio={startAudio} coreReady={coreState.status === 'ready'} />
+      </main>
+      <footer>
         <output id="core" data-status={coreState.status} aria-live="polite">
           {coreText(t, coreState)}
         </output>
-      </main>
-      <footer>
         <a href="https://github.com/dmitryweiner/voice-modem">{t.source}</a> · GPL-3.0-or-later
       </footer>
     </>

@@ -45,6 +45,8 @@ receiver estimated: here it measures the distortion by the codec.
 | G.726, 16 kbit/s       | 5/5      | 9.8 … 10.8          |
 | iLBC, 15.2 kbit/s      | **3/5**  | −4.6 … −2.9         |
 | G.723.1, 6.3 kbit/s    | 5/5      | 6.0 … 6.9           |
+| AMR-NB, 12.2 kbit/s    | 5/5      | 11.5 … 12.4         |
+| AMR-NB, 4.75 kbit/s    | 5/5      | 2.9 … 3.5           |
 | Opus voice, 24 kbit/s  | 5/5      | 14.8 … 20.5         |
 | Opus voice, 16 kbit/s  | 5/5      | 11.0 … 12.4         |
 | Opus voice, 12 kbit/s  | 5/5      | 3.1 … 3.7           |
@@ -54,22 +56,35 @@ receiver estimated: here it measures the distortion by the codec.
 What this says about the main risk of the plan (vocoders leaving no usable
 channel):
 
-- 62.5 bit/s gets through every codec tried, down to 6 kbit/s, with one
-  exception.
+- 62.5 bit/s gets through every codec tried, down to 4.75 kbit/s, with one
+  exception. **AMR-NB**, the codec of GSM and 3G calls, passes everything at
+  both its highest and its lowest rate.
 - **iLBC loses two of five messages**, and loses them whole — the preamble or
   the header, not the payload — although the three it passes arrive with the
   payload intact. Not investigated yet; the first thing to look at when the
   telephone preset is tuned (stage 6).
-- **AMR and EVS, the codecs of cellular calls, were not tested**: this ffmpeg
-  build has no AMR encoder. G.723.1 (the same family of coders, at 6.3 kbit/s)
-  is the nearest stand-in here. The real answer comes from a real call
-  (stage 2 onwards) or a build with `libopencore_amrnb`, which the script
-  picks up by itself.
-- No test here has packet loss, time stretching by a jitter buffer, noise
-  suppression or a voice detector — what messengers and phones add on top of
-  the codec.
+- AMR-WB and EVS (the codecs of VoLTE calls) were not tested: ffmpeg has no
+  encoder for them.
+- The codec alone is not a call. No test here has discontinuous transmission
+  (the voice detector that mutes "silence"), noise suppression, packet loss
+  or time stretching by a jitter buffer — what phones and messengers add on
+  top. The real answer comes from a real call.
 
-## Speed of the receiver
+## Speed of the receiver (2026-11-10)
 
-Searching for a preamble in noise: 131× real time natively on an M-series Mac
-(release build). Not yet measured as WASM in a browser.
+Searching for a preamble in noise, M-series Mac:
+
+| Build           | Device rate | Speed          |
+| --------------- | ----------- | -------------- |
+| native, release | 16 kHz      | 131× real time |
+| WASM in Node 24 | 16 kHz      | 128× real time |
+| WASM in Node 24 | 48 kHz      | 95× real time  |
+| WASM in Node 24 | 44.1 kHz    | 97× real time  |
+
+At 48 kHz the sample rate converter is a quarter of the work. With a sine
+computed per filter tap it was four fifths (22× real time); it now reads the
+filter from a table. Not yet measured on a phone.
+
+## Over the air between real devices
+
+Not measured yet.

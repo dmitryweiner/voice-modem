@@ -66,16 +66,17 @@ export async function ensureServer(preview) {
 }
 
 /**
- * Starts the server and a browser. `open({ locale, viewport })` makes a fresh
+ * Starts the server and a browser (with extra command-line `browserArgs`).
+ * `open({ locale, viewport })` makes a fresh
  * context (empty storage, the given browser language) and loads the app.
  * Console errors and page errors of every page land in `errors`, tagged with
  * the step set by `label(text)`.
  */
-export async function launch({ preview = false } = {}) {
+export async function launch({ preview = false, browserArgs = [] } = {}) {
   const { base, proc } = await ensureServer(preview);
   // In a cloud container Playwright may miss its own chromium while another
   // is installed: PLAYWRIGHT_BROWSER gives its path.
-  const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_BROWSER || undefined });
+  const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_BROWSER || undefined, args: browserArgs });
   const errors = [];
   let step = 'start';
 

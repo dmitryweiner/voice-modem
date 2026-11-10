@@ -18,6 +18,8 @@ export default defineConfig({
   base: './',
   define: { __APP_ID__: JSON.stringify(APP_ID) },
   plugins: [react(), serviceWorkerPlugin({ appId: APP_ID, publicDir: resolve(import.meta.dirname, 'public') })],
+  // The AudioWorklet module stays a file of its own: not every browser loads a worklet from a data: URL.
+  build: { assetsInlineLimit: (file) => (file.endsWith('.worklet.js') ? false : undefined) },
   // The WASM glue finds its .wasm via import.meta.url, which an iife worker lacks.
   worker: { format: 'es' },
   test: {

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { detectLocale, direction, isLocale, LOCALES, messages } from './index';
-import { plural } from './plural';
+import { plural, signed } from './plural';
 
 const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf8');
 
@@ -48,7 +48,8 @@ describe('messages', () => {
 
   it.each(LOCALES)('are not empty (%s)', (locale) => {
     for (const [key, value] of Object.entries(messages[locale])) {
-      const text: unknown = typeof value === 'function' ? value('1.2.3') : value;
+      // Every message function takes one argument: a version or a number.
+      const text: unknown = typeof value === 'function' ? (value as (arg: unknown) => string)(key === 'coreReady' ? '1.2.3' : 3) : value;
       expect({ key, text }).toEqual({ key, text: expect.stringMatching(/\S/) });
     }
   });
@@ -62,6 +63,28 @@ describe('messages', () => {
   it('put the core version into the status line', () => {
     expect(messages.en.coreReady('0.1.0')).toBe('Modem core 0.1.0 is ready.');
     expect(messages.ru.coreReady('0.1.0')).toBe('Ядро модема 0.1.0 готово.');
+  });
+
+  it('format numbers the way of the language', () => {
+    expect(messages.en.tooLong(1)).toBe('Too long by 1 byte.');
+    expect(messages.en.tooLong(12)).toBe('Too long by 12 bytes.');
+    expect([1, 3, 5, 21].map(messages.ru.tooLong)).toEqual([
+      'Длиннее допустимого на 1 байт.',
+      'Длиннее допустимого на 3 байта.',
+      'Длиннее допустимого на 5 байт.',
+      'Длиннее допустимого на 21 байт.',
+    ]);
+    expect(messages.en.snr(11.6)).toBe('signal +12 dB to noise');
+    expect(messages.en.snr(-4.4)).toBe('signal -4 dB to noise');
+    expect(messages.ru.snr(0.2)).toBe('сигнал/шум 0 дБ');
+    expect(messages.en.seconds(3.96)).toBe('4.0 s');
+    expect(messages.ru.seconds(3.96)).toBe('4,0 с');
+  });
+});
+
+describe('signed', () => {
+  it('rounds and shows the sign of what is not zero', () => {
+    expect([11.6, 0.4, -0.4, -4.5, -4.6].map(signed)).toEqual(['+12', '0', '0', '-4', '-5']);
   });
 });
 

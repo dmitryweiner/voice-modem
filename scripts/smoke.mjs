@@ -1,9 +1,14 @@
 // Browser smoke of the real app: language detection and memory, the modem
-// core loaded through the worker, no horizontal scroll on a phone, no console
-// errors. With --preview it runs against a fresh production build and also
-// checks that the service worker makes the app (WASM core included) work
-// offline and that a new deploy reaches a page that is already open (phones
-// suspend pages, never close them).
+// core loaded through the worker, a message received from the microphone and
+// one transmitted, no horizontal scroll on a phone, no console errors. With
+// --preview it runs against a fresh production build and also checks that
+// the service worker makes the app (WASM core included) work offline and
+// that a new deploy reaches a page that is already open (phones suspend
+// pages, never close them).
+//
+// The microphone is a WAV file made by modem-cli, which Chromium plays in a
+// loop as its fake capture device: the whole chain from the AudioWorklet to
+// the screen runs as with a real sound card. Needs a Rust toolchain.
 //
 //   npm run smoke               # dev server
 //   npm run smoke -- --preview  # production build + offline check
@@ -12,13 +17,28 @@
 // Prints one line per step; exits 1 on the first failed step or on any
 // console error. New checks are new steps here, not new scripts.
 
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { check, launch, parseArgs, VIEWPORTS } from './lib/harness.mjs';
 
 const flags = parseArgs(process.argv.slice(2));
 const preview = flags.has('preview');
 const shots = flags.has('shots');
-const app = await launch({ preview });
+
+const HEARD = 'Hello from the fake microphone';
+const temp = mkdtempSync(join(tmpdir(), 'voice-modem-smoke-'));
+const microphone = join(temp, 'microphone.wav');
+execFileSync('cargo', ['run', '--release', '--quiet', '-p', 'modem-cli', '--', 'encode', HEARD, '-o', microphone], {
+  stdio: ['ignore', 'ignore', 'inherit'],
+});
+
+const app = await launch({
+  preview,
+  browserArgs: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${microphone}`],
+});
 
 async function step(name, fn) {
   app.label(name);
@@ -50,6 +70,44 @@ try {
     await page.selectOption('#locale', 'en');
     await page.reload();
     check((await page.locator('html').getAttribute('lang')) === 'en', 'the switcher choice was lost on reload');
+    await context.close();
+  });
+
+  await step('a message played into the microphone appears on the page', async () => {
+    const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
+    await coreReady(page);
+    await page.click('#mic');
+    await page
+      .locator('#state')
+      .waitFor({ timeout: 10_000 })
+      .catch(() => check(false, 'the microphone did not turn on'));
+    // the recording loops: the first pass may have started before the worklet was ready
+    const received = page.locator('#feed .received .text').first();
+    await received.waitFor({ timeout: 30_000 }).catch(() => check(false, 'nothing was received'));
+    check((await received.textContent()) === HEARD, `received ${JSON.stringify(await received.textContent())}`);
+    const bars = await page
+      .locator('#spectrum > i')
+      .evaluateAll((list) => list.filter((bar) => bar.getBoundingClientRect().height > 10).length);
+    check(bars > 0, 'the spectrum shows nothing');
+    if (shots) await page.screenshot({ path: 'shots/phone-receiving.png', fullPage: true });
+    await context.close();
+  });
+
+  await step('a text is transmitted and the modem listens again', async () => {
+    const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
+    await coreReady(page);
+    await page.click('#mic');
+    await page.fill('#draft', 'ok');
+    await page.click('#send');
+    const state = page.locator('#state');
+    check((await state.textContent()) === 'Transmitting…', 'did not start transmitting');
+    check((await page.locator('#feed .sent .text').textContent()) === 'ok', 'the sent text is not in the feed');
+    // 'ok' is 3.3 s of sound
+    await page
+      .locator('#state:not(.transmitting)')
+      .waitFor({ timeout: 10_000 })
+      .catch(() => check(false, 'the transmission never ended'));
+    check((await page.locator('#feed .sent small').textContent()).startsWith('Sent'), 'the text is not marked as sent');
     await context.close();
   });
 
@@ -105,4 +163,5 @@ try {
   process.exitCode = 1;
 } finally {
   await app.close();
+  rmSync(temp, { recursive: true });
 }

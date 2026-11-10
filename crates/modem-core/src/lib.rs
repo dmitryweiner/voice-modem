@@ -14,6 +14,7 @@ pub mod crc;
 pub mod frame;
 pub mod mfsk;
 pub mod modem;
+pub mod resample;
 pub mod rx;
 pub mod sync;
 pub mod tx;

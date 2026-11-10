@@ -13,6 +13,8 @@
     "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }],
     // The automatic JSX runtime ("jsx": "react-jsx") imports what it needs itself.
     "react/react-in-jsx-scope": "off",
+    // Assigning `onmessage` is what starts a MessagePort; each port here has one handler by design.
+    "unicorn/prefer-add-event-listener": "off",
     // Build-time constants injected by Vite's `define` are spelled __LIKE_THIS__.
     "no-underscore-dangle": ["error", { "allow": ["__APP_ID__"] }]
   },

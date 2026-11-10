@@ -4,7 +4,8 @@ The sound on the wire, as implemented in `crates/modem-core`. Version 0:
 it changes freely until the first release. Every number here has a test in the
 module named next to it.
 
-All processing runs at **16 kHz**. Bits are sent most significant first;
+All processing runs at **16 kHz**; the core converts from and to the sample
+rate of the audio device (`resample.rs`). Bits are sent most significant first;
 multi-byte numbers are big-endian.
 
 ## Frame
@@ -103,6 +104,6 @@ for the noise in a 3 kHz band). On a clean signal the estimate tops out near
 
 ## Not there yet
 
-Other modes, a resampler for 44.1/48 kHz devices, tracking of the symbol clock
+Other modes, tracking of the symbol clock
 inside a frame, the link layer (acknowledgements, sessions) and everything
 above it: see [the plan](../plans/PLAN.md).

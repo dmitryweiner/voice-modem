@@ -13,9 +13,10 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
 ## Plans
 
 - [plans/PLAN.md](plans/PLAN.md) — the development plan: architecture,
-  protocol layers, stages 0–7 and the decisions taken. Stages 0 (skeleton)
-  and 1 (PHY minimum: mode R1, `modem-cli`, the simulator) are done; stage 2
-  (sound in the browser) is next.
+  protocol layers, stages 0–7 and the decisions taken. Stages 0
+  (skeleton), 1 (PHY minimum: mode R1, `modem-cli`, the simulator) and 2
+  (sound in the browser: one-way text over the air) are done; stage 3 (link
+  layer: half duplex, ARQ, sessions, PTT) is next.
 
 ## Commands
 
@@ -31,7 +32,8 @@ login shell may put an older one first). Rust — stable with the
 - `npm run check` — `check:rust` (cargo fmt, clippy, test) + WASM build +
   typecheck + oxlint + prettier + unit tests. Must pass before any work is
   called done.
-- `npm run smoke` — browser smoke on the dev server; `-- --preview` builds and
+- `npm run smoke` — browser smoke on the dev server (builds `modem-cli` for
+  the fake microphone, so it needs cargo); `-- --preview` builds and
   also checks offline mode; `-- --shots` saves screenshots to `shots/`.
 - `npm run build` — WASM, typecheck and build into `dist/`.
 - `npm run format` — prettier and `cargo fmt`.
@@ -58,12 +60,12 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | ------------------------------- | -------------------------------------------------- |
 | `npm run wasm`, nothing changed | 0.3 s                                              |
 | `npm run wasm`, clean           | ~40 s (first run also installs `wasm-bindgen-cli`) |
-| `npm run check`, warm           | ~3 s                                               |
-| `npm run smoke -- --preview`    | ~4 s                                               |
+| `npm run check`, warm           | ~7 s                                               |
+| `npm run smoke -- --preview`    | ~20 s                                              |
 | `cargo test --workspace`, warm  | ~2 s (the link tests take most of it)              |
 | the sweep example               | ~70 s                                              |
 | `node scripts/codecs.mjs`       | ~10 s                                              |
-| receiver, searching in noise    | 131× real time (native, release)                   |
+| receiver, searching in noise    | 131× real time native; 95× as WASM at 48 kHz       |
 
 ## Test-driven development is mandatory
 
@@ -94,14 +96,20 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   `examples/sweep.rs` — the measurements.
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
-- `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter (still only
-  the version).
+- `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter: `Modem`,
+  `ModemEvent`, `version`, `maxTextBytes`.
 - `src/main.tsx` — entry: renders the app with browser storage, languages and
   the worker client; registers the service worker in production.
-- `src/App.tsx` — the React UI.
-- `src/worker/` — `protocol.ts` (typed messages with a `jobId`), `client.ts`
-  (page side, creates the worker lazily), `handler.ts` (worker logic, tested
-  in node), `modem.worker.ts` (the thin worker file, the only importer of
+- `src/App.tsx` — the shell: language, core status. `src/ModemPanel.tsx` —
+  the modem on the page: microphone switch, input meter, messages, the text
+  to send.
+- `src/audio/` — `engine.ts` (AudioContext, microphone, wiring; browser
+  glue), `modem-io.worklet.js` (the AudioWorklet: plain JS, no imports),
+  `meter.ts` (peak and spectrum bars). Design: `docs/web-audio.md`.
+- `src/worker/` — `protocol.ts` (typed messages with a `jobId`, events),
+  `client.ts` (page side, creates the worker lazily), `handler.ts` (the
+  session: one modem on one audio channel; tested in node, also with the
+  real WASM), `modem.worker.ts` (the thin worker file, the only importer of
   WASM).
 - `src/wasm/` — wasm-pack output, gitignored.
 - `src/i18n/` — `en.ts` defines the messages, `ru.ts` follows its type;
@@ -127,6 +135,10 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   CI greps the main chunk for `WebAssembly`.
 - No SharedArrayBuffer (GitHub Pages sends no COOP/COEP headers): the page,
   the worker and the AudioWorklet exchange `postMessage` with transferables.
+- Sound never passes through the main thread: the worklet and the worker
+  talk over their own MessageChannel. The worklet only moves samples.
+- Browser APIs reach components as parameters (`startAudio`, `core`,
+  `storage`), so component tests run without a browser.
 - The wire format is specified in `docs/protocol.md`; a change to it changes
   that file in the same PR. Limits claimed in `docs/measurements.md` are
   guarded by `crates/modem-sim/tests/link.rs` with a margin.
