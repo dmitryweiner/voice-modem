@@ -1,0 +1,570 @@
+//! Receiver: a stream of samples → frames.
+//!
+//! Searches for the preamble, then demodulates the header and the payload.
+//! Fed in pieces of any size, it gives the same frames as when fed at once.
+//!
+//! Once a header is read the receiver takes the whole announced payload and
+//! does not look for preambles inside it: a frame that starts before a
+//! cut-off one would have ended is lost.
+
+use std::collections::VecDeque;
+
+use crate::SAMPLE_RATE;
+use crate::coding::{block_symbols, decode_block};
+use crate::crc::crc32;
+use crate::frame::{HEADER_BYTES, HEADER_MODE, Header, Mode};
+use crate::mfsk::{MfskParams, soft_bits, tone_energies};
+use crate::sync::{CHIRP_LEN, HZ_PER_SAMPLE, PREAMBLE_LEN, Reference};
+
+/// The up-chirp is looked for at every `SEARCH_STEP`-th position; its
+/// correlation peak is about 16 samples wide.
+const SEARCH_STEP: usize = 4;
+/// Share of the window energy that must be the chirp to call it found. Noise
+/// gives about 0.001 on average and exceeds this once in e¹² positions.
+const THRESHOLD: f32 = 0.012;
+/// After the threshold is crossed, the true peak is the largest value this far ahead.
+const REFINE: usize = 256;
+/// The largest frequency offset the receiver follows, Hz.
+pub const MAX_FREQ_OFFSET_HZ: f32 = 250.0;
+/// How far the offset moves each chirp peak, samples.
+const MAX_SHIFT: usize = (MAX_FREQ_OFFSET_HZ / HZ_PER_SAMPLE) as usize;
+/// CRC-32 after the payload.
+const CHECKSUM_BYTES: usize = 4;
+
+/// Length of the header in samples.
+pub fn header_len() -> usize {
+    let mfsk = HEADER_MODE.mfsk();
+    block_symbols(HEADER_BYTES, mfsk.bits_per_symbol) * mfsk.symbol_len
+}
+
+/// Length in samples of a payload of `bytes` bytes with its checksum.
+pub fn payload_len(mode: Mode, bytes: usize) -> usize {
+    let mfsk = mode.mfsk();
+    block_symbols(bytes + CHECKSUM_BYTES, mfsk.bits_per_symbol) * mfsk.symbol_len
+}
+
+/// What the receiver measured on a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RxStats {
+    /// Signal-to-noise ratio in dB, the noise taken over the whole band up to
+    /// half the sample rate (8 kHz). An estimate from the tone energies.
+    pub snr_db: f32,
+    /// How far the signal is shifted in frequency, Hz.
+    pub freq_offset_hz: f32,
+    /// Position of the first sample of the preamble in the stream.
+    pub start: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RxEvent {
+    /// A frame with a correct checksum.
+    Frame {
+        seq: u8,
+        mode: Mode,
+        payload: Vec<u8>,
+        stats: RxStats,
+    },
+    /// The header was read but the payload checksum is wrong.
+    Damaged { seq: u8, mode: Mode, stats: RxStats },
+}
+
+enum State {
+    /// Looking for the up-chirp from this position on.
+    Search { from: u64 },
+    Header {
+        start: u64,
+        freq_offset_hz: f32,
+        resume: u64,
+    },
+    Payload {
+        start: u64,
+        freq_offset_hz: f32,
+        header: Header,
+        header_snr: SnrEstimate,
+    },
+}
+
+/// Tone energy sums over the symbols of a block.
+#[derive(Clone, Copy, Default)]
+struct SnrEstimate {
+    loudest: f32,
+    rest: f32,
+    symbols: f32,
+}
+
+impl SnrEstimate {
+    fn add(&mut self, energies: &[f32]) {
+        let loudest = energies.iter().copied().fold(0.0, f32::max);
+        self.loudest += loudest;
+        self.rest += (energies.iter().sum::<f32>() - loudest) / (energies.len() - 1) as f32;
+        self.symbols += 1.0;
+    }
+
+    fn merged(self, other: SnrEstimate) -> SnrEstimate {
+        SnrEstimate {
+            loudest: self.loudest + other.loudest,
+            rest: self.rest + other.rest,
+            symbols: self.symbols + other.symbols,
+        }
+    }
+
+    /// A tone of power P gives the energy P·N²/2 in its own filter of N
+    /// samples; noise of power σ² gives N·σ² in every filter.
+    fn snr_db(self, symbol_len: usize) -> f32 {
+        let noise = self.rest / self.symbols;
+        let signal = self.loudest / self.symbols - noise;
+        let ratio = signal / noise.max(f32::MIN_POSITIVE) * 2.0 / symbol_len as f32;
+        (10.0 * ratio.max(1e-4).log10()).min(60.0)
+    }
+}
+
+pub struct Receiver {
+    /// Samples not yet done with; `buffer[0]` is sample number `base` of the
+    /// stream, counted from `MAX_SHIFT` samples of silence put in front of it:
+    /// a frequency offset moves the up-chirp peak of a frame that starts with
+    /// the stream to before its first sample.
+    buffer: Vec<f32>,
+    base: u64,
+    state: State,
+    up: Reference,
+    down: Reference,
+    events: VecDeque<RxEvent>,
+}
+
+impl Default for Receiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Receiver {
+    pub fn new() -> Self {
+        Self {
+            buffer: vec![0.0; MAX_SHIFT],
+            base: 0,
+            state: State::Search { from: 0 },
+            up: Reference::new(true),
+            down: Reference::new(false),
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Takes the next samples of the stream.
+    pub fn push(&mut self, samples: &[f32]) {
+        self.buffer.extend_from_slice(samples);
+        while self.step() {}
+        self.forget();
+    }
+
+    pub fn poll(&mut self) -> Option<RxEvent> {
+        self.events.pop_front()
+    }
+
+    /// `len` samples from stream position `start`, once they have all arrived.
+    fn samples(&self, start: u64, len: usize) -> Option<&[f32]> {
+        let offset = (start - self.base) as usize;
+        self.buffer.get(offset..offset + len)
+    }
+
+    /// Drops the samples no state will look at again.
+    fn forget(&mut self) {
+        let keep_from = match self.state {
+            State::Search { from } => from,
+            State::Header { start, resume, .. } => start.min(resume),
+            State::Payload { start, .. } => start,
+        };
+        let drop = (keep_from.saturating_sub(self.base) as usize).min(self.buffer.len());
+        self.buffer.drain(..drop);
+        self.base += drop as u64;
+    }
+
+    /// Advances the state machine; false when it needs more samples.
+    fn step(&mut self) -> bool {
+        match self.state {
+            State::Search { from } => self.search(from),
+            State::Header {
+                start,
+                freq_offset_hz,
+                resume,
+            } => self.header(start, freq_offset_hz, resume),
+            State::Payload {
+                start,
+                freq_offset_hz,
+                header,
+                header_snr,
+            } => self.payload(start, freq_offset_hz, header, header_snr),
+        }
+    }
+
+    fn search(&mut self, from: u64) -> bool {
+        // Everything a detection may look at: the refined up-chirp and the shifted down-chirp.
+        let lookahead = REFINE + PREAMBLE_LEN + 2 * MAX_SHIFT;
+        let mut position = from;
+        loop {
+            if self.samples(position, lookahead).is_none() {
+                self.state = State::Search { from: position };
+                return false;
+            }
+            if self.metric(&self.up, position) >= THRESHOLD {
+                break;
+            }
+            position += SEARCH_STEP as u64;
+        }
+
+        let resume = position + REFINE as u64 + 1;
+        let (up_at, _) = self.peak(&self.up, position, position + REFINE as u64);
+        // The offset moves the two peaks apart or together, by up to MAX_SHIFT each.
+        let expected = up_at + CHIRP_LEN as u64;
+        let (down_at, down_metric) = self.peak(
+            &self.down,
+            expected - 2 * MAX_SHIFT as u64,
+            expected + 2 * MAX_SHIFT as u64,
+        );
+        if down_metric < THRESHOLD {
+            self.state = State::Search { from: resume };
+            return true;
+        }
+        let shift = (down_at as i64 - expected as i64) as f32 / 2.0;
+        let preamble_at = (up_at as i64 + shift.round() as i64) as u64;
+        self.state = State::Header {
+            start: preamble_at + PREAMBLE_LEN as u64,
+            freq_offset_hz: shift * HZ_PER_SAMPLE,
+            resume,
+        };
+        true
+    }
+
+    fn metric(&self, reference: &Reference, position: u64) -> f32 {
+        self.samples(position, CHIRP_LEN)
+            .map_or(0.0, |window| reference.metric(window))
+    }
+
+    /// The position in `from..=to` where the chirp matches best, and how well.
+    fn peak(&self, reference: &Reference, from: u64, to: u64) -> (u64, f32) {
+        let mut best = (from, 0.0);
+        for position in from.max(self.base)..=to {
+            let metric = self.metric(reference, position);
+            if metric > best.1 {
+                best = (position, metric);
+            }
+        }
+        best
+    }
+
+    /// Soft bits of the symbols from `start` on, or None until all of them have arrived.
+    fn demodulate(
+        &self,
+        mfsk: &MfskParams,
+        start: u64,
+        symbols: usize,
+        freq_offset_hz: f32,
+    ) -> Option<(Vec<f32>, SnrEstimate)> {
+        let samples = self.samples(start, symbols * mfsk.symbol_len)?;
+        let mut soft = Vec::with_capacity(symbols * mfsk.bits_per_symbol);
+        let mut snr = SnrEstimate::default();
+        for symbol in samples.chunks_exact(mfsk.symbol_len) {
+            let energies = tone_energies(mfsk, symbol, freq_offset_hz);
+            soft_bits(mfsk, &energies, &mut soft);
+            snr.add(&energies);
+        }
+        Some((soft, snr))
+    }
+
+    fn header(&mut self, start: u64, freq_offset_hz: f32, resume: u64) -> bool {
+        let mfsk = HEADER_MODE.mfsk();
+        let symbols = block_symbols(HEADER_BYTES, mfsk.bits_per_symbol);
+        let Some((soft, header_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
+        else {
+            return false;
+        };
+        self.state = match Header::from_bytes(&decode_block(&soft, HEADER_BYTES)) {
+            Some(header) => State::Payload {
+                start,
+                freq_offset_hz,
+                header,
+                header_snr,
+            },
+            // Not a frame after all: go on searching right after the false preamble.
+            None => State::Search { from: resume },
+        };
+        true
+    }
+
+    fn payload(
+        &mut self,
+        header_start: u64,
+        freq_offset_hz: f32,
+        header: Header,
+        header_snr: SnrEstimate,
+    ) -> bool {
+        let mfsk = header.mode.mfsk();
+        let bytes = usize::from(header.len) + CHECKSUM_BYTES;
+        let symbols = block_symbols(bytes, mfsk.bits_per_symbol);
+        let start = header_start + header_len() as u64;
+        let Some((soft, payload_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
+        else {
+            return false;
+        };
+
+        let mut payload = decode_block(&soft, bytes);
+        let checksum = payload.split_off(usize::from(header.len));
+        let stats = RxStats {
+            snr_db: header_snr.merged(payload_snr).snr_db(mfsk.symbol_len),
+            freq_offset_hz,
+            start: header_start.saturating_sub((PREAMBLE_LEN + MAX_SHIFT) as u64),
+        };
+        let Header { seq, mode, .. } = header;
+        self.events
+            .push_back(if checksum == crc32(&payload).to_be_bytes() {
+                RxEvent::Frame {
+                    seq,
+                    mode,
+                    payload,
+                    stats,
+                }
+            } else {
+                RxEvent::Damaged { seq, mode, stats }
+            });
+        self.state = State::Search {
+            from: start + (symbols * mfsk.symbol_len) as u64,
+        };
+        true
+    }
+}
+
+/// Duration of `samples` samples in seconds.
+pub fn seconds(samples: usize) -> f32 {
+    samples as f32 / SAMPLE_RATE as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx::{TxConfig, encode_frame};
+
+    fn frame(seq: u8, payload: &[u8]) -> Vec<f32> {
+        encode_frame(seq, Mode::R1, payload, &TxConfig::default()).unwrap()
+    }
+
+    fn receive(samples: &[f32]) -> Vec<RxEvent> {
+        let mut receiver = Receiver::new();
+        receiver.push(samples);
+        std::iter::from_fn(|| receiver.poll()).collect()
+    }
+
+    fn payloads(events: &[RxEvent]) -> Vec<(u8, Vec<u8>)> {
+        events
+            .iter()
+            .map(|event| match event {
+                RxEvent::Frame { seq, payload, .. } => (*seq, payload.clone()),
+                RxEvent::Damaged { .. } => panic!("damaged frame"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn receives_a_clean_frame() {
+        let events = receive(&frame(7, b"hello, modem"));
+        assert_eq!(payloads(&events), [(7, b"hello, modem".to_vec())]);
+        let RxEvent::Frame { mode, stats, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(*mode, Mode::R1);
+        assert_eq!(stats.start, 0);
+        assert!(stats.freq_offset_hz.abs() < 1.0, "{}", stats.freq_offset_hz);
+        // The fades at the ends of the frame leak into other tones: the estimate tops out here.
+        assert!(stats.snr_db > 25.0, "{}", stats.snr_db);
+    }
+
+    #[test]
+    fn receives_empty_and_full_frames() {
+        let full: Vec<u8> = (0..255).collect();
+        assert_eq!(payloads(&receive(&frame(0, &[]))), [(0, vec![])]);
+        assert_eq!(payloads(&receive(&frame(255, &full))), [(255, full)]);
+    }
+
+    #[test]
+    fn finds_the_frame_anywhere_in_the_stream() {
+        for lead in [1usize, 3, 517, 4000, 20_001] {
+            let mut samples = vec![0.0; lead];
+            samples.extend(frame(1, b"offset"));
+            samples.extend(vec![0.0; 300]);
+            let events = receive(&samples);
+            assert_eq!(payloads(&events), [(1, b"offset".to_vec())], "lead {lead}");
+            let RxEvent::Frame { stats, .. } = &events[0] else {
+                unreachable!()
+            };
+            assert_eq!(stats.start, lead as u64, "lead {lead}");
+        }
+    }
+
+    #[test]
+    fn receives_frames_one_after_another() {
+        let mut samples = Vec::new();
+        for (seq, text) in [b"first".as_slice(), b"second", b"third"]
+            .iter()
+            .enumerate()
+        {
+            samples.extend(frame(seq as u8, text));
+            samples.extend(vec![0.0; 100 * seq]);
+        }
+        assert_eq!(
+            payloads(&receive(&samples)),
+            [
+                (0, b"first".to_vec()),
+                (1, b"second".to_vec()),
+                (2, b"third".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn pieces_of_any_size_give_the_same_result() {
+        let mut samples = vec![0.0; 777];
+        samples.extend(frame(1, b"in pieces"));
+        samples.extend(frame(2, b"again"));
+        let whole = receive(&samples);
+        assert_eq!(whole.len(), 2);
+        for size in [1usize, 128, 1000, 4801] {
+            let mut receiver = Receiver::new();
+            let mut events = Vec::new();
+            for piece in samples.chunks(size) {
+                receiver.push(piece);
+                events.extend(std::iter::from_fn(|| receiver.poll()));
+            }
+            assert_eq!(events, whole, "pieces of {size}");
+        }
+    }
+
+    #[test]
+    fn does_not_keep_old_samples() {
+        let mut receiver = Receiver::new();
+        for _ in 0..100 {
+            receiver.push(&[0.0; 1600]);
+        }
+        receiver.push(&frame(0, b"x"));
+        assert!(
+            receiver.buffer.len() < 2 * PREAMBLE_LEN,
+            "{}",
+            receiver.buffer.len()
+        );
+        assert!(receiver.poll().is_some());
+    }
+
+    #[test]
+    fn the_level_does_not_matter() {
+        for gain in [0.001, 0.1, 1.9] {
+            let samples: Vec<f32> = frame(4, b"level").iter().map(|x| x * gain).collect();
+            assert_eq!(
+                payloads(&receive(&samples)),
+                [(4, b"level".to_vec())],
+                "gain {gain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lead_in_tone_is_skipped() {
+        let config = TxConfig {
+            lead_in_ms: 400,
+            ..TxConfig::default()
+        };
+        let samples = encode_frame(9, Mode::R1, b"after the tone", &config).unwrap();
+        let events = receive(&samples);
+        assert_eq!(payloads(&events), [(9, b"after the tone".to_vec())]);
+        let RxEvent::Frame { stats, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(stats.start, 6400);
+    }
+
+    #[test]
+    fn reports_a_damaged_payload() {
+        let mut samples = frame(5, &[0x55; 60]);
+        let payload_at = PREAMBLE_LEN + header_len();
+        // Silence would only be erasures, which the code fills in; a wrong tone is believed.
+        for (n, x) in samples[payload_at + 2000..payload_at + 30_000]
+            .iter_mut()
+            .enumerate()
+        {
+            *x = (std::f32::consts::TAU * 1000.0 * n as f32 / SAMPLE_RATE as f32).sin() * 0.5;
+        }
+        let events = receive(&samples);
+        assert!(
+            matches!(
+                events[..],
+                [RxEvent::Damaged {
+                    seq: 5,
+                    mode: Mode::R1,
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_frame_gives_nothing_and_the_next_one_is_received() {
+        let mut samples = frame(1, b"cut off at the start of the header");
+        samples.truncate(PREAMBLE_LEN + 4 * 512);
+        samples.extend(vec![0.0; 3000]);
+        samples.extend(frame(2, b"whole"));
+        let events = receive(&samples);
+        let whole: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, RxEvent::Frame { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(payloads(&whole), [(2, b"whole".to_vec())], "{events:?}");
+    }
+
+    #[test]
+    fn silence_and_tones_give_nothing() {
+        assert_eq!(receive(&vec![0.0; 50_000]), []);
+        let tone: Vec<f32> = (0..50_000).map(|n| (n as f32 * 0.5).sin() * 0.5).collect();
+        assert_eq!(receive(&tone), []);
+    }
+
+    #[test]
+    fn a_shifted_frame_at_the_very_start_of_the_stream() {
+        // Every tone and the chirps 40 Hz up: the up-chirp peak is 41 samples before the frame.
+        let mut samples = Vec::new();
+        crate::sync::preamble_shifted(0.5, 40.0, &mut samples);
+        let shifted = MfskParams {
+            first_tone_hz: 790.0,
+            ..Mode::R1.mfsk()
+        };
+        let mut modulator = crate::mfsk::Modulator::new(shifted, 0.5);
+        let header = Header {
+            mode: Mode::R1,
+            seq: 3,
+            len: 2,
+        };
+        let mut block = b"hi".to_vec();
+        block.extend(crc32(b"hi").to_be_bytes());
+        for value in crate::coding::encode_block(&header.to_bytes(), 4)
+            .into_iter()
+            .chain(crate::coding::encode_block(&block, 4))
+        {
+            modulator.symbol(value, &mut samples);
+        }
+        let events = receive(&samples);
+        assert_eq!(payloads(&events), [(3, b"hi".to_vec())]);
+        let RxEvent::Frame { stats, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(stats.start, 0);
+        assert!(
+            (stats.freq_offset_hz - 40.0).abs() < 1.0,
+            "{}",
+            stats.freq_offset_hz
+        );
+    }
+
+    #[test]
+    fn lengths() {
+        assert_eq!(header_len(), 23 * 512);
+        assert_eq!(payload_len(Mode::R1, 0), 19 * 512);
+        assert_eq!(seconds(16_000), 1.0);
+    }
+}

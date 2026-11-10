@@ -10,9 +10,14 @@ repository = "https://github.com/dmitryweiner/voice-modem"
 
 [workspace.dependencies]
 modem-core = { path = "crates/modem-core" }
+modem-sim = { path = "crates/modem-sim" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Signal processing in tests is too slow unoptimised.
+[profile.dev]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

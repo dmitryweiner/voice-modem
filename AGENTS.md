@@ -13,8 +13,9 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
 ## Plans
 
 - [plans/PLAN.md](plans/PLAN.md) — the development plan: architecture,
-  protocol layers, stages 0–7 and the decisions taken. Stage 0 (skeleton) is
-  done; stage 1 (PHY minimum) is next.
+  protocol layers, stages 0–7 and the decisions taken. Stages 0 (skeleton)
+  and 1 (PHY minimum: mode R1, `modem-cli`, the simulator) are done; stage 2
+  (sound in the browser) is next.
 
 ## Commands
 
@@ -35,7 +36,18 @@ login shell may put an older one first). Rust — stable with the
 - `npm run build` — WASM, typecheck and build into `dist/`.
 - `npm run format` — prettier and `cargo fmt`.
 - `npm run icons` — render the PWA PNG icons from `public/icon.svg`.
-- `cargo run -p modem-cli` — the native tool (prints the core version for now).
+- `cargo run --release -p modem-cli -- help` — the native tool: `encode`
+  texts into a WAV file, `decode` a WAV file, pass one through a simulated
+  `channel`.
+
+## Scripts
+
+- `cargo run --release -p modem-sim --example sweep` — where the modem stops
+  working: frames received against noise, frequency and clock offset; the
+  speed of the receiver. Source of `docs/measurements.md`.
+- `node scripts/codecs.mjs` — the modem through real speech codecs with
+  ffmpeg (`--keep` keeps the WAV files).
+- `npm run smoke` — the browser smoke, see above.
 
 CI (`.github/workflows/ci.yml`) runs `check` and the preview smoke on every
 push and PR; a push to `main` publishes `dist/` to GitHub Pages.
@@ -48,6 +60,10 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | `npm run wasm`, clean           | ~40 s (first run also installs `wasm-bindgen-cli`) |
 | `npm run check`, warm           | ~3 s                                               |
 | `npm run smoke -- --preview`    | ~4 s                                               |
+| `cargo test --workspace`, warm  | ~2 s (the link tests take most of it)              |
+| the sweep example               | ~70 s                                              |
+| `node scripts/codecs.mjs`       | ~10 s                                              |
+| receiver, searching in noise    | 131× real time (native, release)                   |
 
 ## Test-driven development is mandatory
 
@@ -66,10 +82,20 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 
 ## Layout
 
-- `Cargo.toml` — the Rust workspace; `crates/modem-core` — DSP, modulations,
-  FEC, frames, link and transport; `crates/modem-sim` — channel models for
-  tests; `crates/modem-cli` — native tool (text/file ⇄ WAV);
-  `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter.
+- `Cargo.toml` — the Rust workspace (the dev profile is optimised: signal
+  processing in tests is too slow otherwise).
+- `crates/modem-core` — the modem. `modem.rs` — what the application sees
+  (commands, events, samples); `tx.rs` / `rx.rs` — a frame to samples and a
+  stream of samples to frames; `sync.rs` — the chirp preamble; `mfsk.rs` —
+  tones; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
+  and Viterbi; `frame.rs` — modes and the header; `crc.rs`, `bits.rs`.
+- `crates/modem-sim` — channel models (noise, band-pass, echo, frequency and
+  clock offset, clipping); `tests/link.rs` — the modem through them;
+  `examples/sweep.rs` — the measurements.
+- `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
+  `wav.rs`.
+- `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter (still only
+  the version).
 - `src/main.tsx` — entry: renders the app with browser storage, languages and
   the worker client; registers the service worker in production.
 - `src/App.tsx` — the React UI.
@@ -101,6 +127,10 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   CI greps the main chunk for `WebAssembly`.
 - No SharedArrayBuffer (GitHub Pages sends no COOP/COEP headers): the page,
   the worker and the AudioWorklet exchange `postMessage` with transferables.
+- The wire format is specified in `docs/protocol.md`; a change to it changes
+  that file in the same PR. Limits claimed in `docs/measurements.md` are
+  guarded by `crates/modem-sim/tests/link.rs` with a margin.
+- The receiver never delivers a payload whose CRC-32 failed.
 - `modem-wasm` and the worker file stay thin adapters; logic lives where it is
   unit-tested (`modem-core`, `handler.ts`).
 
