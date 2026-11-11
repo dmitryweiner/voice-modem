@@ -253,7 +253,10 @@ fn a_frame_drowned_by_interference_is_repeated_and_delivered_once() {
         1,
         "{at_alice:?}"
     );
-    assert_eq!(at_alice.last(), Some(&Event::MessageDelivered { id }));
+    assert!(
+        at_alice.contains(&Event::MessageDelivered { id }),
+        "{at_alice:?}"
+    );
 }
 
 #[test]
@@ -268,4 +271,42 @@ fn a_dead_channel_ends_in_not_delivered() {
     );
     assert_eq!(texts(&events(&mut bob)), [] as [&str; 0]);
     assert!(alice.is_idle());
+}
+
+#[test]
+fn the_speed_settles_where_the_noise_allows() {
+    let (mut alice, mut bob) = (station(1), station(2));
+    // Noise 2 dB below a single tone: enough for 125 bit/s, not for 250.
+    let mut noise = [Awgn::new(0.28, 7), Awgn::new(0.28, 8)];
+    let ids: Vec<u32> = (0..5)
+        .map(|n| {
+            alice
+                .send_text(&format!("message number {n}, of some length"))
+                .unwrap()
+        })
+        .collect();
+    talk(&mut alice, &mut bob, &mut noise, 60.0, |_| false);
+    let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
+    assert_eq!(texts(&at_bob).len(), 5);
+    for id in ids {
+        assert!(
+            at_alice.contains(&Event::MessageDelivered { id }),
+            "{at_alice:?}"
+        );
+    }
+    let modes: Vec<Mode> = at_alice
+        .iter()
+        .filter_map(|e| {
+            if let Event::TxMode { mode } = e {
+                Some(*mode)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(modes, [Mode::R2]);
+    assert!(
+        !at_alice.iter().any(|e| matches!(e, Event::Retry { .. })),
+        "{at_alice:?}"
+    );
 }

@@ -153,6 +153,9 @@ input {
 .station:disabled {
   display: none;
 }
+.station select {
+  inline-size: 100%;
+}
 .station label {
   display: flex;
   align-items: center;
@@ -191,7 +194,7 @@ input {
   align-items: center;
   gap: 12px;
 }
-.state {
+.state-box {
   flex: 1;
 }
 .link > button:only-child {
@@ -199,6 +202,10 @@ input {
 }
 .state {
   font-weight: 700;
+}
+.state-box > small {
+  display: block;
+  color: var(--muted);
 }
 .state::before {
   content: '';

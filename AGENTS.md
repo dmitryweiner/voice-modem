@@ -16,8 +16,9 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   protocol layers, stages 0–7 and the decisions taken. Stages 0
   (skeleton), 1 (PHY minimum: mode R1, `modem-cli`, the simulator), 2 (sound
   in the browser) and 3 (link layer: acknowledgements and repeats, taking
-  turns, greetings, push-to-talk) are done; stage 4 (fast modes and
-  adaptation) is next.
+  turns, greetings, push-to-talk) are done. Stage 4 (fast modes and
+  adaptation) is half done: modes R2–R4 and the choice of mode by the advice
+  in acknowledgements; coherent OFDM modes and LDPC are next.
 
 ## Commands
 
@@ -53,8 +54,11 @@ login shell may put an older one first). Rust — stable with the
 - `cargo run --release -p modem-sim --example sweep` — where the modem stops
   working: frames received against noise, frequency and clock offset; the
   speed of the receiver. Source of `docs/measurements.md`.
+- `cargo run --release -p modem-sim --example modes` — the modes compared:
+  the white noise and the room echo each withstands. Source of the mode
+  table and of the thresholds of `advise` in `link.rs`.
 - `node scripts/codecs.mjs` — the modem through real speech codecs with
-  ffmpeg (`--keep` keeps the WAV files).
+  ffmpeg (`--mode r3` for another mode, `--keep` keeps the WAV files).
 - `npm run smoke` — the browser smoke, see above.
 
 CI (`.github/workflows/ci.yml`) runs `check` and the preview smoke on every

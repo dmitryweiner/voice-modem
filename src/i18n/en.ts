@@ -13,6 +13,8 @@ export const en = {
 
   nameLabel: 'Your name or callsign',
   pttLabel: 'Push-to-talk',
+  speedLabel: 'Speed',
+  speedAuto: 'Speed: by the channel',
   pttHint: 'A radio with a push-to-talk button that I press myself',
   micOn: 'Turn the microphone on',
   micOff: 'Turn off',
@@ -48,6 +50,7 @@ export const en = {
   coreReady: (version: string) => `Modem core ${version} is ready.`,
   tooLong: (bytes: number) => `Too long by ${bytes} ${plural('en', bytes, { one: 'byte', other: 'bytes' })}.`,
   snr: (db: number) => `signal ${signed(db)} dB to noise`,
+  bitRate: (rate: number) => `${rate} bit/s`,
   attempt: (attempt: number) => `attempt ${attempt}`,
   peerNamed: (name: string) => `${name} is on the channel.`,
 };

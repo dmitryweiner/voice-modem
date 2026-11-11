@@ -78,7 +78,7 @@ export function App({ storage, languages, core, startAudio }: AppProps) {
           core={core}
           startAudio={startAudio}
           coreReady={coreState.status === 'ready'}
-          station={{ name: settings.name, manualPtt: settings.manualPtt }}
+          station={{ name: settings.name, manualPtt: settings.manualPtt, mode: settings.mode }}
           onStationChange={(station) => update({ ...settings, ...station })}
         />
       </main>

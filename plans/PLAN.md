@@ -274,7 +274,7 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–3 are done (2026-11-10). What they settled is in
+**Progress**: stages 0–3 are done and stage 4 is half done (2026-11-11). What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
@@ -285,6 +285,17 @@ these places:
 - The link layer is stop-and-wait, one frame per acknowledgement; the
   selective acknowledgement of a burst waits for modes fast enough to need it
   (stage 4).
+- **The medium group of modes is not OFDM.** Over the air the limit turned
+  out to be the echo of the room, not noise, and what beat it was tones that
+  avoid the frequencies still ringing. Differential OFDM keeps every carrier
+  on all the time and has no such escape. So the ladder above R1 is the same
+  idea made faster — several tones at once, fewer sets in turn: R2, R3, R4 at
+  125, 250 and 500 bit/s. Coherent OFDM (the F group, 1–5 kbit/s) remains
+  for channels without echo — a cable, a wired line, a metre of air — and
+  LDPC with it: the second half of stage 4.
+- Adaptation has no separate probing: the first frame goes in R1 and every
+  acknowledgement carries the mode the receiver advises, from the SNR it
+  measured. Per-frequency measurements wait for the modes that can use them.
 - There is no session yet, only a greeting that carries the name and the
   capabilities field. Frames have a sender but no destination, so the link is
   for two stations. Addressed sessions come with probing (stage 4), which

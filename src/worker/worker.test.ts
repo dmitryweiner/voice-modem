@@ -69,6 +69,8 @@ const coreEvent = (fields: Partial<CoreModemEvent> & { kind: string }): CoreMode
   text: '',
   id: 0,
   attempt: 0,
+  mode: 0,
+  bitRate: 0,
   station: 0,
   snrDb: 0,
   freqOffsetHz: 0,
@@ -96,7 +98,7 @@ function counter() {
   return () => next++;
 }
 
-const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false } as const;
+const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false, mode: null } as const;
 
 /** A session on a fake core, started at 48 kHz. */
 async function startedSession() {
@@ -137,6 +139,8 @@ describe('protocol', () => {
       { ...start, sampleRate: '48000' },
       { ...start, name: undefined },
       { ...start, manualPtt: 'no' },
+      { ...start, mode: 'fast' },
+      { ...start, mode: undefined },
       { type: 'sendText', jobId: 1 },
       { type: 'other', jobId: 1 },
       null,
@@ -160,6 +164,7 @@ describe('protocol', () => {
       { type: 'event', event: { kind: 'retry', id: 1, attempt: 2 } },
       { type: 'event', event: { kind: 'frameLost', snrDb: -3, freqOffsetHz: 12 } },
       { type: 'event', event: { kind: 'txRequest' } },
+      { type: 'event', event: { kind: 'txMode', mode: 1, bitRate: 125 } },
       { type: 'event', event: { kind: 'txStart', seconds: 2.5 } },
       { type: 'event', event: { kind: 'txEnd' } },
     ];
@@ -195,7 +200,7 @@ describe('session', () => {
   it('starts a modem for the device, with a random address and seed', async () => {
     const { out, modem } = await startedSession();
     expect(out).toEqual([{ type: 'started', jobId: 1, maxTextBytes: 5 }]);
-    expect(modem.options).toEqual({ sampleRate: 48_000, name: 'Alice', manualPtt: false, station: 0x5678, seed: 0x12345679 });
+    expect(modem.options).toEqual({ sampleRate: 48_000, name: 'Alice', manualPtt: false, mode: null, station: 0x5678, seed: 0x12345679 });
   });
 
   it('reports a sample rate the core refuses', async () => {
@@ -220,6 +225,7 @@ describe('session', () => {
       coreEvent({ kind: 'sent', id: 6 }),
       coreEvent({ kind: 'retry', id: 7, attempt: 3 }),
       coreEvent({ kind: 'frameLost', snrDb: -5, freqOffsetHz: 3 }),
+      coreEvent({ kind: 'txMode', mode: 2, bitRate: 250 }),
       coreEvent({ kind: 'txRequest' }),
     );
     audio.hear(block);
@@ -231,6 +237,7 @@ describe('session', () => {
       { kind: 'sent', id: 6 },
       { kind: 'retry', id: 7, attempt: 3 },
       { kind: 'frameLost', snrDb: -5, freqOffsetHz: 3 },
+      { kind: 'txMode', mode: 2, bitRate: 250 },
       { kind: 'txRequest' },
     ]);
   });
@@ -318,7 +325,7 @@ describe('session', () => {
   it('a second start replaces the first modem', async () => {
     const { handle, audio, modem, modems } = await startedSession();
     const second = new FakeAudioPort();
-    await handle({ ...START, jobId: 5, sampleRate: 44_100, manualPtt: true, port: second.port });
+    await handle({ ...START, jobId: 5, sampleRate: 44_100, manualPtt: true, mode: 3, port: second.port });
     expect(modem.freed).toBe(true);
     expect(audio.closed).toBe(true);
     expect(modems.map((m) => [m.options.sampleRate, m.options.manualPtt])).toEqual([
@@ -415,8 +422,8 @@ describe('coreClient', () => {
   it('hands the audio port over to the worker on start', async () => {
     const { client, workers } = setup();
     const { port1, port2 } = new MessageChannel();
-    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true });
-    expect(workers[0]?.sent).toEqual([{ type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true }]);
+    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true, mode: 2 });
+    expect(workers[0]?.sent).toEqual([{ type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true, mode: 2 }]);
     expect(workers[0]?.transfers).toEqual([[port1]]);
     workers[0]?.reply({ type: 'started', jobId: 1, maxTextBytes: 1000 });
     expect(await started).toEqual({ maxTextBytes: 1000 });
@@ -457,7 +464,7 @@ describe('coreClient', () => {
 const realCore: Core = {
   version,
   maxTextBytes,
-  createModem: ({ sampleRate, station, name, manualPtt, seed }) => new Modem(sampleRate, station, name, manualPtt, seed),
+  createModem: ({ sampleRate, station, name, manualPtt, seed, mode }) => new Modem(sampleRate, station, name, manualPtt, seed, mode ?? 255),
 };
 
 /** A session on the real core, started at 48 kHz. */
@@ -532,6 +539,8 @@ describe('the WASM core', () => {
     expect(events(alice.out)).toEqual([
       { kind: 'txStart', seconds: expect.closeTo(6.44, 1) },
       { kind: 'delivered', id: 1 },
+      // heard as through a cable: the other side advises the fastest mode, one step up for now
+      { kind: 'txMode', mode: 1, bitRate: 125 },
     ]);
     await alice.handle({ type: 'stop', jobId: 4 });
     await bob.handle({ type: 'stop', jobId: 5 });

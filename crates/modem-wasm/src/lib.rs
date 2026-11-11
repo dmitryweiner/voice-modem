@@ -1,7 +1,7 @@
 //! Browser binding of the core. A thin adapter: logic and its tests live in
 //! `modem-core`; this crate only converts types at the JS boundary.
 
-use modem_core::{CommandError, Config, ConfigError, Event, RxStats};
+use modem_core::{CommandError, Config, ConfigError, Event, Mode, RxStats};
 use wasm_bindgen::prelude::*;
 
 /// Version of the core.
@@ -33,11 +33,17 @@ pub struct ModemEvent {
     /// "retry": no acknowledgement, the message `id` goes out for the `attempt`-th time.
     /// "frameLost": something was transmitted nearby but could not be read.
     /// "txRequest": push-to-talk — press the button and call `pttPressed`.
+    /// "txMode": data frames go out in the mode number `mode` from now on.
     pub kind: String,
     pub text: String,
     /// The id `sendText` returned.
     pub id: u32,
     pub attempt: u8,
+    /// 0 is the slowest mode, R1.
+    pub mode: u8,
+    /// Bits of payload per second in that mode.
+    #[wasm_bindgen(js_name = bitRate)]
+    pub bit_rate: f32,
     /// The address of the station a message or a greeting came from.
     pub station: u16,
     /// Signal-to-noise ratio of the received frame, dB, noise over the band up to 8 kHz.
@@ -97,16 +103,23 @@ impl From<Event> for ModemEvent {
             },
             Event::FrameLost { stats } => Self::heard("frameLost", stats),
             Event::TxRequest => Self::of("txRequest"),
+            Event::TxMode { mode } => Self {
+                mode: mode.id(),
+                bit_rate: mode.bit_rate(),
+                ..Self::of("txMode")
+            },
         }
     }
 }
 
+/// `mode`: the number of the mode of every data frame, or anything else (255) to adapt.
 fn new_modem(
     sample_rate: u32,
     station: u16,
     name: String,
     manual_ptt: bool,
     seed: u32,
+    mode: u8,
 ) -> Result<modem_core::Modem, String> {
     let config = Config {
         sample_rate,
@@ -114,6 +127,7 @@ fn new_modem(
         name,
         manual_ptt,
         seed: u64::from(seed),
+        mode: Mode::from_id(mode),
         ..Config::default()
     };
     modem_core::Modem::new(config).map_err(|ConfigError::UnsupportedSampleRate(rate)| {
@@ -136,6 +150,8 @@ impl Modem {
     /// A modem for an audio device running at `sample_rate` Hz. `station` is
     /// the address of this station and `seed` feeds its random waits: both
     /// random numbers. With `manual_ptt` every transmission waits for `pttPressed`.
+    /// `mode` is the number of a mode to use for every data frame (0 = R1 … 3 =
+    /// R4), or 255 to adapt to the channel.
     #[wasm_bindgen(constructor)]
     pub fn new(
         sample_rate: u32,
@@ -143,8 +159,9 @@ impl Modem {
         name: String,
         manual_ptt: bool,
         seed: u32,
+        mode: u8,
     ) -> Result<Modem, JsError> {
-        new_modem(sample_rate, station, name, manual_ptt, seed)
+        new_modem(sample_rate, station, name, manual_ptt, seed, mode)
             .map(Modem)
             .map_err(|message| JsError::new(&message))
     }
@@ -204,6 +221,7 @@ mod tests {
                 format!("station {station}"),
                 false,
                 u32::from(station),
+                255,
             )
             .unwrap(),
         )
@@ -235,7 +253,7 @@ mod tests {
     #[test]
     fn errors_are_put_into_words() {
         assert_eq!(
-            new_modem(100, 1, String::new(), false, 1).err(),
+            new_modem(100, 1, String::new(), false, 1, 255).err(),
             Some("unsupported sample rate: 100 Hz".to_string())
         );
         let mut modem = modem(1);
@@ -269,8 +287,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_mode_is_set_by_its_number() {
+        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, 1, 3).unwrap());
+        let mut bob = modem(2);
+        send_text(&mut alice.0, "at 500 bit/s from the first frame").unwrap();
+        run(&mut alice, &mut bob, 5);
+        assert_eq!(
+            bob.poll_event().unwrap().text,
+            "at 500 bit/s from the first frame"
+        );
+        assert_eq!(
+            kinds(&mut alice),
+            [("delivered".to_string(), String::new(), 1)]
+        );
+    }
+
+    #[test]
     fn greetings_and_push_to_talk_reach_the_application() {
-        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, 1).unwrap());
+        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, 1, 255).unwrap());
         let mut bob = modem(2);
         alice.hello();
         run(&mut alice, &mut bob, 1);

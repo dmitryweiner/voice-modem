@@ -66,6 +66,41 @@ signal: it plays no part here. 40-byte frames, 25 rooms per point.
   own tones instead of a wrong tone.
 - Beyond −9 dB the preamble is the next thing to fail.
 
+## The four modes compared (2026-11-11)
+
+`cargo run --release -p modem-sim --example modes` — 40-byte frames, 20 per
+point. The level a mode needs, for 19 or 20 frames of 20:
+
+| Mode | Speed      | White noise, SNR | Room, RT60 0.3 s, direct | Room, RT60 0.5 s, direct |
+| ---- | ---------- | ---------------- | ------------------------ | ------------------------ |
+| R1   | 62.5 bit/s | −15 dB           | −9 dB or less            | −9 dB or less            |
+| R2   | 125 bit/s  | −6 dB            | −9 dB                    | −3 dB                    |
+| R3   | 250 bit/s  | 0 dB             | 3 dB                     | 3 dB                     |
+| R4   | 500 bit/s  | 9 dB             | 9 dB                     | 9 dB                     |
+
+SNR is that of the header, a single tone at full level; the faster modes
+split the same peak level between their tones. Each doubling of the speed
+costs 6–9 dB of noise and 6 dB of room, that is half the distance.
+
+Through the codecs (`node scripts/codecs.mjs --mode r2` and so on; messages
+of five that arrive):
+
+| Codec                                                     | R1  | R2  | R3  | R4  |
+| --------------------------------------------------------- | --- | --- | --- | --- |
+| G.711 µ-law, G.726 32 and 16 kbit/s, G.723.1, AMR-NB 12.2 | 5   | 5   | 5   | 5   |
+| AMR-NB, 4.75 kbit/s                                       | 5   | 5   | 2   | 0   |
+| Opus voice, 24 kbit/s                                     | 5   | 5   | 5   | 5   |
+| Opus voice, 16 kbit/s                                     | 5   | 5   | 5   | 4   |
+| Opus voice, 12, 8 and 6 kbit/s                            | 5   | 5   | 0–1 | 0   |
+| iLBC, 15.2 kbit/s                                         | 4   | 3   | 3   | 3   |
+
+The SNR the receiver measures on the header predicts this well enough for
+the choice of mode: where it reads below 5 dB (AMR 4.75, Opus 12 and less) R3
+fails and is not advised; where it reads 10 dB and more, R3 gets through.
+
+Not measured: the modes over the air, and the choice of mode on a real
+channel.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through

@@ -12,6 +12,8 @@ export const ru: Messages = {
 
   nameLabel: 'Ваше имя или позывной',
   pttLabel: 'Тангента',
+  speedLabel: 'Скорость',
+  speedAuto: 'Скорость: по каналу',
   pttHint: 'Рация с тангентой, которую я нажимаю сам',
   micOn: 'Включить микрофон',
   micOff: 'Выключить',
@@ -48,6 +50,7 @@ export const ru: Messages = {
   tooLong: (bytes: number) =>
     `Длиннее допустимого на ${bytes} ${plural('ru', bytes, { one: 'байт', few: 'байта', many: 'байт', other: 'байта' })}.`,
   snr: (db: number) => `сигнал/шум ${signed(db)} дБ`,
+  bitRate: (rate: number) => `${String(rate).replace('.', ',')} бит/с`,
   attempt: (attempt: number) => `попытка ${attempt}`,
   peerNamed: (name: string) => `На канале ${name}.`,
 };

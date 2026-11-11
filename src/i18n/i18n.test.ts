@@ -79,6 +79,8 @@ describe('messages', () => {
     expect(messages.en.snr(-4.4)).toBe('signal -4 dB to noise');
     expect(messages.ru.snr(0.2)).toBe('сигнал/шум 0 дБ');
     expect(messages.en.attempt(2)).toBe('attempt 2');
+    expect(messages.en.bitRate(62.5)).toBe('62.5 bit/s');
+    expect(messages.ru.bitRate(62.5)).toBe('62,5 бит/с');
     expect(messages.ru.peerNamed('UB1XYZ')).toBe('На канале UB1XYZ.');
   });
 });

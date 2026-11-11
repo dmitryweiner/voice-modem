@@ -18,6 +18,8 @@ export interface CoreModemEvent {
   text: string;
   id: number;
   attempt: number;
+  mode: number;
+  bitRate: number;
   station: number;
   snrDb: number;
   freqOffsetHz: number;
@@ -41,7 +43,7 @@ export interface Core {
 }
 
 function toEvent(event: CoreModemEvent): CoreEvent | null {
-  const { kind, text, id, attempt, station, snrDb, freqOffsetHz } = event;
+  const { kind, text, id, attempt, mode, bitRate, station, snrDb, freqOffsetHz } = event;
   event.free?.();
   switch (kind) {
     case 'message':
@@ -56,6 +58,8 @@ function toEvent(event: CoreModemEvent): CoreEvent | null {
       return { kind, id, attempt };
     case 'frameLost':
       return { kind, snrDb, freqOffsetHz };
+    case 'txMode':
+      return { kind, mode, bitRate };
     case 'txRequest':
       return { kind };
     default:
@@ -124,9 +128,16 @@ export function createSession(
         return { type: 'version', jobId, version: loaded.version() };
       case 'start': {
         stop();
-        const { name, manualPtt } = message;
+        const { name, manualPtt, mode } = message;
         // An address of zero is as good as any other; the seed must not be zero for some generators.
-        modem = loaded.createModem({ sampleRate: message.sampleRate, name, manualPtt, station: random() & 0xffff, seed: random() | 1 });
+        modem = loaded.createModem({
+          sampleRate: message.sampleRate,
+          name,
+          manualPtt,
+          mode,
+          station: random() & 0xffff,
+          seed: random() | 1,
+        });
         sampleRate = message.sampleRate;
         audio = message.port;
         audio.onmessage = (event: MessageEvent<unknown>) => onAudio(event.data);
