@@ -280,10 +280,16 @@ mod tests {
         );
         assert!(event.snr_db > 20.0 && event.freq_offset_hz.abs() < 1.0);
         assert!(bob.poll_event().is_none());
+        let mut at_alice = std::iter::from_fn(|| alice.poll_event());
+        let delivered = at_alice.next().unwrap();
+        assert_eq!((delivered.kind.as_str(), delivered.id), ("delivered", id));
+        // over a cable the other side advises the fastest mode: one step up for now
+        let faster = at_alice.next().unwrap();
         assert_eq!(
-            kinds(&mut alice),
-            [("delivered".to_string(), String::new(), id)]
+            (faster.kind.as_str(), faster.mode, faster.bit_rate),
+            ("txMode", 1, 125.0)
         );
+        assert!(at_alice.next().is_none());
     }
 
     #[test]
