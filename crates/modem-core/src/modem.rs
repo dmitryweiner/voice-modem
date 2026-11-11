@@ -159,6 +159,12 @@ impl Modem {
         })
     }
 
+    /// Takes back a text that is not delivered yet; false when it is no
+    /// longer waiting. What is already playing is played to the end.
+    pub fn cancel(&mut self, id: u32) -> bool {
+        self.link.cancel(id)
+    }
+
     /// Queues a greeting with the name of this station; stations that hear it answer with theirs.
     pub fn hello(&mut self) {
         self.link.hello(self.clock);
@@ -387,6 +393,18 @@ mod tests {
                 .chain(&at_bob)
                 .any(|e| matches!(e, Event::MessageFailed { .. }))
         );
+    }
+
+    #[test]
+    fn a_cancelled_text_is_not_repeated() {
+        let mut alone = modem(1);
+        let id = alone.send_text("anyone?").unwrap();
+        run(&mut [&mut alone], 4.0);
+        assert!(alone.cancel(id));
+        run(&mut [&mut alone], 20.0);
+        assert_eq!(events(&mut alone), []);
+        assert!(alone.is_idle());
+        assert!(!alone.cancel(id));
     }
 
     #[test]

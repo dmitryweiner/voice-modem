@@ -101,7 +101,7 @@ try {
     await context.close();
   });
 
-  await step('a text is transmitted, and repeated when nobody acknowledges it', async () => {
+  await step('a text is transmitted, repeated when nobody acknowledges it, and cancelled', async () => {
     const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
     await coreReady(page);
     await page.click('#mic');
@@ -121,6 +121,10 @@ try {
     // the fake microphone does not answer: the link layer tries again
     const repeated = page.locator('#feed .sent small', { hasText: 'attempt 2' });
     await repeated.waitFor({ timeout: 20_000 }).catch(() => check(false, 'the text was not repeated'));
+    // taken back, it stops there
+    await page.click('#feed .cancel');
+    const cancelled = page.locator('#feed .sent small', { hasText: 'Cancelled' });
+    await cancelled.waitFor({ timeout: 5000 }).catch(() => check(false, 'the text was not cancelled'));
     await context.close();
   });
 

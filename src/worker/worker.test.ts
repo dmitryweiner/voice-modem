@@ -30,7 +30,7 @@ class FakeModem implements CoreModem {
   heard: Float32Array[] = [];
   events: CoreModemEvent[] = [];
   texts: string[] = [];
-  calls: string[] = [];
+  calls: (string | [string, number])[] = [];
   freed = false;
   /** Samples the modem wants played; the test sets it. */
   pending = 0;
@@ -45,6 +45,10 @@ class FakeModem implements CoreModem {
   }
   pttPressed() {
     this.calls.push('ptt');
+  }
+  cancel(id: number) {
+    this.calls.push(['cancel', id]);
+    return true;
   }
   pushRx(samples: Float32Array) {
     this.heard.push(samples);
@@ -131,6 +135,7 @@ describe('protocol', () => {
       { type: 'ptt', jobId: 1 },
       start,
       { type: 'sendText', jobId: 1, text: 'hi' },
+      { type: 'cancel', jobId: 1, id: 3 },
     ];
     for (const request of good) expect({ request, ok: isWorkerIn(request) }).toEqual({ request, ok: true });
     const bad = [
@@ -297,6 +302,14 @@ describe('session', () => {
     ]);
   });
 
+  it('takes a text back by its id', async () => {
+    const { handle, out, modem } = await startedSession();
+    out.length = 0;
+    await handle({ type: 'cancel', jobId: 2, id: 7 });
+    expect(modem.calls).toEqual([['cancel', 7]]);
+    expect(out).toEqual([{ type: 'done', jobId: 2 }]);
+  });
+
   it('refuses a text the core refuses, and anything before the start', async () => {
     const { handle, out } = await startedSession();
     out.length = 0;
@@ -436,14 +449,15 @@ describe('coreClient', () => {
     const sent = client.sendText('hello');
     workers[0]?.reply({ type: 'queued', jobId: 1, id: 8 });
     expect(await sent).toEqual({ id: 8 });
-    const rest = [client.hello(), client.ptt(), client.stop()];
-    for (const jobId of [2, 3, 4]) workers[0]?.reply({ type: 'done', jobId });
-    expect(await Promise.all(rest)).toEqual([undefined, undefined, undefined]);
+    const rest = [client.hello(), client.ptt(), client.cancel(8), client.stop()];
+    for (const jobId of [2, 3, 4, 5]) workers[0]?.reply({ type: 'done', jobId });
+    expect(await Promise.all(rest)).toEqual([undefined, undefined, undefined, undefined]);
     expect(workers[0]?.sent).toEqual([
       { type: 'sendText', jobId: 1, text: 'hello' },
       { type: 'hello', jobId: 2 },
       { type: 'ptt', jobId: 3 },
-      { type: 'stop', jobId: 4 },
+      { type: 'cancel', jobId: 4, id: 8 },
+      { type: 'stop', jobId: 5 },
     ]);
   });
 

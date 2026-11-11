@@ -128,7 +128,7 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `src/App.tsx` — the shell: language, core status. `src/ModemPanel.tsx` —
   the modem on the page: station settings (name, push-to-talk, speed),
   microphone switch, state and speed, input meter, the scrolling box of
-  messages with delivery statuses, resend and clear, the text to send.
+  messages with delivery statuses, cancel, resend and clear, the text to send.
 - `src/audio/` — `engine.ts` (AudioContext, microphone, wiring; browser
   glue), `modem-io.worklet.js` (the AudioWorklet: plain JS, no imports),
   `meter.ts` (peak and spectrum bars). Design: `docs/web-audio.md`.
