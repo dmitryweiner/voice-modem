@@ -113,8 +113,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   processing in tests is too slow otherwise).
 - `crates/modem-core` — the modem. `modem.rs` — what the application sees
   (texts, events, samples); `link.rs` — the link layer, pure logic on frames
-  and a clock (acknowledgements, repeats, turns, segments, greetings,
-  push-to-talk, the choice of mode); `tx.rs` / `rx.rs` — a frame to samples
+  and a clock (acknowledgements, repeats, turns, segments and cutting them
+  again for a slower mode, greetings, push-to-talk, cancelling, the ladder
+  of modes and the advice); `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
@@ -124,8 +125,8 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   `conv.rs` — convolutional code and Viterbi; `crc.rs`, `bits.rs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room
   reverberation, frequency and clock offset, clipping); `tests/link.rs` — the
-  modem through them; `examples/sweep.rs`, `examples/modes.rs` — the
-  measurements (see Scripts).
+  modem through them; `examples/sweep.rs`, `examples/modes.rs`,
+  `examples/pause.rs` — the measurements (see Scripts).
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
 - `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter: `Modem`,

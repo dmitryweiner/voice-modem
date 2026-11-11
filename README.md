@@ -18,9 +18,10 @@ to press it.
 
 Seven modes from 62.5 to 4200 bit/s, chosen by the modem itself from how well
 the other side hears it: tones for noise, distance and phone codecs, and
-carriers (OFDM under an LDPC code) for a cable or a speaker close by. The slowest is received down to 15 dB below white
-noise and through speech codecs down to 4.75 kbit/s; over the air between a
-laptop and a phone it is reliable at 8 m
+carriers (OFDM under an LDPC code) for a cable or a speaker close by. The
+slowest is received down to 15 dB below white noise and through speech
+codecs down to 4.75 kbit/s; over the air between a laptop and a phone it is
+reliable at 8 m. The fast ones are measured in simulation only so far
 ([measurements](docs/measurements.md), [protocol](docs/protocol.md),
 [sound in the browser](docs/web-audio.md)). The rest is being built stage by
 stage — see [plans/PLAN.md](plans/PLAN.md).

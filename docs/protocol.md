@@ -56,11 +56,11 @@ Seven bytes, always in mode R1:
 | 4    | the eight lowest bits of the payload length in bytes                                       |
 | 5–6  | CRC-16/CCITT-FALSE of bytes 0–4 (polynomial 0x1021, initial value 0xFFFF)                  |
 
-| Kind | Name            | Address and number                                   | Payload                                                                      |
-| ---- | --------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 0    | data            | of the sender; it counts its frames, wrapping around | yes; asks for an acknowledgement                                             |
-| 1    | acknowledgement | those of the data frame it answers                   | none: the frame ends with the header; the length is the advised mode (below) |
-| 2    | broadcast       | of the sender                                        | yes; expects no answer                                                       |
+| Kind | Name            | Address and number                                    | Payload                                                                      |
+| ---- | --------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
+| 0    | data            | of the sender; it counts its frames, 0 again after 63 | yes; asks for an acknowledgement                                             |
+| 1    | acknowledgement | those of the data frame it answers                    | none: the frame ends with the header; the length is the advised mode (below) |
+| 2    | broadcast       | of the sender                                         | yes; expects no answer                                                       |
 
 A receiver that does not know the version, the kind or the mode drops the
 frame.

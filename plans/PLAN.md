@@ -325,6 +325,24 @@ Open:
   whose beginning was missed (36× real time natively).
 - The app icon is still the template's.
 
+Where stage 5 starts from:
+
+- A frame carries 1023 bytes at most, and only in a fast mode (64 in R1): a
+  file goes as a message of many segments, so the limit of 1000 bytes per
+  message (`MAX_TEXT_BYTES`) and the two-byte offset of a segment are the
+  first things files outgrow.
+- The link is stop-and-wait: every frame costs 1.25 s of preamble and header
+  and as much again for its acknowledgement. At 4200 bit/s a full frame is
+  2 s of data in about 6 s of exchange — bursts with a selective
+  acknowledgement, postponed twice, pay off here if anywhere.
+- Message types are the low four bits of the first payload byte (0 text,
+  1 hello); unknown ones are acknowledged and ignored, so new types do not
+  break old stations. The capabilities field of the greeting is still 0.
+- Broadcast frames exist (`reliable: false`, sent once in a fixed mode) but
+  the web app has no switch for them.
+- Cancelling exists for texts (`Link::cancel`); a file transfer needs the
+  same on both sides.
+
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.
 
