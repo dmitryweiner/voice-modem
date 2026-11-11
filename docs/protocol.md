@@ -211,5 +211,5 @@ followed by an unreadable header, are reported as "heard but not read".
 
 ## Not there yet
 
-Other modes, tracking of the symbol clock inside a frame, addressed
-sessions, files and everything else above the link layer: see [the plan](../plans/PLAN.md).
+Coherent (OFDM) modes and LDPC, tracking of the symbol clock inside a frame,
+addressed sessions, files and everything else above the link layer: see [the plan](../plans/PLAN.md).

@@ -70,13 +70,22 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | ------------------------------- | -------------------------------------------------- |
 | `npm run wasm`, nothing changed | 0.3 s                                              |
 | `npm run wasm`, clean           | ~40 s (first run also installs `wasm-bindgen-cli`) |
-| `npm run check`, warm           | ~7 s                                               |
-| `npm run smoke -- --preview`    | ~20 s                                              |
+| `npm run check`, warm           | ~8 s                                               |
+| `npm run smoke -- --preview`    | ~30 s                                              |
 | `cargo test --workspace`, warm  | ~2 s (the link tests take most of it)              |
-| the sweep example               | ~70 s                                              |
-| `node scripts/codecs.mjs`       | ~10 s                                              |
+| the sweep example               | ~50 s                                              |
+| the modes example               | ~60 s                                              |
+| `node scripts/codecs.mjs`       | ~10 s per mode                                     |
 | receiver, searching in noise    | 131× real time native; 95× as WASM at 48 kHz       |
 | receiver, amid modem tones      | 36× real time native (a frame with a missed start) |
+
+## Finding out why something fails on a real channel
+
+What worked for the range over the air: reproduce the numbers the user saw
+(the SNR shown under a message, where it stops) in `modem-sim` first — add
+the missing channel model if need be — then compare variants there
+(`examples/modes.rs`), and only then change the modem. A change is judged by
+the user's next test on real devices, which goes into `docs/measurements.md`.
 
 ## Test-driven development is mandatory
 
@@ -100,22 +109,26 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `crates/modem-core` — the modem. `modem.rs` — what the application sees
   (texts, events, samples); `link.rs` — the link layer, pure logic on frames
   and a clock (acknowledgements, repeats, turns, segments, greetings,
-  push-to-talk); `tx.rs` / `rx.rs` — a frame to samples and a
-  stream of samples to frames; `sync.rs` — the chirp preamble; `mfsk.rs` —
-  tones (four sets in turn, against room echo); `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
-  and Viterbi; `frame.rs` — modes and the header; `crc.rs`, `bits.rs`.
+  push-to-talk, the choice of mode); `tx.rs` / `rx.rs` — a frame to samples
+  and a stream of samples to frames; `sync.rs` — the chirp preamble;
+  `mfsk.rs` — tones: several at once, sets of tones in turn against room
+  echo; `frame.rs` — the modes R1–R4, frame kinds and the header;
+  `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler;
+  `conv.rs` — convolutional code and Viterbi; `crc.rs`, `bits.rs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room
-  reverberation, frequency and clock offset, clipping); `tests/link.rs` — the modem through them;
-  `examples/sweep.rs` — the measurements.
+  reverberation, frequency and clock offset, clipping); `tests/link.rs` — the
+  modem through them; `examples/sweep.rs`, `examples/modes.rs` — the
+  measurements (see Scripts).
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
 - `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter: `Modem`,
-  `ModemEvent`, `version`, `maxTextBytes`.
+  `ModemEvent`, `version`, `maxTextBytes`, `maxNameBytes`.
 - `src/main.tsx` — entry: renders the app with browser storage, languages and
   the worker client; registers the service worker in production.
 - `src/App.tsx` — the shell: language, core status. `src/ModemPanel.tsx` —
-  the modem on the page: microphone switch, input meter, messages, the text
-  to send.
+  the modem on the page: station settings (name, push-to-talk, speed),
+  microphone switch, state and speed, input meter, the scrolling box of
+  messages with delivery statuses, resend and clear, the text to send.
 - `src/audio/` — `engine.ts` (AudioContext, microphone, wiring; browser
   glue), `modem-io.worklet.js` (the AudioWorklet: plain JS, no imports),
   `meter.ts` (peak and spectrum bars). Design: `docs/web-audio.md`.
@@ -127,12 +140,15 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `src/wasm/` — wasm-pack output, gitignored.
 - `src/i18n/` — `en.ts` defines the messages, `ru.ts` follows its type;
   `index.ts` — locales, detection, text direction; `plural.ts` —
-  `Intl.PluralRules` helper.
-- `src/storage.ts` — versioned, validated settings in localStorage.
+  `Intl.PluralRules` helper, signed numbers.
+- `src/storage.ts` — versioned, validated settings in localStorage: language,
+  name, push-to-talk, speed.
 - `src/sw-plugin.ts` — Vite plugin emitting `sw.js` that precaches the build;
   `src/pwa.ts` — its registration, an update check on every return to the
   page and a reload when a new version takes control (`_conventions/pwa.md`).
-- `src/style.css` — mobile first, logical properties, light and dark.
+- `src/style.css` — mobile first, logical properties, light and dark. The app
+  fills the screen and the messages scroll in their box; a phone hides what
+  a desktop shows (heading, introduction, settings while the modem runs).
 - `public/` — manifest, icons (`icon.svg` is the source; still the template's).
 - `scripts/lib/harness.mjs` — Playwright plumbing; `scripts/smoke.mjs` — the
   smoke; `scripts/icons.mjs` — icon rendering.
@@ -153,7 +169,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - Browser APIs reach components as parameters (`startAudio`, `core`,
   `storage`), so component tests run without a browser.
 - The wire format is specified in `docs/protocol.md`; a change to it changes
-  that file in the same PR. Limits claimed in `docs/measurements.md` are
+  that file in the same PR. It is version 0 and changes freely: builds of
+  different PRs do not talk to each other, so both devices are updated
+  together. Limits claimed in `docs/measurements.md` are
   guarded by `crates/modem-sim/tests/link.rs` with a margin.
 - The receiver never delivers a payload whose CRC-32 failed.
 - The core's clock is the count of received samples: the host must keep
@@ -179,10 +197,13 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   English. Switching redraws without losing state. There is no RTL
   language yet, but `<html dir>` follows `direction(locale)` and CSS uses
   logical properties only.
-- Do not change the stored format without bumping `VERSION` in
+- A new stored field gets a default and a test that data saved before it
+  still loads (as `name`, `manualPtt`, `mode` did). Changing the meaning or
+  the type of an existing field needs a bump of `VERSION` in
   `src/storage.ts` and a test for the reset or migration.
 - No `as` casts in app code; a disabled lint rule carries its reason.
-- A helper script that may be needed again goes to `scripts/` with a header
-  comment and a line in this file. A new browser check is a step or a flag in
+- A helper script that may be needed again goes to `scripts/` (Rust
+  experiments: `crates/modem-sim/examples/`) with a header comment and a line
+  in this file. Experiments are kept, not deleted after one use. A new browser check is a step or a flag in
   `scripts/smoke.mjs`, not a new file.
 - Each feature gets its own branch and a pull request.

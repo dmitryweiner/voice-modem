@@ -6,30 +6,31 @@ channels. Each table says how to repeat it.
 SNR is the ratio of the signal power to the power of white noise over the
 whole band up to 8 kHz; in a 3 kHz band the same noise is 4.3 dB weaker.
 
-## Mode R1 in simulation (2026-11-10)
+## Mode R1 in simulation (2026-11-11)
 
-`cargo run --release -p modem-sim --example sweep` — 40-byte frames (6.7 s),
+`cargo run --release -p modem-sim --example sweep` — 40-byte frames (7 s),
 50 per point.
 
 | White noise, SNR | Frames received |
 | ---------------- | --------------- |
 | −15 dB and above | 50/50           |
 | −16 dB           | 46/50           |
-| −17 dB           | 26/50           |
-| −18 dB           | 1/50            |
+| −17 dB           | 33/50           |
+| −18 dB           | 0/50            |
 
 - **Frequency offset** (at −10 dB): received 50/50 at every offset tried from
   −250 to +250 Hz; the estimate is within 0.2 Hz on average.
 - **Sound-card clock offset**, the longest frame (255 bytes, 34 s), no noise:
-  received up to ±500 ppm, lost at ±700 ppm. The receiver does not track the
-  symbol clock yet, so shorter frames tolerate proportionally more.
+  received at every offset tried up to ±1000 ppm (±500 before the four sets
+  of tones, see the next section). The receiver does not track the symbol
+  clock; shorter frames tolerate proportionally more.
 - **False frames**: none in 10 minutes of pure noise.
 - No frame with a wrong payload was ever delivered: beyond the limit frames
   are lost or reported as damaged.
 
 `crates/modem-sim/tests/link.rs` guards these with about 3 dB of margin, plus
-a telephone band with echoes of 12–55 ms, clipping of a ten times overdriven
-signal and a signal 60 dB down.
+a telephone band with echoes of 12–55 ms, a reverberant room, clipping of a
+ten times overdriven signal and a signal 60 dB down.
 
 ## Mode R1 in a room, simulated (2026-11-11)
 
