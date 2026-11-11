@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import basicSsl from '@vitejs/plugin-basic-ssl';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vitest/config';
 import { serviceWorkerPlugin } from './src/sw-plugin.ts';
@@ -13,11 +14,17 @@ function appId(): string {
 
 const APP_ID = appId();
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   // Relative base lets the build work both on GitHub Pages (/<repo>/) and from any static folder.
   base: './',
   define: { __APP_ID__: JSON.stringify(APP_ID) },
-  plugins: [react(), serviceWorkerPlugin({ appId: APP_ID, publicDir: resolve(import.meta.dirname, 'public') })],
+  plugins: [
+    react(),
+    serviceWorkerPlugin({ appId: APP_ID, publicDir: resolve(import.meta.dirname, 'public') }),
+    // `npm run dev:lan`: the microphone and AudioWorklet need a secure context, which a
+    // LAN address over plain http is not; a self-signed certificate makes it one.
+    ...(mode === 'lan' ? [basicSsl()] : []),
+  ],
   // The AudioWorklet module stays a file of its own: not every browser loads a worklet from a data: URL.
   build: { assetsInlineLimit: (file) => (file.endsWith('.worklet.js') ? false : undefined) },
   // The WASM glue finds its .wasm via import.meta.url, which an iife worker lacks.
@@ -26,4 +33,4 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.test.{ts,tsx}'],
   },
-});
+}));

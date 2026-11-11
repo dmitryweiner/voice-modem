@@ -49,7 +49,8 @@ describe('messages', () => {
   it.each(LOCALES)('are not empty (%s)', (locale) => {
     for (const [key, value] of Object.entries(messages[locale])) {
       // Every message function takes one argument: a version or a number.
-      const text: unknown = typeof value === 'function' ? (value as (arg: unknown) => string)(key === 'coreReady' ? '1.2.3' : 3) : value;
+      const text: unknown =
+        typeof value === 'function' ? (value as (arg: unknown) => string)(key === 'coreReady' || key === 'peerNamed' ? '1.2.3' : 3) : value;
       expect({ key, text }).toEqual({ key, text: expect.stringMatching(/\S/) });
     }
   });
@@ -77,8 +78,8 @@ describe('messages', () => {
     expect(messages.en.snr(11.6)).toBe('signal +12 dB to noise');
     expect(messages.en.snr(-4.4)).toBe('signal -4 dB to noise');
     expect(messages.ru.snr(0.2)).toBe('сигнал/шум 0 дБ');
-    expect(messages.en.seconds(3.96)).toBe('4.0 s');
-    expect(messages.ru.seconds(3.96)).toBe('4,0 с');
+    expect(messages.en.attempt(2)).toBe('attempt 2');
+    expect(messages.ru.peerNamed('UB1XYZ')).toBe('На канале UB1XYZ.');
   });
 });
 

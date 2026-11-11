@@ -2,35 +2,55 @@
 // jobId and gets exactly one reply with the same jobId; events come unasked.
 //
 // Sound does not pass through the page: `start` hands the worker one end of
-// a MessageChannel whose other end is in the AudioWorklet (see `AudioLink`).
+// a MessageChannel whose other end is in the AudioWorklet (see `AUDIO_IDLE`).
 
 /** Something the modem tells the application. */
 export type CoreEvent =
-  | { kind: 'message'; text: string; snrDb: number; freqOffsetHz: number }
-  /** A frame was heard but could not be read. */
+  | { kind: 'message'; text: string; station: number; snrDb: number; freqOffsetHz: number }
+  /** A station greeted with its name (which may be empty). */
+  | { kind: 'hello'; name: string; station: number }
+  /** The message with this id was acknowledged / given up on / sent without asking for an answer. */
+  | { kind: 'delivered' | 'failed' | 'sent'; id: number }
+  /** No acknowledgement: the message goes out again, for the `attempt`-th time. */
+  | { kind: 'retry'; id: number; attempt: number }
+  /** Something was transmitted nearby but could not be read. */
   | { kind: 'frameLost'; snrDb: number; freqOffsetHz: number }
-  /** The last transmitted sample has left for the speaker. */
+  /** Push-to-talk: the modem waits for the `ptt` request. */
+  | { kind: 'txRequest' }
+  /** Sound of this length has gone to the speaker. */
+  | { kind: 'txStart'; seconds: number }
+  /** The last sample has been played. */
   | { kind: 'txEnd' };
+
+export interface StationOptions {
+  /** The name or callsign sent in a greeting. */
+  name: string;
+  /** Every transmission waits for the `ptt` request. */
+  manualPtt: boolean;
+}
 
 export type WorkerIn =
   | { type: 'version'; jobId: number }
-  | { type: 'start'; jobId: number; sampleRate: number; port: MessagePort }
+  | ({ type: 'start'; jobId: number; sampleRate: number; port: MessagePort } & StationOptions)
   | { type: 'sendText'; jobId: number; text: string }
+  | { type: 'hello'; jobId: number }
+  | { type: 'ptt'; jobId: number }
   | { type: 'stop'; jobId: number };
 
 export type WorkerOut =
   | { type: 'version'; jobId: number; version: string }
   | { type: 'started'; jobId: number; maxTextBytes: number }
-  /** The text is on its way to the speaker and takes so many seconds. */
-  | { type: 'sent'; jobId: number; seconds: number }
-  | { type: 'stopped'; jobId: number }
+  /** The text waits for its turn; events will tell its fate under this id. */
+  | { type: 'queued'; jobId: number; id: number }
+  /** A request that has nothing to return was carried out. */
+  | { type: 'done'; jobId: number }
   | { type: 'error'; jobId: number; message: string }
   | { type: 'event'; event: CoreEvent };
 
 /**
- * The channel between the worker and the AudioWorklet. The worklet sends
- * blocks of microphone samples and the string 'idle' when it has played
- * everything it was given; the worker sends blocks of samples to play.
+ * The channel between the worker and the AudioWorklet carries blocks of
+ * samples both ways (microphone to the worker, speaker to the worklet) and
+ * this string from the worklet when it has played everything it was given.
  */
 export const AUDIO_IDLE = 'idle';
 
@@ -41,10 +61,17 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
   if (!isRecord(value) || !isNumber(value.jobId)) return false;
   switch (value.type) {
     case 'version':
+    case 'hello':
+    case 'ptt':
     case 'stop':
       return true;
     case 'start':
-      return isNumber(value.sampleRate) && value.port instanceof MessagePort;
+      return (
+        isNumber(value.sampleRate) &&
+        value.port instanceof MessagePort &&
+        typeof value.name === 'string' &&
+        typeof value.manualPtt === 'boolean'
+      );
     case 'sendText':
       return typeof value.text === 'string';
     default:
@@ -54,9 +81,28 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
 
 function isCoreEvent(value: unknown): value is CoreEvent {
   if (!isRecord(value)) return false;
-  if (value.kind === 'txEnd') return true;
-  if (!isNumber(value.snrDb) || !isNumber(value.freqOffsetHz)) return false;
-  return value.kind === 'frameLost' || (value.kind === 'message' && typeof value.text === 'string');
+  const heard = isNumber(value.snrDb) && isNumber(value.freqOffsetHz);
+  switch (value.kind) {
+    case 'message':
+      return heard && typeof value.text === 'string' && isNumber(value.station);
+    case 'hello':
+      return typeof value.name === 'string' && isNumber(value.station);
+    case 'delivered':
+    case 'failed':
+    case 'sent':
+      return isNumber(value.id);
+    case 'retry':
+      return isNumber(value.id) && isNumber(value.attempt);
+    case 'frameLost':
+      return heard;
+    case 'txStart':
+      return isNumber(value.seconds);
+    case 'txRequest':
+    case 'txEnd':
+      return true;
+    default:
+      return false;
+  }
 }
 
 export function isWorkerOut(value: unknown): value is WorkerOut {
@@ -68,9 +114,9 @@ export function isWorkerOut(value: unknown): value is WorkerOut {
       return typeof value.version === 'string';
     case 'started':
       return isNumber(value.maxTextBytes);
-    case 'sent':
-      return isNumber(value.seconds);
-    case 'stopped':
+    case 'queued':
+      return isNumber(value.id);
+    case 'done':
       return true;
     case 'error':
       return typeof value.message === 'string';

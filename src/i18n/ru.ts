@@ -10,6 +10,8 @@ export const ru: Messages = {
   coreLoading: 'Ядро модема загружается…',
   coreFailed: 'Ядро модема не загрузилось.',
 
+  nameLabel: 'Ваше имя или позывной',
+  pttLabel: 'Рация с тангентой, которую я нажимаю сам',
   micOn: 'Включить микрофон',
   micOff: 'Выключить',
   micStarting: 'Запуск…',
@@ -19,6 +21,9 @@ export const ru: Messages = {
   micFailed: 'Звуковое устройство не запустилось.',
   listening: 'Приём',
   transmitting: 'Передача…',
+  pttPrompt: 'Нажмите и держите тангенту рации, затем нажмите здесь или пробел.',
+  pttButton: 'Передать',
+  pttHold: 'Передача… держите тангенту',
   inputLevel: 'Уровень входа',
   clipping: 'Слишком громко: убавьте громкость или раздвиньте устройства.',
   spectrum: 'Спектр входного сигнала, от 0 до 4 кГц',
@@ -26,9 +31,13 @@ export const ru: Messages = {
   noMessages: 'Пока пусто. Здесь появятся отправленные и принятые тексты.',
   messageLabel: 'Текст для отправки',
   send: 'Отправить',
+  hello: 'Поздороваться',
   received: 'Принято',
   sending: 'Отправляется…',
   sent: 'Отправлено',
+  delivered: 'Доставлено',
+  notDelivered: 'Не доставлено: нет ответа',
+  peerAnonymous: 'На канале появилась станция.',
   frameLost: 'Сообщение услышано, но прочитать его не удалось.',
   sendFailed: 'Текст не отправлен.',
 
@@ -36,5 +45,6 @@ export const ru: Messages = {
   tooLong: (bytes: number) =>
     `Длиннее допустимого на ${bytes} ${plural('ru', bytes, { one: 'байт', few: 'байта', many: 'байт', other: 'байта' })}.`,
   snr: (db: number) => `сигнал/шум ${signed(db)} дБ`,
-  seconds: (seconds: number) => `${seconds.toFixed(1).replace('.', ',')} с`,
+  attempt: (attempt: number) => `попытка ${attempt}`,
+  peerNamed: (name: string) => `На канале ${name}.`,
 };

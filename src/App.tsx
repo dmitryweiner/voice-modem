@@ -73,7 +73,14 @@ export function App({ storage, languages, core, startAudio }: AppProps) {
       <main>
         <h1>{t.title}</h1>
         <p>{t.intro}</p>
-        <ModemPanel t={t} core={core} startAudio={startAudio} coreReady={coreState.status === 'ready'} />
+        <ModemPanel
+          t={t}
+          core={core}
+          startAudio={startAudio}
+          coreReady={coreState.status === 'ready'}
+          station={{ name: settings.name, manualPtt: settings.manualPtt }}
+          onStationChange={(station) => update({ ...settings, ...station })}
+        />
       </main>
       <footer>
         <output id="core" data-status={coreState.status} aria-live="polite">

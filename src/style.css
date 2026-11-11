@@ -126,11 +126,57 @@ input {
 .modem {
   margin-block-start: 24px;
 }
-.link {
+.station {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 0;
+  border: 0;
+}
+.station:disabled {
+  opacity: 0.6;
+}
+.station label {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
+  min-block-size: 44px;
+}
+.station input[type='checkbox'] {
+  flex: none;
+  inline-size: 24px;
+  min-block-size: 24px;
+  block-size: 24px;
+}
+.ptt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-block-start: 16px;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--danger);
+  color: var(--accent-fg);
+}
+.ptt > p {
+  margin: 0;
+  font-weight: 700;
+}
+.ptt > button {
+  min-block-size: 64px;
+  background: var(--surface);
+  color: var(--fg);
+  font-weight: 700;
+}
+.link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 12px;
+}
+.state {
+  flex: 1;
 }
 .link > button:only-child {
   flex: 1;
@@ -208,9 +254,15 @@ input {
   background: var(--accent);
   color: var(--accent-fg);
 }
-.feed > .lost {
+.feed > .note {
+  align-self: center;
+  background: none;
   color: var(--muted);
-  font-style: italic;
+  font-size: 0.875rem;
+  text-align: center;
+}
+.feed > [data-status='failed'] {
+  background: var(--danger);
 }
 .feed small {
   display: block;

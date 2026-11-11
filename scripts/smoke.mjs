@@ -28,15 +28,18 @@ const flags = parseArgs(process.argv.slice(2));
 const preview = flags.has('preview');
 const shots = flags.has('shots');
 
+// The recording ends with silence long enough for the page to get a word in: it
+// transmits only when the channel is quiet.
 const HEARD = 'Hello from the fake microphone';
 const temp = mkdtempSync(join(tmpdir(), 'voice-modem-smoke-'));
 const microphone = join(temp, 'microphone.wav');
-execFileSync('cargo', ['run', '--release', '--quiet', '-p', 'modem-cli', '--', 'encode', HEARD, '-o', microphone], {
+execFileSync('cargo', ['run', '--release', '--quiet', '-p', 'modem-cli', '--', 'encode', HEARD, '-o', microphone, '--pause', '6'], {
   stdio: ['ignore', 'ignore', 'inherit'],
 });
 
 const app = await launch({
   preview,
+  audio: true,
   browserArgs: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${microphone}`],
 });
 
@@ -93,21 +96,26 @@ try {
     await context.close();
   });
 
-  await step('a text is transmitted and the modem listens again', async () => {
+  await step('a text is transmitted, and repeated when nobody acknowledges it', async () => {
     const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
     await coreReady(page);
     await page.click('#mic');
     await page.fill('#draft', 'ok');
     await page.click('#send');
-    const state = page.locator('#state');
-    check((await state.textContent()) === 'Transmitting…', 'did not start transmitting');
     check((await page.locator('#feed .sent .text').textContent()) === 'ok', 'the sent text is not in the feed');
-    // 'ok' is 3.3 s of sound
+    check((await page.locator('#feed .sent small').textContent()) === 'Sending…', 'the text is not marked as being sent');
+    // it waits for the recording to fall silent, then plays 2.8 s of sound
+    await page
+      .locator('#state.transmitting')
+      .waitFor({ timeout: 20_000 })
+      .catch(() => check(false, 'never started transmitting'));
     await page
       .locator('#state:not(.transmitting)')
       .waitFor({ timeout: 10_000 })
       .catch(() => check(false, 'the transmission never ended'));
-    check((await page.locator('#feed .sent small').textContent()).startsWith('Sent'), 'the text is not marked as sent');
+    // the fake microphone does not answer: the link layer tries again
+    const repeated = page.locator('#feed .sent small', { hasText: 'attempt 2' });
+    await repeated.waitFor({ timeout: 20_000 }).catch(() => check(false, 'the text was not repeated'));
     await context.close();
   });
 

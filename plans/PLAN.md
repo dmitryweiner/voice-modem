@@ -274,17 +274,32 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–2 are done (2026-11-10). What they settled is in
+**Progress**: stages 0–3 are done (2026-11-10). What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
-these places: the code of mode R1 is the convolutional one (LDPC comes with
-the fast modes at stage 4); the simulator has no fading, packet loss or time
-stretching yet (stage 6, with the presets); the web app shows the input level
-and spectrum but no output meter, and the spectrum is the browser's analyser,
-not the core's. Open: iLBC loses whole frames; AMR-WB/EVS and everything a
-real call adds to the codec are untested; nothing is measured between real
-devices yet.
+these places:
+
+- The code of mode R1 is the convolutional one; LDPC comes with the fast
+  modes at stage 4.
+- The link layer is stop-and-wait, one frame per acknowledgement; the
+  selective acknowledgement of a burst waits for modes fast enough to need it
+  (stage 4).
+- There is no session yet, only a greeting that carries the name and the
+  capabilities field. Frames have a sender but no destination, so the link is
+  for two stations. Addressed sessions come with probing (stage 4), which
+  needs them.
+- Text is not compressed.
+- The core's API is methods (`send_text`, `hello`, `ptt_pressed`), not a
+  command enum.
+- The simulator has no fading, packet loss or time stretching yet (stage 6).
+- The web app shows the input level and spectrum but no output meter, and the
+  spectrum is the browser's analyser, not the core's.
+
+Open: over the air the range is about 4 m and the cause is not known (not
+noise, by the numbers); iLBC loses whole frames; AMR-WB/EVS and everything a
+real call adds to the codec are untested; the receiver's speed on a phone is
+not measured.
 
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.

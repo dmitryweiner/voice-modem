@@ -14,9 +14,10 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
 
 - [plans/PLAN.md](plans/PLAN.md) — the development plan: architecture,
   protocol layers, stages 0–7 and the decisions taken. Stages 0
-  (skeleton), 1 (PHY minimum: mode R1, `modem-cli`, the simulator) and 2
-  (sound in the browser: one-way text over the air) are done; stage 3 (link
-  layer: half duplex, ARQ, sessions, PTT) is next.
+  (skeleton), 1 (PHY minimum: mode R1, `modem-cli`, the simulator), 2 (sound
+  in the browser) and 3 (link layer: acknowledgements and repeats, taking
+  turns, greetings, push-to-talk) are done; stage 4 (fast modes and
+  adaptation) is next.
 
 ## Commands
 
@@ -29,11 +30,16 @@ login shell may put an older one first). Rust — stable with the
 - `npm run wasm` — build `crates/modem-wasm` into `src/wasm/` (gitignored).
   `dev`, `build` and `check` run it themselves.
 - `npm run dev` — dev server.
+- `npm run dev:lan` — the dev server on the local network over HTTPS with a
+  self-signed certificate (`--mode lan`): sound needs a secure context, and a
+  LAN address over http is not one. The phone shows a certificate warning
+  once; accept it.
 - `npm run check` — `check:rust` (cargo fmt, clippy, test) + WASM build +
   typecheck + oxlint + prettier + unit tests. Must pass before any work is
   called done.
 - `npm run smoke` — browser smoke on the dev server (builds `modem-cli` for
-  the fake microphone, so it needs cargo); `-- --preview` builds and
+  the fake microphone, so it needs cargo; on a Mac it wakes the display,
+  without which Chromium processes no sound); `-- --preview` builds and
   also checks offline mode; `-- --shots` saves screenshots to `shots/`.
 - `npm run build` — WASM, typecheck and build into `dist/`.
 - `npm run format` — prettier and `cargo fmt`.
@@ -66,6 +72,7 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | the sweep example               | ~70 s                                              |
 | `node scripts/codecs.mjs`       | ~10 s                                              |
 | receiver, searching in noise    | 131× real time native; 95× as WASM at 48 kHz       |
+| receiver, amid modem tones      | 36× real time native (a frame with a missed start) |
 
 ## Test-driven development is mandatory
 
@@ -87,9 +94,11 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `Cargo.toml` — the Rust workspace (the dev profile is optimised: signal
   processing in tests is too slow otherwise).
 - `crates/modem-core` — the modem. `modem.rs` — what the application sees
-  (commands, events, samples); `tx.rs` / `rx.rs` — a frame to samples and a
+  (texts, events, samples); `link.rs` — the link layer, pure logic on frames
+  and a clock (acknowledgements, repeats, turns, segments, greetings,
+  push-to-talk); `tx.rs` / `rx.rs` — a frame to samples and a
   stream of samples to frames; `sync.rs` — the chirp preamble; `mfsk.rs` —
-  tones; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
+  tones; `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
   and Viterbi; `frame.rs` — modes and the header; `crc.rs`, `bits.rs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, frequency and
   clock offset, clipping); `tests/link.rs` — the modem through them;
@@ -143,6 +152,10 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   that file in the same PR. Limits claimed in `docs/measurements.md` are
   guarded by `crates/modem-sim/tests/link.rs` with a margin.
 - The receiver never delivers a payload whose CRC-32 failed.
+- The core's clock is the count of received samples: the host must keep
+  calling `push_rx` (silence too) and play what `pull_tx` gives at once.
+  `link.rs` knows no sound and `rx.rs`/`tx.rs` know no link rules; only
+  `modem.rs` joins them.
 - `modem-wasm` and the worker file stay thin adapters; logic lives where it is
   unit-tested (`modem-core`, `handler.ts`).
 

@@ -12,6 +12,7 @@ pub mod coding;
 pub mod conv;
 pub mod crc;
 pub mod frame;
+pub mod link;
 pub mod mfsk;
 pub mod modem;
 pub mod resample;
@@ -19,8 +20,10 @@ pub mod rx;
 pub mod sync;
 pub mod tx;
 
+pub use frame::{Frame, Kind};
 pub use frame::{MAX_PAYLOAD, Mode};
-pub use modem::{Command, CommandError, Config, ConfigError, Event, Modem};
+pub use link::{MAX_NAME_BYTES, MAX_TEXT_BYTES};
+pub use modem::{CommandError, Config, ConfigError, Event, Modem};
 pub use rx::{Receiver, RxEvent, RxStats};
 pub use tx::{TxConfig, encode_frame};
 

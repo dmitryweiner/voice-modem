@@ -1,7 +1,7 @@
 //! Browser binding of the core. A thin adapter: logic and its tests live in
 //! `modem-core`; this crate only converts types at the JS boundary.
 
-use modem_core::{Command, CommandError, Config, ConfigError, Event};
+use modem_core::{CommandError, Config, ConfigError, Event, RxStats};
 use wasm_bindgen::prelude::*;
 
 /// Version of the core.
@@ -13,53 +13,119 @@ pub fn version() -> String {
 /// The longest text of one message, in UTF-8 bytes.
 #[wasm_bindgen(js_name = maxTextBytes)]
 pub fn max_text_bytes() -> usize {
-    modem_core::MAX_PAYLOAD
+    modem_core::MAX_TEXT_BYTES
 }
 
-/// Something the modem has to tell the application.
+/// The longest station name, in UTF-8 bytes; a longer one is cut.
+#[wasm_bindgen(js_name = maxNameBytes)]
+pub fn max_name_bytes() -> usize {
+    modem_core::MAX_NAME_BYTES
+}
+
+/// Something the modem has to tell the application. Fields that do not
+/// belong to the kind of the event are empty or zero.
 #[wasm_bindgen(getter_with_clone)]
+#[derive(Default)]
 pub struct ModemEvent {
-    /// "message": a text was received; "frameLost": a frame was heard but could not be read.
+    /// "message": a text was received.
+    /// "hello": a station greeted; `text` is its name.
+    /// "sent", "delivered", "failed": the fate of the message `id`.
+    /// "retry": no acknowledgement, the message `id` goes out for the `attempt`-th time.
+    /// "frameLost": something was transmitted nearby but could not be read.
+    /// "txRequest": push-to-talk — press the button and call `pttPressed`.
     pub kind: String,
-    /// The text of a message, empty otherwise.
     pub text: String,
-    /// Signal-to-noise ratio of the frame, dB, noise over the band up to 8 kHz.
+    /// The id `sendText` returned.
+    pub id: u32,
+    pub attempt: u8,
+    /// The address of the station a message or a greeting came from.
+    pub station: u16,
+    /// Signal-to-noise ratio of the received frame, dB, noise over the band up to 8 kHz.
     #[wasm_bindgen(js_name = snrDb)]
     pub snr_db: f32,
-    /// Frequency offset of the frame, Hz.
+    /// Frequency offset of the received frame, Hz.
     #[wasm_bindgen(js_name = freqOffsetHz)]
     pub freq_offset_hz: f32,
 }
 
-impl From<Event> for ModemEvent {
-    fn from(event: Event) -> Self {
-        let (kind, text, stats) = match event {
-            Event::MessageReceived { text, stats } => ("message", text, stats),
-            Event::FrameLost { stats } => ("frameLost", String::new(), stats),
-        };
+impl ModemEvent {
+    fn of(kind: &str) -> Self {
         Self {
             kind: kind.to_owned(),
-            text,
+            ..Self::default()
+        }
+    }
+
+    fn heard(kind: &str, stats: RxStats) -> Self {
+        Self {
             snr_db: stats.snr_db,
             freq_offset_hz: stats.freq_offset_hz,
+            ..Self::of(kind)
         }
     }
 }
 
-fn new_modem(sample_rate: u32) -> Result<modem_core::Modem, String> {
-    modem_core::Modem::new(Config {
+impl From<Event> for ModemEvent {
+    fn from(event: Event) -> Self {
+        match event {
+            Event::MessageReceived { from, text, stats } => Self {
+                text,
+                station: from,
+                ..Self::heard("message", stats)
+            },
+            Event::PeerHello { from, name, stats } => Self {
+                text: name,
+                station: from,
+                ..Self::heard("hello", stats)
+            },
+            Event::MessageSent { id } => Self {
+                id,
+                ..Self::of("sent")
+            },
+            Event::MessageDelivered { id } => Self {
+                id,
+                ..Self::of("delivered")
+            },
+            Event::MessageFailed { id } => Self {
+                id,
+                ..Self::of("failed")
+            },
+            Event::Retry { id, attempt } => Self {
+                id,
+                attempt,
+                ..Self::of("retry")
+            },
+            Event::FrameLost { stats } => Self::heard("frameLost", stats),
+            Event::TxRequest => Self::of("txRequest"),
+        }
+    }
+}
+
+fn new_modem(
+    sample_rate: u32,
+    station: u16,
+    name: String,
+    manual_ptt: bool,
+    seed: u32,
+) -> Result<modem_core::Modem, String> {
+    let config = Config {
         sample_rate,
+        station,
+        name,
+        manual_ptt,
+        seed: u64::from(seed),
         ..Config::default()
-    })
-    .map_err(|ConfigError::UnsupportedSampleRate(rate)| {
+    };
+    modem_core::Modem::new(config).map_err(|ConfigError::UnsupportedSampleRate(rate)| {
         format!("unsupported sample rate: {rate} Hz")
     })
 }
 
-fn send_text(modem: &mut modem_core::Modem, text: String) -> Result<(), String> {
-    modem
-        .command(Command::SendText(text))
-        .map_err(|CommandError::TextTooLong { max }| format!("the text is longer than {max} bytes"))
+fn send_text(modem: &mut modem_core::Modem, text: &str) -> Result<u32, String> {
+    modem.send_text(text).map_err(|error| match error {
+        CommandError::EmptyText => "the text is empty".to_owned(),
+        CommandError::TextTooLong { max } => format!("the text is longer than {max} bytes"),
+    })
 }
 
 #[wasm_bindgen]
@@ -67,27 +133,46 @@ pub struct Modem(modem_core::Modem);
 
 #[wasm_bindgen]
 impl Modem {
-    /// A modem for an audio device running at `sample_rate` Hz.
+    /// A modem for an audio device running at `sample_rate` Hz. `station` is
+    /// the address of this station and `seed` feeds its random waits: both
+    /// random numbers. With `manual_ptt` every transmission waits for `pttPressed`.
     #[wasm_bindgen(constructor)]
-    pub fn new(sample_rate: u32) -> Result<Modem, JsError> {
-        new_modem(sample_rate)
+    pub fn new(
+        sample_rate: u32,
+        station: u16,
+        name: String,
+        manual_ptt: bool,
+        seed: u32,
+    ) -> Result<Modem, JsError> {
+        new_modem(sample_rate, station, name, manual_ptt, seed)
             .map(Modem)
             .map_err(|message| JsError::new(&message))
     }
 
-    /// Queues a text for transmission; fails when it does not fit into one frame.
+    /// Queues a text; its fate is reported in events under the returned id.
     #[wasm_bindgen(js_name = sendText)]
-    pub fn send_text(&mut self, text: String) -> Result<(), JsError> {
+    pub fn send_text(&mut self, text: &str) -> Result<u32, JsError> {
         send_text(&mut self.0, text).map_err(|message| JsError::new(&message))
     }
 
-    /// Samples from the microphone.
+    /// Queues a greeting with the name of this station.
+    pub fn hello(&mut self) {
+        self.0.hello();
+    }
+
+    /// Push-to-talk: the button is down, transmit what is waiting.
+    #[wasm_bindgen(js_name = pttPressed)]
+    pub fn ptt_pressed(&mut self) {
+        self.0.ptt_pressed();
+    }
+
+    /// Samples from the microphone. Keep them coming: the modem's clock is their count.
     #[wasm_bindgen(js_name = pushRx)]
     pub fn push_rx(&mut self, samples: &[f32]) {
         self.0.push_rx(samples);
     }
 
-    /// The next `len` samples for the speaker: silence when there is nothing to send.
+    /// The next `len` samples for the speaker, to be played at once.
     #[wasm_bindgen(js_name = pullTx)]
     pub fn pull_tx(&mut self, len: usize) -> Vec<f32> {
         let mut samples = vec![0.0; len];
@@ -95,7 +180,7 @@ impl Modem {
         samples
     }
 
-    /// Samples waiting to be transmitted.
+    /// Samples waiting to be played.
     #[wasm_bindgen(js_name = txPending)]
     pub fn tx_pending(&self) -> usize {
         self.0.tx_pending()
@@ -111,43 +196,93 @@ impl Modem {
 mod tests {
     use super::*;
 
+    fn modem(station: u16) -> Modem {
+        Modem(
+            new_modem(
+                48_000,
+                station,
+                format!("station {station}"),
+                false,
+                u32::from(station),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn kinds(modem: &mut Modem) -> Vec<(String, String, u32)> {
+        std::iter::from_fn(|| modem.poll_event())
+            .map(|e| (e.kind, e.text, e.id))
+            .collect()
+    }
+
+    /// Each hears what the other plays, a block later.
+    fn run(a: &mut Modem, b: &mut Modem, seconds: usize) {
+        let (mut to_a, mut to_b) = (vec![0.0; 2048], vec![0.0; 2048]);
+        for _ in 0..seconds * 48_000 / 2048 {
+            a.push_rx(&to_a);
+            b.push_rx(&to_b);
+            to_b = a.pull_tx(2048);
+            to_a = b.pull_tx(2048);
+        }
+    }
+
     #[test]
-    fn version_is_the_core_version() {
+    fn version_and_limits_are_those_of_the_core() {
         assert_eq!(version(), modem_core::VERSION);
-        assert_eq!(max_text_bytes(), 255);
+        assert_eq!((max_text_bytes(), max_name_bytes()), (1000, 32));
     }
 
     #[test]
     fn errors_are_put_into_words() {
         assert_eq!(
-            new_modem(100).err(),
+            new_modem(100, 1, String::new(), false, 1).err(),
             Some("unsupported sample rate: 100 Hz".to_string())
         );
-        let mut modem = new_modem(48_000).unwrap();
+        let mut modem = modem(1);
         assert_eq!(
-            send_text(&mut modem, "x".repeat(256)),
-            Err("the text is longer than 255 bytes".to_string())
+            send_text(&mut modem.0, &"x".repeat(1001)),
+            Err("the text is longer than 1000 bytes".to_string())
         );
-        assert_eq!(send_text(&mut modem, "fits".into()), Ok(()));
+        assert_eq!(
+            send_text(&mut modem.0, ""),
+            Err("the text is empty".to_string())
+        );
+        assert_eq!(send_text(&mut modem.0, "fits"), Ok(1));
     }
 
     #[test]
-    fn a_message_goes_from_modem_to_modem() {
-        let (mut alice, mut bob) = (
-            Modem(new_modem(48_000).unwrap()),
-            Modem(new_modem(48_000).unwrap()),
-        );
-        send_text(&mut alice.0, "через wasm".into()).unwrap();
-        let pending = alice.tx_pending();
-        assert!(pending > 0);
-        bob.push_rx(&alice.pull_tx(pending));
-        assert_eq!(alice.tx_pending(), 0);
+    fn a_message_is_delivered_and_both_sides_are_told() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let id = send_text(&mut alice.0, "через wasm").unwrap();
+        run(&mut alice, &mut bob, 8);
         let event = bob.poll_event().unwrap();
         assert_eq!(
-            (event.kind.as_str(), event.text.as_str()),
-            ("message", "через wasm")
+            (event.kind.as_str(), event.text.as_str(), event.station),
+            ("message", "через wasm", 1)
         );
         assert!(event.snr_db > 20.0 && event.freq_offset_hz.abs() < 1.0);
         assert!(bob.poll_event().is_none());
+        assert_eq!(
+            kinds(&mut alice),
+            [("delivered".to_string(), String::new(), id)]
+        );
+    }
+
+    #[test]
+    fn greetings_and_push_to_talk_reach_the_application() {
+        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, 1).unwrap());
+        let mut bob = modem(2);
+        alice.hello();
+        run(&mut alice, &mut bob, 1);
+        assert_eq!(
+            kinds(&mut alice),
+            [("txRequest".to_string(), String::new(), 0)]
+        );
+        alice.ptt_pressed();
+        run(&mut alice, &mut bob, 6);
+        assert_eq!(
+            kinds(&mut bob),
+            [("hello".to_string(), "Alice".to_string(), 0)]
+        );
     }
 }

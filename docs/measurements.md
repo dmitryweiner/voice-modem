@@ -39,19 +39,23 @@ receiver estimated: here it measures the distortion by the codec.
 
 | Codec                  | Messages | SNR, dB (min … max) |
 | ---------------------- | -------- | ------------------- |
-| none (16-bit WAV)      | 5/5      | 25.9 … 39.3         |
-| G.711 µ-law, 64 kbit/s | 5/5      | 23.9 … 29.0         |
-| G.726, 32 kbit/s       | 5/5      | 18.5 … 20.5         |
-| G.726, 16 kbit/s       | 5/5      | 9.8 … 10.8          |
-| iLBC, 15.2 kbit/s      | **3/5**  | −4.6 … −2.9         |
-| G.723.1, 6.3 kbit/s    | 5/5      | 6.0 … 6.9           |
-| AMR-NB, 12.2 kbit/s    | 5/5      | 11.5 … 12.4         |
-| AMR-NB, 4.75 kbit/s    | 5/5      | 2.9 … 3.5           |
-| Opus voice, 24 kbit/s  | 5/5      | 14.8 … 20.5         |
-| Opus voice, 16 kbit/s  | 5/5      | 11.0 … 12.4         |
-| Opus voice, 12 kbit/s  | 5/5      | 3.1 … 3.7           |
-| Opus voice, 8 kbit/s   | 5/5      | −5.0 … 4.2          |
-| Opus voice, 6 kbit/s   | 5/5      | −5.0 … 4.2          |
+| none (16-bit WAV)      | 5/5      | 25.8 … 32.1         |
+| G.711 µ-law, 64 kbit/s | 5/5      | 24.2 … 27.4         |
+| G.726, 32 kbit/s       | 5/5      | 18.6 … 20.5         |
+| G.726, 16 kbit/s       | 5/5      | 10.2 … 11.6         |
+| iLBC, 15.2 kbit/s      | **4/5**  | −11.0 … −1.2        |
+| G.723.1, 6.3 kbit/s    | 5/5      | 5.9 … 7.3           |
+| AMR-NB, 12.2 kbit/s    | 5/5      | 11.6 … 12.8         |
+| AMR-NB, 4.75 kbit/s    | 5/5      | 3.0 … 3.9           |
+| Opus voice, 24 kbit/s  | 5/5      | 8.0 … 20.8          |
+| Opus voice, 16 kbit/s  | 5/5      | 10.7 … 13.0         |
+| Opus voice, 12 kbit/s  | 5/5      | 3.5 … 5.1           |
+| Opus voice, 8 kbit/s   | 5/5      | 3.4 … 4.7           |
+| Opus voice, 6 kbit/s   | 5/5      | 3.4 … 4.5           |
+
+Measured with the frames of stage 3: one-way (broadcast) frames with the
+7-byte header, messages cut into segments of 63 bytes — the 255-byte message
+is five frames, all of which must arrive.
 
 What this says about the main risk of the plan (vocoders leaving no usable
 channel):
@@ -59,9 +63,9 @@ channel):
 - 62.5 bit/s gets through every codec tried, down to 4.75 kbit/s, with one
   exception. **AMR-NB**, the codec of GSM and 3G calls, passes everything at
   both its highest and its lowest rate.
-- **iLBC loses two of five messages**, and loses them whole — the preamble or
-  the header, not the payload — although the three it passes arrive with the
-  payload intact. Not investigated yet; the first thing to look at when the
+- **iLBC loses one of five messages** (two of five with the frames of stage
+  1), and loses frames whole — the preamble or the header, not the payload.
+  Not investigated yet; the first thing to look at when the
   telephone preset is tuned (stage 6).
 - AMR-WB and EVS (the codecs of VoLTE calls) were not tested: ffmpeg has no
   encoder for them.
@@ -72,7 +76,7 @@ channel):
 
 ## Speed of the receiver (2026-11-10)
 
-Searching for a preamble in noise, M-series Mac:
+M-series Mac. Searching for a preamble in noise:
 
 | Build           | Device rate | Speed          |
 | --------------- | ----------- | -------------- |
@@ -83,8 +87,36 @@ Searching for a preamble in noise, M-series Mac:
 
 At 48 kHz the sample rate converter is a quarter of the work. With a sine
 computed per filter tap it was four fifths (22× real time); it now reads the
-filter from a table. Not yet measured on a phone.
+filter from a table.
 
-## Over the air between real devices
+The worst case is not noise but **a frame whose beginning was missed**: its
+tones cross the preamble threshold about 60 times a second, and each crossing
+starts a search for the exact peak and the second chirp. Native: 18× real
+time, 36× since that search looks at every fourth position first. Not yet
+measured on a phone, where it matters.
 
-Not measured yet.
+## Over the air between real devices (2026-11-10)
+
+The stage 2 build (one-way text, no repeats), by the author, in a room:
+
+| From → to                                   | Result               |
+| ------------------------------------------- | -------------------- |
+| MacBook Pro → the same MacBook, another tab | received, SNR +10 dB |
+| Android phone (Chrome) → MacBook Pro        | received, SNR +12 dB |
+| MacBook Pro → Android phone (Chrome)        | received, SNR +7 dB  |
+
+- **Range: about 4 m.** Beyond it nothing is received, and "heard but could
+  not be read" never appeared — at that time it was shown only for a bad
+  payload, so the loss is in the preamble or the header.
+- The SNR at arm's length is 15–20 dB below what the same signal gives
+  through a cable (above 26 dB), and 22–27 dB above where white noise stops
+  the modem. So it is hardly noise that limits the range. The suspects are
+  what a room and small speakers do and white noise does not: echoes longer
+  than a symbol, and distortion of the chirps. To be found out before any
+  tuning; unreadable headers after a clear preamble are now reported, which
+  tells the two apart.
+- iPhone and a phone call in between: not tried yet.
+
+On a Mac the display must be awake for a browser to process sound at all:
+with the display asleep an AudioContext reports "running" while its clock
+stands still. `npm run smoke` keeps it awake with `caffeinate`.
