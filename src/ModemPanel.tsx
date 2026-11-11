@@ -26,7 +26,14 @@ type Link =
 type Item =
   | { key: number; kind: 'received'; text: string; snrDb: number }
   /** `id` is the modem's; `attempt` grows with every repeat. */
-  | { key: number; kind: 'sent'; id: number; text: string; status: 'sending' | 'sent' | 'delivered' | 'failed'; attempt: number }
+  | {
+      key: number;
+      kind: 'sent';
+      id: number;
+      text: string;
+      status: 'sending' | 'sent' | 'delivered' | 'failed' | 'cancelled';
+      attempt: number;
+    }
   | { key: number; kind: 'peer'; name: string }
   | { key: number; kind: 'lost' };
 
@@ -76,21 +83,37 @@ function InputMeter({ t, session }: { t: Messages; session: AudioSession }) {
   );
 }
 
-function FeedItem({ t, item, onResend }: { t: Messages; item: Item; onResend: (item: Item & { kind: 'sent' }) => void }) {
+type SentItem = Item & { kind: 'sent' };
+
+interface FeedItemProps {
+  t: Messages;
+  item: Item;
+  onResend: (item: SentItem) => void;
+  onCancel: (item: SentItem) => void;
+}
+
+function FeedItem({ t, item, onResend, onCancel }: FeedItemProps) {
   if (item.kind === 'lost') return <li className="note">{t.frameLost}</li>;
   if (item.kind === 'peer') return <li className="note peer">{item.name === '' ? t.peerAnonymous : t.peerNamed(item.name)}</li>;
   let note: string;
   if (item.kind === 'received') {
     note = `${t.received} · ${t.snr(item.snrDb)}`;
   } else {
-    const status = { sending: t.sending, sent: t.sent, delivered: t.delivered, failed: t.notDelivered }[item.status];
+    const status = { sending: t.sending, sent: t.sent, delivered: t.delivered, failed: t.notDelivered, cancelled: t.cancelled }[
+      item.status
+    ];
     note = item.status === 'sending' && item.attempt > 1 ? `${status} · ${t.attempt(item.attempt)}` : status;
   }
   return (
     <li className={item.kind} data-status={item.kind === 'sent' ? item.status : undefined}>
       <span className="text">{item.text}</span>
       <small>{note}</small>
-      {item.kind === 'sent' && item.status === 'failed' && (
+      {item.kind === 'sent' && item.status === 'sending' && (
+        <button type="button" className="cancel" aria-label={t.cancel} title={t.cancel} onClick={() => onCancel(item)}>
+          ✕
+        </button>
+      )}
+      {item.kind === 'sent' && (item.status === 'failed' || item.status === 'cancelled') && (
         <button type="button" className="resend" aria-label={t.resend} title={t.resend} onClick={() => onResend(item)}>
           ↻
         </button>
@@ -123,7 +146,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
 
   useEffect(() => {
     const add = (item: Item) => setItems((list) => [...list, item]);
-    const update = (id: number, change: (item: Item & { kind: 'sent' }) => Item) =>
+    const update = (id: number, change: (item: SentItem) => Item) =>
       setItems((list) => list.map((item) => (item.kind === 'sent' && item.id === id ? change(item) : item)));
     return core.onEvent((event) => {
       const key = nextKey.current++;
@@ -233,6 +256,18 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
     }
   };
 
+  /** Takes a text back from the modem; what was delivered meanwhile stays delivered. */
+  const cancel = async ({ key, id }: SentItem) => {
+    try {
+      await core.cancel(id);
+    } catch {
+      return;
+    }
+    setItems((list) =>
+      list.map((item) => (item.key === key && item.kind === 'sent' && item.status === 'sending' ? { ...item, status: 'cancelled' } : item)),
+    );
+  };
+
   const send = async (event: FormEvent) => {
     event.preventDefault();
     if (link.status !== 'on' || text === '' || over > 0) return;
@@ -334,7 +369,13 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
         ) : (
           <ol id="feed" className="feed" aria-live="polite">
             {items.map((item) => (
-              <FeedItem key={item.key} t={t} item={item} onResend={(failed) => void (on && transmit(failed.text, failed.key))} />
+              <FeedItem
+                key={item.key}
+                t={t}
+                item={item}
+                onResend={(failed) => void (on && transmit(failed.text, failed.key))}
+                onCancel={(sending) => void cancel(sending)}
+              />
             ))}
           </ol>
         )}

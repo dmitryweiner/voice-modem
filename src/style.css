@@ -309,17 +309,20 @@ input {
 .feed > [data-status='failed'] {
   background: var(--danger);
 }
+.feed > [data-status='cancelled'] {
+  background: var(--muted);
+}
 .feed small {
   display: block;
   opacity: 0.75;
 }
-.feed > li:has(.resend) {
+.feed > li:has(button) {
   display: grid;
   grid-template-columns: 1fr auto;
   column-gap: 8px;
   align-items: center;
 }
-.feed .resend {
+.feed button {
   grid-area: 1 / 2 / 3;
   inline-size: 44px;
   min-block-size: 44px;

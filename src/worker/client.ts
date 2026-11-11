@@ -14,6 +14,8 @@ export interface CoreClient {
   hello(): Promise<void>;
   /** Push-to-talk: the button of the radio is down, transmit what is waiting. */
   ptt(): Promise<void>;
+  /** Takes back a text that is not delivered yet: it is not repeated and nothing more is told about it. */
+  cancel(id: number): Promise<void>;
   stop(): Promise<void>;
   /** Calls the listener for every event of the modem; returns the unsubscribe function. */
   onEvent(listener: (event: CoreEvent) => void): () => void;
@@ -96,6 +98,7 @@ export function coreClient(createWorker: () => WorkerPort): CoreClient {
     },
     hello: () => done({ type: 'hello' }),
     ptt: () => done({ type: 'ptt' }),
+    cancel: (id) => done({ type: 'cancel', id }),
     stop: () => done({ type: 'stop' }),
     onEvent(listener) {
       listeners.add(listener);

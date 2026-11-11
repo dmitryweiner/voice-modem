@@ -30,7 +30,14 @@ class MemoryStorage implements KeyValueStorage {
 /** A modem core that records what it is asked and says what the test tells it to. */
 function fakeCore(overrides: Partial<CoreClient> = {}) {
   const listeners = new Set<(event: CoreEvent) => void>();
-  const calls = { started: [] as [number, MessagePort, StationOptions][], sent: [] as string[], stopped: 0, hello: 0, ptt: 0 };
+  const calls = {
+    started: [] as [number, MessagePort, StationOptions][],
+    sent: [] as string[],
+    cancelled: [] as number[],
+    stopped: 0,
+    hello: 0,
+    ptt: 0,
+  };
   const client: CoreClient = {
     version: () => Promise.resolve('1.2.3'),
     start(sampleRate, port, options) {
@@ -47,6 +54,10 @@ function fakeCore(overrides: Partial<CoreClient> = {}) {
     },
     ptt() {
       calls.ptt++;
+      return Promise.resolve();
+    },
+    cancel(id) {
+      calls.cancelled.push(id);
       return Promise.resolve();
     },
     stop() {
@@ -371,6 +382,46 @@ describe('messages', () => {
     await press(() => $('#feed .resend', HTMLButtonElement).click());
     expect(text('#send-failed')).toBe('The text was not sent.');
     expect(text('#feed .sent small')).toBe('Not delivered: no answer');
+  });
+
+  it('takes back a text that is on its way, and can send it again', async () => {
+    const { core } = await listening();
+    await send('wrong');
+    core.emit({ kind: 'retry', id: 1, attempt: 2 });
+    const cancel = $('#feed .cancel', HTMLButtonElement);
+    expect(cancel.getAttribute('aria-label')).toBe('Cancel');
+
+    await press(() => cancel.click());
+    expect(core.calls.cancelled).toEqual([1]);
+    expect(text('#feed .sent small')).toBe('Cancelled');
+    expect($('#feed .sent', HTMLElement).dataset.status).toBe('cancelled');
+    expect(exists('.cancel')).toBe(false);
+
+    await press(() => $('#feed .resend', HTMLButtonElement).click());
+    expect(core.calls.sent).toEqual(['wrong', 'wrong']);
+    expect(text('#feed .sent small')).toBe('Sending…');
+  });
+
+  it('offers to cancel only what is still on its way', async () => {
+    const { core } = await listening();
+    await send('one');
+    await send('two');
+    await send('three');
+    core.emit({ kind: 'delivered', id: 1 });
+    core.emit({ kind: 'failed', id: 2 });
+    expect(document.querySelectorAll('#feed .cancel')).toHaveLength(1);
+    expect(exists('#feed .sent:last-child .cancel')).toBe(true);
+  });
+
+  it('keeps a text on its way when the modem did not take it back', async () => {
+    const core = fakeCore({ cancel: () => Promise.reject(new Error('the modem is not started')) });
+    await listening({ core });
+    await send('stays');
+    await press(() => $('#feed .cancel', HTMLButtonElement).click());
+    expect(text('#feed .sent small')).toBe('Sending…');
+    // delivered while the request was on its way: that is what is shown
+    core.emit({ kind: 'delivered', id: 1 });
+    expect(text('#feed .sent small')).toBe('Delivered');
   });
 
   it('clears the messages at a press', async () => {

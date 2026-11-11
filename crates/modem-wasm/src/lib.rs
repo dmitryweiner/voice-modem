@@ -172,6 +172,12 @@ impl Modem {
         send_text(&mut self.0, text).map_err(|message| JsError::new(&message))
     }
 
+    /// Takes back the text `id` if it is not delivered yet; false when it
+    /// is no longer waiting.
+    pub fn cancel(&mut self, id: u32) -> bool {
+        self.0.cancel(id)
+    }
+
     /// Queues a greeting with the name of this station.
     pub fn hello(&mut self) {
         self.0.hello();

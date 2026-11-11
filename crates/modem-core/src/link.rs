@@ -295,6 +295,32 @@ impl Link {
         Ok(id)
     }
 
+    /// Takes back a text that is not delivered yet: what is left of it is
+    /// not sent and nothing more is reported about it. False when there is
+    /// no such text any more. A frame already on the air still arrives, so
+    /// the other side may have the text all the same.
+    pub fn cancel(&mut self, id: u32) -> bool {
+        let queued = self.queue.len();
+        self.queue.retain(|outgoing| outgoing.message != Some(id));
+        let flight = self
+            .in_flight
+            .take_if(|flight| flight.segment.message == Some(id));
+        // Its acknowledgement may still come: nothing goes out into it.
+        if let Some(InFlight {
+            phase: Phase::WaitAck { deadline },
+            ..
+        }) = flight
+        {
+            self.quiet_until = self.quiet_until.max(deadline);
+        }
+        // The button was asked for this text alone: the request is withdrawn.
+        if self.queue.is_empty() && self.in_flight.is_none() && self.acks.is_empty() {
+            self.ptt_requested = false;
+            self.ptt_armed = false;
+        }
+        flight.is_some() || self.queue.len() < queued
+    }
+
     /// Queues a greeting: the name of this station and what it can do.
     pub fn hello(&mut self, now: u64) {
         let mut bytes = CAPABILITIES.to_be_bytes().to_vec();
@@ -892,6 +918,86 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_text_that_waits_in_the_queue_is_never_sent() {
+        let mut air = Air::pair();
+        let first = air.links[0].send_text("goes").unwrap();
+        let second = air.links[0].send_text("never mind").unwrap();
+        let third = air.links[0].send_text("goes too").unwrap();
+        assert!(air.links[0].cancel(second));
+        air.run(ms(15_000));
+        assert_eq!(air.events[1], [text(1, "goes"), text(1, "goes too")]);
+        assert_eq!(
+            air.events[0],
+            [
+                LinkEvent::Delivered { id: first },
+                LinkEvent::Delivered { id: third }
+            ]
+        );
+        // there is nothing left to cancel
+        assert!(!air.links[0].cancel(second));
+        assert!(!air.links[0].cancel(first));
+        assert!(!air.links[0].cancel(99));
+    }
+
+    #[test]
+    fn a_cancelled_text_is_not_repeated_and_the_next_one_goes() {
+        let mut air = Air::pair();
+        air.hears = Box::new(|_, _, frame| frame.payload.last() != Some(&b'?'));
+        let lost = air.links[0].send_text("anyone?").unwrap();
+        let next = air.links[0].send_text("next").unwrap();
+        // the first transmission and the wait for its acknowledgement are over, the repeat is not
+        air.run(ms(5800));
+        assert_eq!(air.sent(0, Kind::Data), 1);
+        assert!(air.links[0].cancel(lost));
+        air.run(ms(15_000));
+        assert_eq!(air.events[1], [text(1, "next")]);
+        // no failure is reported: the application knows what it cancelled
+        assert_eq!(
+            air.events[0],
+            [
+                LinkEvent::Retry {
+                    id: lost,
+                    attempt: 2
+                },
+                LinkEvent::Delivered { id: next }
+            ]
+        );
+        assert_eq!(air.sent(0, Kind::Data), 2);
+        assert!(air.links[0].is_idle(air.now));
+    }
+
+    #[test]
+    fn the_next_text_waits_for_the_answer_to_the_cancelled_one() {
+        let mut air = Air::pair();
+        air.links[0].send_text("on the air").unwrap();
+        air.links[0].send_text("next").unwrap();
+        air.run(ms(1000));
+        assert!(air.links[0].cancel(1));
+        air.run(ms(15_000));
+        // the frame was on the air already: it arrives, and its acknowledgement collides with nothing
+        assert_eq!(air.events[1], [text(1, "on the air"), text(1, "next")]);
+        assert_eq!(air.events[0], [LinkEvent::Delivered { id: 2 }]);
+        assert_eq!((air.sent(0, Kind::Data), air.sent(1, ACK)), (2, 2));
+    }
+
+    #[test]
+    fn cancelling_a_long_text_drops_the_rest_of_it() {
+        let mut air = Air::pair();
+        let long = air.links[0]
+            .send_text(&"a".repeat(3 * SEGMENT_BYTES))
+            .unwrap();
+        let next = air.links[0].send_text("clean").unwrap();
+        // the first segment is acknowledged, the second is on its way
+        air.run(ms(13_000));
+        assert_eq!(air.sent(0, Kind::Data), 2);
+        assert!(air.links[0].cancel(long));
+        air.run(ms(25_000));
+        assert_eq!(air.events[1], [text(1, "clean")]);
+        assert_eq!(air.events[0], [LinkEvent::Delivered { id: next }]);
+        assert_eq!(air.sent(0, Kind::Data), 3);
+    }
+
+    #[test]
     fn both_stations_talk_at_once_and_both_texts_arrive() {
         let mut air = Air::pair();
         let a = air.links[0].send_text("from one").unwrap();
@@ -1174,6 +1280,26 @@ mod tests {
         air.run(ms(3000));
         assert!(air.log.is_empty());
         assert_eq!(air.events[0], [LinkEvent::TxRequest]);
+    }
+
+    #[test]
+    fn a_press_for_a_cancelled_text_does_not_carry_over_to_the_next() {
+        let mut air = Air::new(vec![
+            LinkConfig {
+                manual_ptt: true,
+                ..config(1)
+            },
+            config(2),
+        ]);
+        let id = air.links[0].send_text("never mind").unwrap();
+        air.run(ms(1000));
+        assert_eq!(air.events[0], [LinkEvent::TxRequest]);
+        assert!(air.links[0].cancel(id));
+        air.links[0].ptt_pressed();
+        air.links[0].send_text("later").unwrap();
+        air.run(ms(3000));
+        assert!(air.log.is_empty());
+        assert_eq!(air.events[0], [LinkEvent::TxRequest, LinkEvent::TxRequest]);
     }
 
     /// The modes of the data frames a station sent, in order.

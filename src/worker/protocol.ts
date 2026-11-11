@@ -40,6 +40,8 @@ export type WorkerIn =
   | { type: 'version'; jobId: number }
   | ({ type: 'start'; jobId: number; sampleRate: number; port: MessagePort } & StationOptions)
   | { type: 'sendText'; jobId: number; text: string }
+  /** Takes back the text with this id if it is not delivered yet. */
+  | { type: 'cancel'; jobId: number; id: number }
   | { type: 'hello'; jobId: number }
   | { type: 'ptt'; jobId: number }
   | { type: 'stop'; jobId: number };
@@ -82,6 +84,8 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
       );
     case 'sendText':
       return typeof value.text === 'string';
+    case 'cancel':
+      return isNumber(value.id);
     default:
       return false;
   }

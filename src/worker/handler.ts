@@ -6,6 +6,8 @@ export interface CoreModem {
   sendText(text: string): number;
   hello(): void;
   pttPressed(): void;
+  /** Takes back a text that is not delivered yet; false when it is no longer waiting. */
+  cancel(id: number): boolean;
   pushRx(samples: Float32Array): void;
   pullTx(length: number): Float32Array;
   txPending(): number;
@@ -150,6 +152,10 @@ export function createSession(
         break;
       case 'ptt':
         running().modem.pttPressed();
+        break;
+      case 'cancel':
+        // Whether it was still waiting does not matter: if not, an event has told its fate.
+        running().modem.cancel(message.id);
         break;
       case 'stop':
         stop();
