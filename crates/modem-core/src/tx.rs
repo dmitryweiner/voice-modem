@@ -8,6 +8,7 @@ use crate::crc::crc32;
 use crate::frame::{Frame, HEADER_MFSK, Header, Kind, MAX_PAYLOAD, Mode, Scheme};
 use crate::mfsk::Modulator;
 use crate::ofdm;
+use crate::rx::payload_pause;
 use crate::sync::preamble;
 
 /// Frequency of the lead-in tone, Hz.
@@ -39,7 +40,7 @@ pub struct PayloadTooLong;
 /// Length of a frame in samples, without the lead-in tone.
 pub fn frame_len(kind: Kind, mode: Mode, payload_len: usize) -> usize {
     let payload = if kind.has_payload() {
-        crate::rx::payload_len(mode, payload_len)
+        payload_pause(mode) + crate::rx::payload_len(mode, payload_len)
     } else {
         0
     };
@@ -95,20 +96,25 @@ pub fn encode_frame(
     }
     let mut block = payload.clone();
     block.extend(crc32(payload).to_be_bytes());
+    // A payload in the mode of the header goes on where the header ends;
+    // before any other the header falls silent for a moment.
+    let mut tones_start = data_start;
+    if payload_pause(mode) > 0 {
+        fade(&mut samples[data_start..]);
+        samples.resize(samples.len() + payload_pause(mode), 0.0);
+        tones_start = samples.len();
+    }
     match mode.scheme() {
         Scheme::Tones(mfsk) => {
             let mut modulator = Modulator::new(mfsk, amplitude);
             for value in encode_block(&block, mfsk.bits_per_symbol()) {
                 modulator.symbol(value, &mut samples);
             }
-            fade(&mut samples[data_start..]);
+            fade(&mut samples[tones_start..]);
         }
-        Scheme::Carriers(params) => {
-            // The carriers start and stop at every symbol anyway, and a fade
-            // would take a piece out of the last one.
-            fade(&mut samples[data_start..]);
-            ofdm::modulate(&params, &block, amplitude, &mut samples);
-        }
+        // The carriers start and stop at every symbol anyway, and a fade
+        // would take a piece out of the last one.
+        Scheme::Carriers(params) => ofdm::modulate(&params, &block, amplitude, &mut samples),
     }
     Ok(samples)
 }
@@ -151,17 +157,42 @@ mod tests {
     #[test]
     fn a_fast_frame_is_carriers_after_the_header() {
         let frame = encode_frame(&data(b"hello"), Mode::F1, &TxConfig::default()).unwrap();
-        // 9 bytes: 72 + 324 coded bits in 4 symbols of 112 bits, after 2 of training
-        assert_eq!(frame.len(), 4096 + 31 * 512 + 6 * 640);
+        // a pause, then 9 bytes: 72 + 324 coded bits in 4 symbols of 112 bits, after 2 of training
+        assert_eq!(frame.len(), 4096 + 31 * 512 + 1024 + 6 * 640);
         assert_eq!(frame.len(), frame_len(Kind::Data, Mode::F1, 5));
         // the longest frame is six seconds at the slowest of the fast modes
         let longest = frame_len(Kind::Data, Mode::F1, MAX_PAYLOAD);
-        assert_eq!(longest, 4096 + 31 * 512 + 151 * 640);
+        assert_eq!(longest, 4096 + 31 * 512 + 1024 + 151 * 640);
         // the header keeps its level, the carriers are quieter on average
         let rms =
             |part: &[f32]| (part.iter().map(|x| x * x).sum::<f32>() / part.len() as f32).sqrt();
-        let (header, carriers) = frame[4096..].split_at(31 * 512);
+        let (header, rest) = frame[4096..].split_at(31 * 512);
+        let (pause, carriers) = rest.split_at(1024);
         assert!((rms(header) - 0.354).abs() < 0.01 && (rms(carriers) - 0.18).abs() < 0.02);
+        assert_eq!(pause, [0.0; 1024]);
+        assert!(header[header.len() - 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn only_a_payload_in_the_mode_of_the_header_follows_it_without_a_pause() {
+        let silent = |mode| {
+            let frame = encode_frame(&data(b"hello"), mode, &TxConfig::default()).unwrap();
+            let after_header = 4096 + 31 * 512;
+            frame[after_header..after_header + 1024]
+                .iter()
+                .all(|&x| x == 0.0)
+        };
+        assert_eq!(
+            Mode::ALL.map(silent),
+            [false, true, true, true, true, true, true]
+        );
+        // tones fade in after the pause
+        let frame = encode_frame(&data(b"hello"), Mode::R4, &TxConfig::default()).unwrap();
+        assert!(frame[4096 + 31 * 512 + 1024].abs() < 1e-3);
+        assert_eq!(
+            frame.len(),
+            4096 + 31 * 512 + 1024 + crate::rx::payload_len(Mode::R4, 5)
+        );
     }
 
     #[test]

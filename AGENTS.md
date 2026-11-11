@@ -16,9 +16,10 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   protocol layers, stages 0–7 and the decisions taken. Stages 0
   (skeleton), 1 (PHY minimum: mode R1, `modem-cli`, the simulator), 2 (sound
   in the browser) and 3 (link layer: acknowledgements and repeats, taking
-  turns, greetings, push-to-talk) are done. Stage 4 (fast modes and
-  adaptation) is half done: modes R2–R4 and the choice of mode by the advice
-  in acknowledgements; coherent OFDM modes and LDPC are next.
+  turns, greetings, push-to-talk) and 4 (fast modes and adaptation: tone
+  modes R2–R4, coherent OFDM modes F1–F3 under an LDPC code, the choice of
+  mode by the advice in acknowledgements) are done. Stage 5 (files,
+  broadcast, encryption) is next.
 
 ## Commands
 
@@ -55,10 +56,13 @@ login shell may put an older one first). Rust — stable with the
   working: frames received against noise, frequency and clock offset; the
   speed of the receiver. Source of `docs/measurements.md`.
 - `cargo run --release -p modem-sim --example modes` — the modes compared:
-  the white noise and the room echo each withstands. Source of the mode
-  table and of the thresholds of `advise` in `link.rs`.
+  the white noise and the room echo each withstands, what the receiver
+  reports there; for the fast modes also clock offsets and decoding time.
+  Source of the mode table and of the thresholds of `advise` in `link.rs`.
+- `cargo run --release -p modem-sim --example pause` — what more silence
+  between the header and the payload would give in a room.
 - `node scripts/codecs.mjs` — the modem through real speech codecs with
-  ffmpeg (`--mode r3` for another mode, `--keep` keeps the WAV files).
+  ffmpeg (`--mode r3` or `f1` for another mode, `--keep` keeps the WAV files).
 - `npm run smoke` — the browser smoke, see above.
 
 CI (`.github/workflows/ci.yml`) runs `check` and the preview smoke on every
@@ -74,7 +78,8 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | `npm run smoke -- --preview`    | ~30 s                                              |
 | `cargo test --workspace`, warm  | ~2 s (the link tests take most of it)              |
 | the sweep example               | ~50 s                                              |
-| the modes example               | ~60 s                                              |
+| the modes example               | ~2 min                                             |
+| the pause example               | ~1.5 min                                           |
 | `node scripts/codecs.mjs`       | ~10 s per mode                                     |
 | receiver, searching in noise    | 131× real time native; 95× as WASM at 48 kHz       |
 | receiver, amid modem tones      | 36× real time native (a frame with a missed start) |
@@ -112,7 +117,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   push-to-talk, the choice of mode); `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
-  echo; `frame.rs` — the modes R1–R4, frame kinds and the header;
+  echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
+  `ldpc.rs` — the code of the fast modes; `frame.rs` — the modes R1–R4 and
+  F1–F3, frame kinds and the header;
   `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler;
   `conv.rs` — convolutional code and Viterbi; `crc.rs`, `bits.rs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room

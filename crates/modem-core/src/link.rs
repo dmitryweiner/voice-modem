@@ -39,7 +39,7 @@ pub const fn frame_bytes(mode: Mode) -> usize {
 
 /// The modes a station chooses from by itself, from the most robust up.
 /// R4 is not among them: F1 is nearly three times as fast and withstands
-/// more noise and more echo. R4 is for channels that do not keep the phase,
+/// more noise and no less echo. R4 is for channels that do not keep the phase,
 /// and is set by hand.
 pub const LADDER: [Mode; 6] = [Mode::R1, Mode::R2, Mode::R3, Mode::F1, Mode::F2, Mode::F3];
 
@@ -65,13 +65,13 @@ pub struct Heard {
 /// carriers tell.
 pub fn advise(heard: Heard) -> Mode {
     match heard.carriers_snr_db {
-        Some(c) if c >= 19.0 => return Mode::F3,
-        Some(c) if c >= 15.0 => return Mode::F2,
-        Some(c) if c >= 7.0 => return Mode::F1,
+        Some(c) if c >= 16.0 => return Mode::F3,
+        Some(c) if c >= 11.0 => return Mode::F2,
+        Some(c) if c >= 6.0 => return Mode::F1,
         _ => {}
     }
     match heard.snr_db {
-        s if s >= 7.0 && heard.carriers_snr_db.is_none() => Mode::F1,
+        s if s >= 6.0 && heard.carriers_snr_db.is_none() => Mode::F1,
         s if s >= 5.0 => Mode::R3,
         s if s >= -1.0 => Mode::R2,
         _ => Mode::R1,
@@ -1408,7 +1408,7 @@ mod tests {
     #[test]
     fn advice_follows_the_signal_to_noise_ratio() {
         assert_eq!(
-            [-20.0, -1.1, -1.0, 4.9, 5.0, 6.9, 7.0, 40.0].map(|snr| advise(tones(snr))),
+            [-20.0, -1.1, -1.0, 4.9, 5.0, 5.9, 6.0, 40.0].map(|snr| advise(tones(snr))),
             [
                 Mode::R1,
                 Mode::R1,
@@ -1426,14 +1426,14 @@ mod tests {
     #[test]
     fn carriers_tell_how_many_bits_they_can_take() {
         assert_eq!(
-            [7.0, 14.9, 15.0, 18.9, 19.0, 30.0].map(|snr| advise(carriers(10.0, snr))),
+            [6.0, 10.9, 11.0, 15.9, 16.0, 30.0].map(|snr| advise(carriers(10.0, snr))),
             [Mode::F1, Mode::F1, Mode::F2, Mode::F2, Mode::F3, Mode::F3]
         );
         // whatever the tones of the header looked like
         assert_eq!(advise(carriers(-3.0, 20.0)), Mode::F3);
         // a fast frame that barely got through: back to tones, as fast as they go
-        assert_eq!(advise(carriers(20.0, 6.9)), Mode::R3);
-        assert_eq!(advise(carriers(2.0, 6.9)), Mode::R2);
+        assert_eq!(advise(carriers(20.0, 5.9)), Mode::R3);
+        assert_eq!(advise(carriers(2.0, 5.9)), Mode::R2);
     }
 
     #[test]

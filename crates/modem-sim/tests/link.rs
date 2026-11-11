@@ -190,14 +190,38 @@ fn fast_modes_in_white_noise() {
 #[test]
 fn fast_modes_near_the_speaker_in_a_room() {
     let payload = payload(200);
-    // The direct sound over all reflections: 9 dB is within a metre of a small speaker.
-    for (mode, direct) in [(Mode::F1, 9.0), (Mode::F2, 18.0), (Mode::F3, 21.0)] {
+    // The direct sound over all reflections, 3 dB above where each stops:
+    // 6 dB is within a metre or two of a small speaker.
+    for (mode, direct) in [(Mode::F1, 6.0), (Mode::F2, 9.0), (Mode::F3, 15.0)] {
         let (frame, level) = frame_in(mode, &payload);
         for seed in 0..12 {
             let heard = padded()
                 .then(Reverb::new(0.5, direct, 100 + seed))
                 .then(Awgn::with_snr(level, 30.0, seed))
                 .process(&frame);
+            stats_of(&receive(&heard), &payload);
+        }
+    }
+}
+
+#[test]
+fn many_tones_at_once_across_a_room() {
+    // Without the pause after the header its last tones, at full level,
+    // ring into the first symbols of the payload: R4 stopped at 9 dB.
+    let payload = payload(40);
+    for (mode, direct) in [(Mode::R3, 0.0), (Mode::R4, 6.0)] {
+        for seed in 0..12 {
+            let frame = Frame {
+                kind: Kind::Data,
+                station: 1,
+                seq: seed as u8,
+                payload: payload.clone(),
+            };
+            let samples = encode_frame(&frame, mode, &TxConfig::default()).unwrap();
+            let heard = padded()
+                .then(Reverb::new(0.5, direct, 100 + seed))
+                .then(Awgn::with_snr(rms(&samples[4096..12_096]), 30.0, seed))
+                .process(&samples);
             stats_of(&receive(&heard), &payload);
         }
     }

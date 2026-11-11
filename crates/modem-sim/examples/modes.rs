@@ -16,13 +16,26 @@ use modem_sim::{Awgn, Chain, Channel, ClockOffset, Pad, Reverb, rms};
 
 const TRIALS: u64 = 20;
 
+/// A data frame in a mode. The number of the frame changes the tones of
+/// the header, and in a room their echo is what the payload starts in: every
+/// trial has another.
+fn encode(mode: Mode, seq: u64, payload: &[u8]) -> Vec<f32> {
+    let frame = Frame {
+        kind: Kind::Data,
+        station: 1,
+        seq: (seq % 64) as u8,
+        payload: payload.to_vec(),
+    };
+    encode_frame(&frame, mode, &TxConfig::default()).unwrap()
+}
+
 /// Frames received, and the mean of the SNR the receiver reported for them:
 /// on the carriers for a fast mode, on the tones of the header for the others.
-fn received(frame: &[f32], payload: &[u8], channel: impl Fn(u64) -> Chain) -> (usize, f32) {
+fn received(mode: Mode, payload: &[u8], channel: impl Fn(u64) -> Chain) -> (usize, f32) {
     let mut estimates = Vec::new();
     for seed in 0..TRIALS {
         let mut receiver = Receiver::new();
-        receiver.push(&channel(seed).process(frame));
+        receiver.push(&channel(seed).process(&encode(mode, seed, payload)));
         if let Some(RxEvent::Frame { frame, stats, .. }) = receiver.poll()
             && frame.payload == payload
         {
@@ -37,12 +50,6 @@ fn received(frame: &[f32], payload: &[u8], channel: impl Fn(u64) -> Chain) -> (u
 
 fn main() {
     let payload: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(37)).collect();
-    let data = Frame {
-        kind: Kind::Data,
-        station: 1,
-        seq: 1,
-        payload: payload.clone(),
-    };
     let padded = || {
         Chain::new().then(Pad {
             before: 3000,
@@ -51,7 +58,7 @@ fn main() {
     };
 
     for mode in Mode::ALL {
-        let frame = encode_frame(&data, mode, &TxConfig::default()).unwrap();
+        let frame = encode(mode, 0, &payload);
         // The level of the header, a single tone: what "SNR" means for every mode.
         let level = rms(&frame[4096..4096 + 8000]);
         println!(
@@ -62,7 +69,7 @@ fn main() {
 
         print!("  white noise, SNR dB:        ");
         for snr in [21, 18, 15, 12, 9, 6, 3, 0, -3, -6, -9, -12, -15] {
-            let (good, estimate) = received(&frame, &payload, |seed| {
+            let (good, estimate) = received(mode, &payload, |seed| {
                 padded().then(Awgn::with_snr(level, snr as f32, seed))
             });
             print!(" {snr:>3}:{good:<2}({estimate:>3.0})");
@@ -76,7 +83,7 @@ fn main() {
                         .then(Reverb::new(rt60, direct as f32, seed + 100))
                         .then(Awgn::with_snr(level, 30.0, seed))
                 };
-                let (good, estimate) = received(&frame, &payload, room);
+                let (good, estimate) = received(mode, &payload, room);
                 print!(" {direct:>3}:{good:<2}({estimate:>3.0})");
             }
             println!();
@@ -86,21 +93,13 @@ fn main() {
         }
 
         let long: Vec<u8> = (0..1023).map(|i| (i * 37 % 256) as u8).collect();
-        let long_frame = encode_frame(
-            &Frame {
-                payload: long.clone(),
-                ..data.clone()
-            },
-            mode,
-            &TxConfig::default(),
-        )
-        .unwrap();
+        let long_frame = encode(mode, 0, &long);
         print!(
             "  1023 bytes ({:.1} s), clock offset ppm:",
             long_frame.len() as f32 / 16_000.0
         );
         for ppm in [-1000, -500, -300, -200, -100, 100, 200, 300, 500, 1000] {
-            let (good, _) = received(&long_frame, &long, |seed| {
+            let (good, _) = received(mode, &long, |seed| {
                 padded()
                     .then(ClockOffset { ppm: ppm as f32 })
                     .then(Awgn::with_snr(level, 20.0, seed))

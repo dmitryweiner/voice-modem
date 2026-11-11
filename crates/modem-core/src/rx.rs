@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use crate::SAMPLE_RATE;
 use crate::coding::{block_symbols, decode_block};
 use crate::crc::crc32;
-use crate::frame::{Frame, HEADER_BYTES, HEADER_MFSK, Header, Mode, Scheme};
+use crate::frame::{Frame, HEADER_BYTES, HEADER_MFSK, HEADER_MODE, Header, Mode, Scheme};
 use crate::mfsk::{MfskParams, soft_bits, tone_energies};
 use crate::ofdm;
 use crate::sync::{CHIRP_LEN, HZ_PER_SAMPLE, PREAMBLE_LEN, Reference};
@@ -39,6 +39,21 @@ const CHECKSUM_BYTES: usize = 4;
 /// Length of the header in samples.
 pub fn header_len() -> usize {
     block_symbols(HEADER_BYTES, HEADER_MFSK.bits_per_symbol()) * HEADER_MFSK.symbol_len
+}
+
+/// Silence between the header and a payload in another mode than the
+/// header's, samples (64 ms). In a room the last tones of the header ring on
+/// at full level, far above each of the many tones or carriers of such a
+/// payload: this lets them die down.
+pub const PAYLOAD_PAUSE: usize = 1024;
+
+/// The pause between the header and a payload in this mode, samples.
+pub fn payload_pause(mode: Mode) -> usize {
+    if mode == HEADER_MODE {
+        0
+    } else {
+        PAYLOAD_PAUSE
+    }
 }
 
 /// Length in samples of a payload of `bytes` bytes with its checksum.
@@ -381,7 +396,7 @@ impl Receiver {
         header_snr: SnrEstimate,
     ) -> bool {
         let bytes = usize::from(header.len) + CHECKSUM_BYTES;
-        let start = header_start + header_len() as u64;
+        let start = header_start + (header_len() + payload_pause(header.mode)) as u64;
         let len = payload_len(header.mode, usize::from(header.len));
         let mut stats = self.stats(header_start, freq_offset_hz, header_snr);
         let mut payload = match header.mode.scheme() {
