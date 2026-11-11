@@ -34,6 +34,9 @@ pub struct Config {
     pub manual_ptt: bool,
     /// Seed of the random waits of the link layer.
     pub seed: u64,
+    /// The mode of every data frame, or None to adapt: start with the
+    /// slowest and follow the advice of the other station.
+    pub mode: Option<Mode>,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             reliable: true,
             manual_ptt: false,
             seed: 1,
+            mode: None,
         }
     }
 }
@@ -89,6 +93,8 @@ pub enum Event {
     FrameLost { stats: RxStats },
     /// Push-to-talk: press the button and call `ptt_pressed`.
     TxRequest,
+    /// Data frames go out in this mode from now on.
+    TxMode { mode: Mode },
 }
 
 pub struct Modem {
@@ -118,9 +124,10 @@ impl Modem {
             reliable,
             manual_ptt,
             seed,
+            mode,
             ..
         } = config;
-        let ack_len = frame_len(Kind::Ack, Mode::R1, 0) as u64
+        let ack_len = frame_len(Kind::Ack { advice: Mode::R1 }, Mode::R1, 0) as u64
             + u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
         Ok(Self {
             tx_config: tx,
@@ -134,6 +141,7 @@ impl Modem {
                     reliable,
                     manual_ptt,
                     seed,
+                    mode,
                 },
                 ack_len,
             ),
@@ -182,7 +190,7 @@ impl Modem {
         while let Some(event) = self.receiver.poll() {
             match event {
                 RxEvent::Frame { frame, stats, .. } => {
-                    self.link.on_frame(&frame, self.clock);
+                    self.link.on_frame(&frame, stats.snr_db, self.clock);
                     self.take_link_events(Some(stats));
                 }
                 RxEvent::Damaged { stats, .. } | RxEvent::Unreadable { stats } => {
@@ -211,7 +219,7 @@ impl Modem {
                     ..self.tx_config
                 }
             };
-            let samples = encode_frame(frame, Mode::R1, &config)
+            let samples = encode_frame(frame, self.link.tx_mode(), &config)
                 .expect("the link layer keeps frames within the limit");
             burst.extend(samples);
             // The pause also pushes the end of the frame out of the resampler.
@@ -248,6 +256,7 @@ impl Modem {
                 (LinkEvent::Failed { id }, _) => Event::MessageFailed { id },
                 (LinkEvent::Retry { id, attempt }, _) => Event::Retry { id, attempt },
                 (LinkEvent::TxRequest, _) => Event::TxRequest,
+                (LinkEvent::TxMode { mode }, _) => Event::TxMode { mode },
             });
         }
     }
@@ -311,8 +320,16 @@ mod tests {
         }
     }
 
-    fn events(modem: &mut Modem) -> Vec<Event> {
+    fn all_events(modem: &mut Modem) -> Vec<Event> {
         std::iter::from_fn(|| modem.poll_event()).collect()
+    }
+
+    /// The events without the changes of mode, which most tests do not care about.
+    fn events(modem: &mut Modem) -> Vec<Event> {
+        all_events(modem)
+            .into_iter()
+            .filter(|e| !matches!(e, Event::TxMode { .. }))
+            .collect()
     }
 
     fn texts(events: &[Event]) -> Vec<(u16, &str)> {
@@ -396,6 +413,47 @@ mod tests {
         run(&mut [&mut alice, &mut bob], 40.0);
         assert_eq!(texts(&events(&mut bob)), [(1, long.as_str())]);
         assert_eq!(events(&mut alice), [Event::MessageDelivered { id }]);
+    }
+
+    #[test]
+    fn over_a_clean_channel_the_speed_climbs_to_the_fastest_mode() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+        let id = alice.send_text(&long).unwrap();
+        // 900 bytes: 190 in the first two frames, the rest at 250 and 500 bit/s
+        run(&mut [&mut alice, &mut bob], 60.0);
+        let at_alice = all_events(&mut alice);
+        let modes: Vec<Mode> = at_alice
+            .iter()
+            .filter_map(|e| {
+                if let Event::TxMode { mode } = e {
+                    Some(*mode)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(modes, [Mode::R2, Mode::R3, Mode::R4]);
+        assert!(
+            at_alice.contains(&Event::MessageDelivered { id }),
+            "{at_alice:?}"
+        );
+        assert_eq!(texts(&events(&mut bob)), [(1, long.as_str())]);
+    }
+
+    #[test]
+    fn a_fixed_mode_is_used_from_the_first_frame() {
+        let mut alice = Modem::new(Config {
+            mode: Some(Mode::R4),
+            reliable: false,
+            ..Config::default()
+        })
+        .unwrap();
+        let mut bob = modem(2);
+        alice.send_text(&"fast and one way ".repeat(12)).unwrap();
+        run(&mut [&mut alice, &mut bob], 6.0);
+        assert_eq!(all_events(&mut alice), [Event::MessageSent { id: 1 }]);
+        assert_eq!(texts(&events(&mut bob)).len(), 1);
     }
 
     #[test]

@@ -4,8 +4,9 @@
 // ratio the receiver measured. Needs ffmpeg and a Rust toolchain; codecs
 // this ffmpeg build lacks are reported as "not available".
 //
-//   node scripts/codecs.mjs          # the table
-//   node scripts/codecs.mjs --keep   # also keeps the WAV files and prints where
+//   node scripts/codecs.mjs            # the table for the slowest mode, r1
+//   node scripts/codecs.mjs --mode r3  # for another mode (r1 to r4)
+//   node scripts/codecs.mjs --keep     # also keeps the WAV files and prints where
 //
 // The results are recorded in docs/measurements.md.
 
@@ -37,7 +38,8 @@ const CODECS = [
   ...[24, 16, 12, 8, 6].map((k) => codec(`Opus voice, ${k} kbit/s`, 'x.ogg', ['-c:a', 'libopus', '-application', 'voip', '-b:a', `${k}k`])),
 ];
 
-const flags = parseArgs(process.argv.slice(2));
+const flags = parseArgs(process.argv.slice(2), ['mode']);
+const mode = flags.get('mode') ?? 'r1';
 const dir = mkdtempSync(join(tmpdir(), 'voice-modem-codecs-'));
 const quiet = { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' };
 const ffmpeg = (...args) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], quiet);
@@ -47,7 +49,7 @@ const cli = (...args) => execFileSync('target/release/modem-cli', args, quiet);
 
 const source = join(dir, 'source.wav');
 console.log(
-  cli('encode', ...TEXTS, '-o', source)
+  cli('encode', ...TEXTS, '-o', source, '--mode', mode)
     .trim()
     .replace(dir, '…'),
 );
@@ -68,8 +70,8 @@ for (const [index, { name, file, encode, decode }] of CODECS.entries()) {
     try {
       report = cli('decode', heard);
     } catch (error) {
-      // exit code 1: no messages; the report of damaged frames is in stdout
-      report = String(error.stdout);
+      // exit code 1: no messages; the report of unreadable frames is in stderr then
+      report = String(error.stdout) + String(error.stderr);
     }
     const lines = report.split('\n').filter((line) => line.includes(' dB '));
     const received = TEXTS.filter((text) => lines.some((line) => line.endsWith(`Hz  ${text}`))).length;

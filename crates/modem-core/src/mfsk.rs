@@ -18,29 +18,44 @@ use crate::SAMPLE_RATE;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MfskParams {
-    /// Bits carried by one symbol; there are `2^bits_per_symbol` tones.
-    pub bits_per_symbol: usize,
-    /// Symbol length in samples.
-    pub symbol_len: usize,
-    /// Frequency of the lowest tone, Hz.
-    pub first_tone_hz: f32,
-    /// Distance between neighbouring frequencies of the grid, Hz. A multiple
-    /// of `SAMPLE_RATE / symbol_len` keeps the tones orthogonal.
-    pub spacing_hz: f32,
+    /// Bits carried by one tone; a group has `2^bits_per_tone` tones to choose from.
+    pub bits_per_tone: usize,
+    /// Tones sounding at once, each chosen from a group of its own: the
+    /// groups lie side by side in frequency. More groups carry more bits per
+    /// symbol, each tone with a smaller share of the power.
+    pub groups: usize,
     /// The grid is shared by this many sets of tones used in turn: symbol
     /// `n` takes every `sets`-th frequency starting from number `n % sets`.
     /// The echo of a symbol then falls between the tones of the next ones.
     pub sets: usize,
+    /// Symbol length in samples.
+    pub symbol_len: usize,
+    /// The lowest frequency of the grid, Hz.
+    pub first_tone_hz: f32,
+    /// Distance between neighbouring frequencies of the grid, Hz. A multiple
+    /// of `SAMPLE_RATE / symbol_len` keeps the tones orthogonal.
+    pub spacing_hz: f32,
 }
 
 impl MfskParams {
+    /// Tones in one group.
     pub const fn tones(&self) -> usize {
-        1 << self.bits_per_symbol
+        1 << self.bits_per_tone
     }
 
-    /// Frequency of a tone in symbol number `index` of a block.
-    pub fn tone_hz(&self, tone: usize, index: usize) -> f32 {
-        self.first_tone_hz + self.spacing_hz * (tone * self.sets + index % self.sets) as f32
+    pub const fn bits_per_symbol(&self) -> usize {
+        self.groups * self.bits_per_tone
+    }
+
+    /// Frequency of a tone of a group in symbol number `index` of a block.
+    pub fn tone_hz(&self, group: usize, tone: usize, index: usize) -> f32 {
+        let slot = (group * self.tones() + tone) * self.sets + index % self.sets;
+        self.first_tone_hz + self.spacing_hz * slot as f32
+    }
+
+    /// The highest frequency of the grid, Hz.
+    pub fn last_tone_hz(&self) -> f32 {
+        self.first_tone_hz + self.spacing_hz * (self.groups * self.tones() * self.sets - 1) as f32
     }
 }
 
@@ -60,11 +75,12 @@ const fn tone_of(value: usize) -> usize {
     tone
 }
 
-/// Generates the tones, keeping the phase continuous from symbol to symbol.
+/// Generates the tones, keeping the phase of each group continuous from symbol to symbol.
 pub struct Modulator {
     params: MfskParams,
+    /// Level of one tone: the tones of all groups together never exceed the asked amplitude.
     amplitude: f32,
-    phase: f32,
+    phases: Vec<f32>,
     /// Number of the next symbol.
     index: usize,
 }
@@ -73,26 +89,35 @@ impl Modulator {
     pub fn new(params: MfskParams, amplitude: f32) -> Self {
         Self {
             params,
-            amplitude,
-            phase: 0.0,
+            amplitude: amplitude / params.groups as f32,
+            phases: vec![0.0; params.groups],
             index: 0,
         }
     }
 
-    /// Appends the samples of one symbol with the given value to `out`.
+    /// Appends the samples of one symbol with the given value to `out`: the
+    /// first `bits_per_tone` bits of the value choose the tone of the first group.
     pub fn symbol(&mut self, value: usize, out: &mut Vec<f32>) {
-        debug_assert!(value < self.params.tones());
-        let step = TAU * self.params.tone_hz(tone_of(value), self.index) / SAMPLE_RATE as f32;
-        self.index += 1;
-        for _ in 0..self.params.symbol_len {
-            out.push(self.amplitude * self.phase.sin());
-            self.phase = (self.phase + step) % TAU;
+        let params = self.params;
+        debug_assert!(value < 1 << params.bits_per_symbol());
+        let start = out.len();
+        out.resize(start + params.symbol_len, 0.0);
+        for (group, phase) in self.phases.iter_mut().enumerate() {
+            let part = (value >> ((params.groups - 1 - group) * params.bits_per_tone))
+                & (params.tones() - 1);
+            let step = TAU * params.tone_hz(group, tone_of(part), self.index) / SAMPLE_RATE as f32;
+            for sample in &mut out[start..] {
+                *sample += self.amplitude * phase.sin();
+                *phase = (*phase + step) % TAU;
+            }
         }
+        self.index += 1;
     }
 }
 
-/// Energy of every tone of symbol number `index` of a block; `freq_offset_hz`
-/// is how far the received signal is shifted up from the nominal frequencies.
+/// Energy of every tone of symbol number `index` of a block, group after
+/// group; `freq_offset_hz` is how far the received signal is shifted up from
+/// the nominal frequencies.
 pub fn tone_energies(
     params: &MfskParams,
     samples: &[f32],
@@ -100,10 +125,11 @@ pub fn tone_energies(
     freq_offset_hz: f32,
 ) -> Vec<f32> {
     debug_assert_eq!(samples.len(), params.symbol_len);
-    (0..params.tones())
-        .map(|tone| {
-            let step = TAU * (params.tone_hz(tone, index) + freq_offset_hz) / SAMPLE_RATE as f32;
-            let (rotate_sin, rotate_cos) = step.sin_cos();
+    (0..params.groups * params.tones())
+        .map(|slot| {
+            let hz = params.tone_hz(slot / params.tones(), slot % params.tones(), index)
+                + freq_offset_hz;
+            let (rotate_sin, rotate_cos) = (TAU * hz / SAMPLE_RATE as f32).sin_cos();
             let (mut cos, mut sin) = (1.0f32, 0.0f32);
             let (mut re, mut im) = (0.0f32, 0.0f32);
             for &x in samples {
@@ -120,20 +146,22 @@ pub fn tone_energies(
 }
 
 /// Appends one soft bit per bit of the symbol, first bit of the value first
-/// (positive: 0). Max-log on tone amplitudes: the best tone with the bit clear
-/// against the best tone with it set.
+/// (positive: 0). Max-log on tone amplitudes within each group: the best tone
+/// with the bit clear against the best tone with it set.
 pub fn soft_bits(params: &MfskParams, energies: &[f32], out: &mut Vec<f32>) {
-    for bit in (0..params.bits_per_symbol).rev() {
-        let (mut zero, mut one) = (0.0f32, 0.0f32);
-        for (tone, energy) in energies.iter().enumerate() {
-            let amplitude = energy.sqrt();
-            if (value_of(tone) >> bit) & 1 == 0 {
-                zero = zero.max(amplitude);
-            } else {
-                one = one.max(amplitude);
+    for group in energies.chunks_exact(params.tones()) {
+        for bit in (0..params.bits_per_tone).rev() {
+            let (mut zero, mut one) = (0.0f32, 0.0f32);
+            for (tone, energy) in group.iter().enumerate() {
+                let amplitude = energy.sqrt();
+                if (value_of(tone) >> bit) & 1 == 0 {
+                    zero = zero.max(amplitude);
+                } else {
+                    one = one.max(amplitude);
+                }
             }
+            out.push(zero - one);
         }
-        out.push(zero - one);
     }
 }
 
@@ -142,11 +170,12 @@ mod tests {
     use super::*;
 
     const PARAMS: MfskParams = MfskParams {
-        bits_per_symbol: 4,
+        bits_per_tone: 4,
+        groups: 1,
+        sets: 1,
         symbol_len: 512,
         first_tone_hz: 750.0,
         spacing_hz: 125.0,
-        sets: 1,
     };
 
     fn hard(llrs: &[f32]) -> usize {
@@ -157,8 +186,8 @@ mod tests {
     #[test]
     fn tone_frequencies() {
         assert_eq!(PARAMS.tones(), 16);
-        assert_eq!(PARAMS.tone_hz(0, 0), 750.0);
-        assert_eq!(PARAMS.tone_hz(15, 7), 2625.0);
+        assert_eq!(PARAMS.tone_hz(0, 0, 0), 750.0);
+        assert_eq!(PARAMS.tone_hz(0, 15, 7), 2625.0);
     }
 
     const HOPPING: MfskParams = MfskParams {
@@ -171,11 +200,11 @@ mod tests {
     fn sets_of_tones_take_turns_on_one_grid() {
         // symbol 0 uses 750, 875, …; symbol 1 the frequencies one grid step up; symbol 4 is back
         assert_eq!(
-            [0, 1, 2, 3, 4].map(|index| HOPPING.tone_hz(0, index)),
+            [0, 1, 2, 3, 4].map(|index| HOPPING.tone_hz(0, 0, index)),
             [750.0, 781.25, 812.5, 843.75, 750.0]
         );
-        assert_eq!(HOPPING.tone_hz(1, 0) - HOPPING.tone_hz(0, 0), 125.0);
-        assert_eq!(HOPPING.tone_hz(15, 3), 2718.75);
+        assert_eq!(HOPPING.tone_hz(0, 1, 0) - HOPPING.tone_hz(0, 0, 0), 125.0);
+        assert_eq!(HOPPING.tone_hz(0, 15, 3), 2718.75);
     }
 
     #[test]
@@ -311,5 +340,67 @@ mod tests {
         for (a, b) in loud.iter().zip(&quiet) {
             assert!((a / b - 2.0).abs() < 0.01);
         }
+    }
+
+    /// Four tones at once, each one of four: 8 bits per symbol.
+    const PARALLEL: MfskParams = MfskParams {
+        bits_per_tone: 2,
+        groups: 4,
+        sets: 4,
+        ..HOPPING
+    };
+
+    #[test]
+    fn groups_lie_side_by_side_on_the_grid() {
+        assert_eq!(PARALLEL.bits_per_symbol(), 8);
+        // a group takes 4 tones × 4 sets = 16 grid steps of 31.25 Hz
+        assert_eq!(
+            [0, 1, 2, 3].map(|group| PARALLEL.tone_hz(group, 0, 0)),
+            [750.0, 1250.0, 1750.0, 2250.0]
+        );
+        assert_eq!(PARALLEL.tone_hz(3, 3, 3), PARALLEL.last_tone_hz());
+        assert_eq!(PARALLEL.last_tone_hz(), 2718.75);
+        assert_eq!(HOPPING.last_tone_hz(), 2718.75);
+    }
+
+    #[test]
+    fn several_tones_at_once_carry_every_value() {
+        let mut modulator = Modulator::new(PARALLEL, 0.5);
+        for index in 0..256 {
+            let value = (index * 37 + 11) % 256;
+            let mut samples = Vec::new();
+            modulator.symbol(value, &mut samples);
+            let peak = samples.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(peak <= 0.5 + 1e-6, "peak {peak}");
+            let mut llrs = Vec::new();
+            soft_bits(
+                &PARALLEL,
+                &tone_energies(&PARALLEL, &samples, index, 0.0),
+                &mut llrs,
+            );
+            assert_eq!(llrs.len(), 8);
+            assert_eq!(hard(&llrs), value, "symbol {index}");
+        }
+    }
+
+    #[test]
+    fn each_of_several_tones_has_its_share_of_the_level() {
+        let mut samples = Vec::new();
+        Modulator::new(PARALLEL, 1.0).symbol(0, &mut samples);
+        let energies = tone_energies(&PARALLEL, &samples, 0, 0.0);
+        // amplitude 1/4 each: energy (512/2 / 4)² in the first tone of every group
+        for group in 0..4 {
+            assert!(
+                (energies[group * 4] / 4096.0 - 1.0).abs() < 0.01,
+                "group {group}: {}",
+                energies[group * 4]
+            );
+        }
+        assert!(
+            energies
+                .iter()
+                .enumerate()
+                .all(|(slot, &e)| slot % 4 == 0 || e < 1.0)
+        );
     }
 }

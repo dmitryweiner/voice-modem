@@ -33,7 +33,7 @@ describe('settings storage', () => {
 
   it('saves and loads settings', () => {
     const storage = new MemoryStorage();
-    const settings = { locale: 'ru', name: 'UB1XYZ', manualPtt: true } as const;
+    const settings = { locale: 'ru', name: 'UB1XYZ', manualPtt: true, mode: 2 } as const;
     saveSettings(storage, settings);
     expect(loadSettings(storage)).toEqual(settings);
   });
@@ -53,16 +53,22 @@ describe('settings storage', () => {
     const storage = new MemoryStorage();
     const save = (settings: unknown) => storage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, settings }));
     save({ locale: 'xx', name: 'Alice', manualPtt: true });
-    expect(loadSettings(storage)).toEqual({ locale: null, name: 'Alice', manualPtt: true });
+    expect(loadSettings(storage)).toEqual({ locale: null, name: 'Alice', manualPtt: true, mode: null });
     save({ locale: 'ru', name: 7, manualPtt: 'yes', unknown: 1 });
-    expect(loadSettings(storage)).toEqual({ locale: 'ru', name: '', manualPtt: false });
+    expect(loadSettings(storage)).toEqual({ locale: 'ru', name: '', manualPtt: false, mode: null });
     save({ locale: 'ru', name: 'x'.repeat(33) });
     expect(loadSettings(storage).name).toBe('');
+    for (const mode of [4, -1, 1.5, '2']) {
+      save({ mode });
+      expect(loadSettings(storage).mode).toBeNull();
+    }
+    save({ mode: 3 });
+    expect(loadSettings(storage).mode).toBe(3);
   });
 
   it('reads what an earlier version saved: the new fields get their defaults', () => {
     const storage = new MemoryStorage();
     storage.setItem(STORAGE_KEY, '{"version":1,"settings":{"locale":"ru"}}');
-    expect(loadSettings(storage)).toEqual({ locale: 'ru', name: '', manualPtt: false });
+    expect(loadSettings(storage)).toEqual({ locale: 'ru', name: '', manualPtt: false, mode: null });
   });
 });

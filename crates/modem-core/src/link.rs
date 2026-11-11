@@ -17,15 +17,44 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::SAMPLE_RATE;
-use crate::frame::{Frame, Kind};
+use crate::frame::{Frame, Kind, MAX_PAYLOAD, Mode};
 
 const fn ms(milliseconds: u64) -> u64 {
     milliseconds * SAMPLE_RATE as u64 / 1000
 }
 
-/// Bytes of a message in one frame: short frames are lost less often and
-/// cost less to repeat. With the first byte of the payload, 64.
+/// Bytes of a message in one frame of the slowest mode: short frames are
+/// lost less often and cost less to repeat. With the first byte of the
+/// payload, 64 — five seconds on the air. Faster modes take more (see
+/// `segment_bytes`), for a frame has more than a second of preamble and header.
 pub const SEGMENT_BYTES: usize = 63;
+
+/// Bytes of a message in one frame of a mode.
+pub const fn segment_bytes(mode: Mode) -> usize {
+    match mode {
+        Mode::R1 => SEGMENT_BYTES,
+        Mode::R2 => 2 * SEGMENT_BYTES + 1,
+        Mode::R3 | Mode::R4 => MAX_PAYLOAD - 1,
+    }
+}
+
+/// The fastest mode worth trying when a frame from the other station was
+/// heard with this signal-to-noise ratio (as `RxStats::snr_db`: of a single
+/// tone, echo counted as noise). Each threshold is 3 dB above where the mode
+/// stops working in white noise and in a simulated room
+/// (`modem-sim/examples/modes.rs`).
+pub fn advise(snr_db: f32) -> Mode {
+    match snr_db {
+        s if s >= 12.0 => Mode::R4,
+        s if s >= 5.0 => Mode::R3,
+        s if s >= -1.0 => Mode::R2,
+        _ => Mode::R1,
+    }
+}
+
+/// After this long without an acknowledgement from anyone the next message
+/// starts in the slowest mode again: the channel may have changed.
+const MODE_MEMORY: u64 = ms(120_000);
 /// The longest text of one message, bytes of UTF-8.
 pub const MAX_TEXT_BYTES: usize = 1000;
 /// The longest station name, bytes of UTF-8.
@@ -91,6 +120,9 @@ pub struct LinkConfig {
     pub manual_ptt: bool,
     /// Seed of the random waits.
     pub seed: u64,
+    /// The mode of every data frame, or None to choose it by what the other
+    /// station advises in its acknowledgements, starting from the slowest.
+    pub mode: Option<Mode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +156,10 @@ pub enum LinkEvent {
     },
     /// Push-to-talk: there is something to transmit, waiting for `ptt_pressed`.
     TxRequest,
+    /// Data frames go out in this mode from now on.
+    TxMode {
+        mode: Mode,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,8 +168,18 @@ pub enum SendError {
     TooLong { max: usize },
 }
 
+/// A message waiting to be sent, or partly sent.
+struct Outgoing {
+    /// The id its fate is reported under; None for a greeting, which nobody tracks.
+    message: Option<u32>,
+    /// The type of its segments, the first byte of their payloads without the flags.
+    kind: u8,
+    bytes: Vec<u8>,
+    /// Bytes already handed out in segments.
+    sent: usize,
+}
+
 struct Segment {
-    /// The message it belongs to; None for a greeting, which nobody tracks.
     message: Option<u32>,
     payload: Vec<u8>,
     last: bool,
@@ -170,10 +216,14 @@ pub struct Link {
     /// Length of an acknowledgement frame, samples.
     ack_len: u64,
     random: u64,
-    queue: VecDeque<Segment>,
+    queue: VecDeque<Outgoing>,
+    /// The mode of the next data frame.
+    tx_mode: Mode,
+    /// When the last acknowledgement for this station was received.
+    last_ack: u64,
     in_flight: Option<InFlight>,
-    /// Acknowledgements owed: station, frame number, when to send.
-    acks: VecDeque<(u16, u8, u64)>,
+    /// Acknowledgements owed: station, frame number, the mode to advise, when to send.
+    acks: VecDeque<(u16, u8, Mode, u64)>,
     next_seq: u8,
     next_message: u32,
     /// The own transmission lasts until this time.
@@ -195,6 +245,8 @@ impl Link {
     pub fn new(config: LinkConfig, ack_len: u64) -> Self {
         Self {
             random: config.seed | 1,
+            tx_mode: config.mode.unwrap_or(Mode::R1),
+            last_ack: 0,
             config,
             ack_len,
             queue: VecDeque::new(),
@@ -234,37 +286,64 @@ impl Link {
         }
         let id = self.next_message;
         self.next_message += 1;
-        let pieces: Vec<&[u8]> = text.as_bytes().chunks(SEGMENT_BYTES).collect();
-        for (index, piece) in pieces.iter().enumerate() {
-            let last = index + 1 == pieces.len();
-            let flags =
-                (if index == 0 { FLAG_FIRST } else { 0 }) | (if last { 0 } else { FLAG_MORE });
-            let mut payload = vec![TYPE_TEXT | flags];
-            payload.extend_from_slice(piece);
-            self.queue.push_back(Segment {
-                message: Some(id),
-                payload,
-                last,
-            });
-        }
+        self.queue.push_back(Outgoing {
+            message: Some(id),
+            kind: TYPE_TEXT,
+            bytes: text.as_bytes().to_vec(),
+            sent: 0,
+        });
         Ok(id)
     }
 
     /// Queues a greeting: the name of this station and what it can do.
     pub fn hello(&mut self, now: u64) {
-        let mut payload = vec![TYPE_HELLO | FLAG_FIRST];
-        payload.extend(CAPABILITIES.to_be_bytes());
+        let mut bytes = CAPABILITIES.to_be_bytes().to_vec();
         let mut end = self.config.name.len().min(MAX_NAME_BYTES);
         while !self.config.name.is_char_boundary(end) {
             end -= 1;
         }
-        payload.extend_from_slice(&self.config.name.as_bytes()[..end]);
-        self.queue.push_back(Segment {
+        bytes.extend_from_slice(&self.config.name.as_bytes()[..end]);
+        self.queue.push_back(Outgoing {
             message: None,
-            payload,
-            last: true,
+            kind: TYPE_HELLO,
+            bytes,
+            sent: 0,
         });
         self.last_hello = Some(now);
+    }
+
+    /// The mode of the data frame `poll` has just returned, and of the next ones.
+    pub fn tx_mode(&self) -> Mode {
+        self.tx_mode
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if self.config.mode.is_none() && mode != self.tx_mode {
+            self.tx_mode = mode;
+            self.events.push_back(LinkEvent::TxMode { mode });
+        }
+    }
+
+    /// Cuts the next segment off the first waiting message, as large as the current mode takes.
+    fn next_segment(&mut self) -> Option<Segment> {
+        let size = segment_bytes(self.tx_mode);
+        let outgoing = self.queue.front_mut()?;
+        let end = (outgoing.sent + size).min(outgoing.bytes.len());
+        let last = end == outgoing.bytes.len();
+        let flags =
+            (if outgoing.sent == 0 { FLAG_FIRST } else { 0 }) | (if last { 0 } else { FLAG_MORE });
+        let mut payload = vec![outgoing.kind | flags];
+        payload.extend_from_slice(&outgoing.bytes[outgoing.sent..end]);
+        outgoing.sent = end;
+        let message = outgoing.message;
+        if last {
+            self.queue.pop_front();
+        }
+        Some(Segment {
+            message,
+            payload,
+            last,
+        })
     }
 
     /// Push-to-talk: the button is down, transmit what is waiting.
@@ -289,15 +368,15 @@ impl Link {
             && now >= self.tx_until
     }
 
-    /// A frame was received at `now`.
-    pub fn on_frame(&mut self, frame: &Frame, now: u64) {
+    /// A frame was received at `now`, heard with the signal-to-noise ratio `snr_db`.
+    pub fn on_frame(&mut self, frame: &Frame, snr_db: f32, now: u64) {
         match frame.kind {
-            Kind::Ack => self.on_ack(frame, now),
-            Kind::Data | Kind::Broadcast => self.on_data(frame, now),
+            Kind::Ack { advice } => self.on_ack(frame, advice, now),
+            Kind::Data | Kind::Broadcast => self.on_data(frame, snr_db, now),
         }
     }
 
-    fn on_ack(&mut self, frame: &Frame, now: u64) {
+    fn on_ack(&mut self, frame: &Frame, advice: Mode, now: u64) {
         let ours = frame.station == self.config.station;
         // A late acknowledgement, after the repeat was already scheduled, counts as well.
         let Some(flight) = self
@@ -309,11 +388,18 @@ impl Link {
         if let (Some(id), true) = (flight.segment.message, flight.segment.last) {
             self.events.push_back(LinkEvent::Delivered { id });
         }
+        // Down at once to what the other side advises, up one step at a time.
+        let faster = Mode::ALL
+            .into_iter()
+            .find(|&mode| mode > self.tx_mode)
+            .unwrap_or(self.tx_mode);
+        self.set_mode(advice.min(faster));
+        self.last_ack = now;
         // The station that acknowledged does not listen yet.
         self.quiet_until = self.quiet_until.max(now + TURNAROUND);
     }
 
-    fn on_data(&mut self, frame: &Frame, now: u64) {
+    fn on_data(&mut self, frame: &Frame, snr_db: f32, now: u64) {
         let from = frame.station;
         // Its own echo, or another station that happened to pick the same address.
         if from == self.config.station {
@@ -323,9 +409,10 @@ impl Link {
             && !self
                 .acks
                 .iter()
-                .any(|&(station, seq, _)| (station, seq) == (from, frame.seq))
+                .any(|&(station, seq, ..)| (station, seq) == (from, frame.seq))
         {
-            self.acks.push_back((from, frame.seq, now + ACK_DELAY));
+            self.acks
+                .push_back((from, frame.seq, advise(snr_db), now + ACK_DELAY));
         }
         if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&from) {
             self.peers.clear();
@@ -378,7 +465,8 @@ impl Link {
 
     /// What to transmit now, if anything: called regularly with the time and
     /// whether a frame is being received. The frames go out one after
-    /// another at once; report their total length with `on_tx`.
+    /// another at once, those with a payload in the mode `tx_mode()`; report
+    /// their total length with `on_tx`.
     pub fn poll(&mut self, now: u64, busy: bool) -> Vec<Frame> {
         if busy {
             self.quiet_until = now + self.random_in(LISTEN);
@@ -387,21 +475,24 @@ impl Link {
             return Vec::new();
         }
         self.check_timeout(now);
-        if self.in_flight.is_none()
-            && let Some(segment) = self.queue.pop_front()
-        {
-            let seq = self.next_seq;
-            self.next_seq = seq.wrapping_add(1);
-            self.in_flight = Some(InFlight {
-                segment,
-                seq,
-                attempts: 0,
-                phase: Phase::Ready { at: now },
-            });
+        if self.in_flight.is_none() && !self.queue.is_empty() {
+            if now > self.last_ack + MODE_MEMORY {
+                self.set_mode(Mode::R1);
+            }
+            if let Some(segment) = self.next_segment() {
+                let seq = self.next_seq;
+                self.next_seq = seq.wrapping_add(1);
+                self.in_flight = Some(InFlight {
+                    segment,
+                    seq,
+                    attempts: 0,
+                    phase: Phase::Ready { at: now },
+                });
+            }
         }
 
         let manual = self.config.manual_ptt;
-        let ack_due = self.acks.front().is_some_and(|&(_, _, due)| due <= now);
+        let ack_due = self.acks.front().is_some_and(|&(.., due)| due <= now);
         // With push-to-talk the human decides when the channel is free.
         // Otherwise: silence for a while, and no acknowledgement owed — the
         // other side waits for that first.
@@ -422,12 +513,12 @@ impl Link {
 
         let mut frames = Vec::new();
         // One press of the button carries everything that is waiting.
-        while let Some(&(station, seq, due)) = self.acks.front()
+        while let Some(&(station, seq, advice, due)) = self.acks.front()
             && (manual || due <= now)
         {
             self.acks.pop_front();
             frames.push(Frame {
-                kind: Kind::Ack,
+                kind: Kind::Ack { advice },
                 station,
                 seq,
                 payload: Vec::new(),
@@ -501,6 +592,14 @@ impl Link {
         if flight.attempts < MAX_ATTEMPTS {
             let attempt = flight.attempts + 1;
             let at = now + self.random_in(BACKOFF);
+            // Whatever the reason, a slower mode has the better chance.
+            if let Some(slower) = Mode::ALL
+                .into_iter()
+                .rev()
+                .find(|&mode| mode < self.tx_mode)
+            {
+                self.set_mode(slower);
+            }
             if let Some(flight) = &mut self.in_flight {
                 flight.phase = Phase::Ready { at };
             }
@@ -528,12 +627,15 @@ impl Link {
 mod tests {
     use super::*;
 
-    /// Length of an acknowledgement and of a data frame with `bytes` of payload, samples.
+    use crate::tx::frame_len;
+
+    /// Length of an acknowledgement and of an R1 data frame with `bytes` of payload, samples.
     const ACK_LEN: u64 = 4096 + 31 * 512;
     fn data_len(bytes: usize) -> u64 {
-        4096 + (31 + ((bytes as u64 + 4) * 8 + 6).div_ceil(2)) * 512
+        frame_len(Kind::Data, Mode::R1, bytes) as u64
     }
     const TICK: u64 = ms(10);
+    const ACK: Kind = Kind::Ack { advice: Mode::R1 };
 
     fn config(station: u16) -> LinkConfig {
         LinkConfig {
@@ -542,6 +644,7 @@ mod tests {
             reliable: true,
             manual_ptt: false,
             seed: u64::from(station) * 7919,
+            mode: None,
         }
     }
 
@@ -557,6 +660,8 @@ mod tests {
         /// Every frame that was transmitted: sender, frame, start.
         log: Vec<(usize, Frame, u64)>,
         hears: Hears,
+        /// How well every frame is heard, dB: decides the advice in acknowledgements.
+        snr: f32,
         events: Vec<Vec<LinkEvent>>,
     }
 
@@ -570,6 +675,7 @@ mod tests {
                 flying: Vec::new(),
                 log: Vec::new(),
                 hears: Box::new(|_, _, _| true),
+                snr: -5.0,
                 events,
             }
         }
@@ -596,7 +702,7 @@ mod tests {
                             }) || self.links[receiver].deaf_until() > start;
                         if receiver != sender && !collided && (self.hears)(sender, receiver, &frame)
                         {
-                            self.links[receiver].on_frame(&frame, now);
+                            self.links[receiver].on_frame(&frame, self.snr, now);
                         }
                     }
                 }
@@ -609,11 +715,9 @@ mod tests {
                     let frames = self.links[index].poll(now, busy);
                     let mut at = now;
                     for frame in frames {
-                        let len = if frame.kind == Kind::Ack {
-                            ACK_LEN
-                        } else {
-                            data_len(frame.payload.len())
-                        };
+                        let len =
+                            frame_len(frame.kind, self.links[index].tx_mode(), frame.payload.len())
+                                as u64;
                         self.log.push((index, frame.clone(), at));
                         self.flying.push((index, frame, at, at + len));
                         at += len + GAP;
@@ -628,10 +732,14 @@ mod tests {
             }
         }
 
+        /// Frames of this kind sent by a station; any acknowledgement counts as `ACK`.
         fn sent(&self, index: usize, kind: Kind) -> usize {
             self.log
                 .iter()
-                .filter(|(sender, frame, _)| *sender == index && frame.kind == kind)
+                .filter(|(sender, frame, _)| {
+                    *sender == index
+                        && std::mem::discriminant(&frame.kind) == std::mem::discriminant(&kind)
+                })
                 .count()
         }
     }
@@ -650,7 +758,7 @@ mod tests {
         air.run(ms(6000));
         assert_eq!(air.events[1], [text(1, "hello")]);
         assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
-        assert_eq!((air.sent(0, Kind::Data), air.sent(1, Kind::Ack)), (1, 1));
+        assert_eq!((air.sent(0, Kind::Data), air.sent(1, ACK)), (1, 1));
         assert!(air.links.iter().all(|link| link.is_idle(air.now)));
     }
 
@@ -661,7 +769,7 @@ mod tests {
         air.run(ms(6000));
         let (_, _, data_at) = air.log[0];
         let (_, ack, ack_at) = &air.log[1];
-        assert_eq!((ack.kind, ack.station, ack.seq), (Kind::Ack, 1, 0));
+        assert_eq!((ack.kind, ack.station, ack.seq), (ACK, 1, 0));
         let pause = ack_at - (data_at + data_len(6));
         assert!(
             (ACK_DELAY..ACK_DELAY + 2 * TICK).contains(&pause),
@@ -697,7 +805,7 @@ mod tests {
         let mut air = Air::pair();
         let mut losses = 1;
         air.hears = Box::new(move |_, _, frame| {
-            let lost = frame.kind == Kind::Ack && losses > 0;
+            let lost = matches!(frame.kind, Kind::Ack { .. }) && losses > 0;
             losses -= usize::from(lost);
             !lost
         });
@@ -712,7 +820,7 @@ mod tests {
             ]
         );
         // the repeat was acknowledged again
-        assert_eq!(air.sent(1, Kind::Ack), 2);
+        assert_eq!(air.sent(1, ACK), 2);
     }
 
     #[test]
@@ -756,7 +864,7 @@ mod tests {
         assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
         let segments = long.len().div_ceil(SEGMENT_BYTES);
         assert_eq!(
-            (air.sent(0, Kind::Data), air.sent(1, Kind::Ack)),
+            (air.sent(0, Kind::Data), air.sent(1, ACK)),
             (segments, segments)
         );
         assert!(
@@ -839,6 +947,7 @@ mod tests {
                 seq: 0,
                 payload: vec![TYPE_TEXT | FLAG_FIRST, b'x'],
             },
+            -5.0,
             100,
         );
         assert_eq!(link.poll_event(), None);
@@ -854,30 +963,33 @@ mod tests {
         let now = air.now;
         air.links[0].on_frame(
             &Frame {
-                kind: Kind::Ack,
+                kind: ACK,
                 station: 1,
                 seq: 9,
                 payload: vec![],
             },
+            -5.0,
             now,
         );
         air.links[0].on_frame(
             &Frame {
-                kind: Kind::Ack,
+                kind: ACK,
                 station: 2,
                 seq: 0,
                 payload: vec![],
             },
+            -5.0,
             now,
         );
         assert!(!air.links[0].is_idle(now));
         air.links[0].on_frame(
             &Frame {
-                kind: Kind::Ack,
+                kind: ACK,
                 station: 1,
                 seq: 0,
                 payload: vec![],
             },
+            -5.0,
             now,
         );
         assert!(air.links[0].is_idle(now + ms(10_000)));
@@ -896,10 +1008,7 @@ mod tests {
         air.run(ms(30_000));
         assert_eq!(air.events[1], [text(1, &"b".repeat(100))]);
         assert_eq!(air.events[0], [LinkEvent::Sent { id }]);
-        assert_eq!(
-            (air.sent(0, Kind::Broadcast), air.sent(1, Kind::Ack)),
-            (2, 0)
-        );
+        assert_eq!((air.sent(0, Kind::Broadcast), air.sent(1, ACK)), (2, 0));
         // the two segments are two pauses apart: one closes the burst, one opens the next
         let gap = air.log[1].2 - (air.log[0].2 + data_len(64));
         assert!((2 * GAP..2 * GAP + 2 * TICK).contains(&gap), "{gap}");
@@ -975,6 +1084,7 @@ mod tests {
                 seq: 0,
                 payload: vec![0x0F | FLAG_FIRST, 1, 2],
             },
+            -5.0,
             0,
         );
         link.on_frame(
@@ -984,6 +1094,7 @@ mod tests {
                 seq: 1,
                 payload: vec![],
             },
+            -5.0,
             0,
         );
         assert_eq!(link.poll_event(), None);
@@ -992,7 +1103,7 @@ mod tests {
             acks.iter()
                 .map(|f| (f.kind, f.station, f.seq))
                 .collect::<Vec<_>>(),
-            [(Kind::Ack, 2, 0), (Kind::Ack, 2, 1)]
+            [(ACK, 2, 0), (ACK, 2, 1)]
         );
     }
 
@@ -1018,7 +1129,7 @@ mod tests {
         assert_eq!(air.sent(0, Kind::Data), 1);
         // the other operator is asked to press for the acknowledgement
         assert_eq!(air.events[1], [text(1, "over"), LinkEvent::TxRequest]);
-        assert_eq!(air.sent(1, Kind::Ack), 0);
+        assert_eq!(air.sent(1, ACK), 0);
 
         // they take their time, and answer with a text in the same press
         air.run(ms(6000));
@@ -1040,7 +1151,7 @@ mod tests {
             .filter(|(sender, _, _)| *sender == 1)
             .map(|(_, frame, _)| frame.kind)
             .collect();
-        assert_eq!(burst, [Kind::Ack, Kind::Data]);
+        assert_eq!(burst, [ACK, Kind::Data]);
 
         air.links[0].ptt_pressed();
         air.run(ms(5000));
@@ -1063,5 +1174,169 @@ mod tests {
         air.run(ms(3000));
         assert!(air.log.is_empty());
         assert_eq!(air.events[0], [LinkEvent::TxRequest]);
+    }
+
+    /// The modes of the data frames a station sent, in order.
+    fn modes(air: &Air, index: usize) -> Vec<Mode> {
+        air.events[index]
+            .iter()
+            .filter_map(|e| {
+                if let LinkEvent::TxMode { mode } = e {
+                    Some(*mode)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn advice_follows_the_signal_to_noise_ratio() {
+        assert_eq!(
+            [-20.0, -1.1, -1.0, 4.9, 5.0, 11.9, 12.0, 40.0].map(advise),
+            [
+                Mode::R1,
+                Mode::R1,
+                Mode::R2,
+                Mode::R2,
+                Mode::R3,
+                Mode::R3,
+                Mode::R4,
+                Mode::R4
+            ]
+        );
+    }
+
+    #[test]
+    fn the_mode_climbs_one_step_per_acknowledged_frame_up_to_the_advice() {
+        let mut air = Air::pair();
+        air.snr = 8.0;
+        for text in ["one", "two", "three", "four"] {
+            air.links[0].send_text(text).unwrap();
+        }
+        air.run(ms(40_000));
+        assert_eq!(
+            air.events[1]
+                .iter()
+                .filter(|e| matches!(e, LinkEvent::Text { .. }))
+                .count(),
+            4
+        );
+        // advised R3 at 8 dB: R1 → R2 → R3 and no further
+        assert_eq!(modes(&air, 0), [Mode::R2, Mode::R3]);
+        assert_eq!(air.links[0].tx_mode(), Mode::R3);
+        // the listener sent nothing but acknowledgements: its own mode is untouched
+        assert_eq!(air.links[1].tx_mode(), Mode::R1);
+        let advice: Vec<Kind> = air
+            .log
+            .iter()
+            .filter(|(sender, ..)| *sender == 1)
+            .map(|(_, frame, _)| frame.kind)
+            .collect();
+        assert_eq!(advice, [Kind::Ack { advice: Mode::R3 }; 4]);
+    }
+
+    #[test]
+    fn the_mode_drops_at_once_when_the_advice_falls() {
+        let mut air = Air::pair();
+        air.snr = 20.0;
+        for _ in 0..4 {
+            air.links[0].send_text("warming up").unwrap();
+        }
+        air.run(ms(40_000));
+        assert_eq!(air.links[0].tx_mode(), Mode::R4);
+        air.snr = -8.0;
+        air.links[0].send_text("the station moved away").unwrap();
+        air.run(ms(20_000));
+        assert_eq!(air.links[0].tx_mode(), Mode::R1);
+        assert_eq!(modes(&air, 0).last(), Some(&Mode::R1));
+    }
+
+    #[test]
+    fn a_frame_without_an_answer_is_repeated_one_mode_slower() {
+        let mut air = Air::pair();
+        air.snr = 20.0;
+        for _ in 0..4 {
+            air.links[0].send_text("warming up").unwrap();
+        }
+        air.run(ms(40_000));
+        assert_eq!(air.links[0].tx_mode(), Mode::R4);
+        // from now on only the two slowest modes get through
+        let reference = Link::new(config(9), ACK_LEN);
+        drop(reference);
+        let mut attempts = Vec::new();
+        air.hears = Box::new(move |sender, _, frame| {
+            if sender == 0 && frame.kind == Kind::Data {
+                attempts.push(());
+                return attempts.len() >= 3;
+            }
+            true
+        });
+        let id = air.links[0].send_text("fading").unwrap();
+        air.run(ms(30_000));
+        assert!(air.events[0].contains(&LinkEvent::Delivered { id }));
+        let after: Vec<Mode> = modes(&air, 0).into_iter().skip(3).collect();
+        // R4 failed, R3 failed, R2 got through; the acknowledgement then advises R4 again: one step up
+        assert_eq!(after, [Mode::R3, Mode::R2, Mode::R3]);
+    }
+
+    #[test]
+    fn faster_modes_carry_more_of_a_message_per_frame() {
+        assert_eq!(Mode::ALL.map(segment_bytes), [63, 127, 254, 254]);
+        let mut air = Air::pair();
+        air.snr = 20.0;
+        let long = "x".repeat(900);
+        let id = air.links[0].send_text(&long).unwrap();
+        air.run(ms(60_000));
+        assert_eq!(air.events[1], [text(1, &long)]);
+        assert!(air.events[0].contains(&LinkEvent::Delivered { id }));
+        // the first frame in R1, the next in R2, then R3 and R4: 63 + 127 + 254 + 254 + the rest
+        let sizes: Vec<usize> = air
+            .log
+            .iter()
+            .filter(|(sender, ..)| *sender == 0)
+            .map(|(_, frame, _)| frame.payload.len() - 1)
+            .collect();
+        assert_eq!(sizes, [63, 127, 254, 254, 202]);
+    }
+
+    #[test]
+    fn a_fixed_mode_is_kept_whatever_happens() {
+        let mut air = Air::new(vec![
+            LinkConfig {
+                mode: Some(Mode::R3),
+                ..config(1)
+            },
+            config(2),
+        ]);
+        air.snr = 30.0;
+        let mut losses = 2;
+        air.hears = Box::new(move |_, _, frame| {
+            let lost = frame.kind == Kind::Data && losses > 0;
+            losses -= usize::from(lost);
+            !lost
+        });
+        air.links[0].send_text("always R3").unwrap();
+        air.links[0].send_text("again").unwrap();
+        air.run(ms(40_000));
+        assert_eq!(air.events[1].len(), 2);
+        assert_eq!(modes(&air, 0), []);
+        assert_eq!(air.links[0].tx_mode(), Mode::R3);
+    }
+
+    #[test]
+    fn after_a_long_silence_the_mode_starts_from_the_slowest_again() {
+        let mut air = Air::pair();
+        air.snr = 20.0;
+        for _ in 0..4 {
+            air.links[0].send_text("warming up").unwrap();
+        }
+        air.run(ms(40_000));
+        assert_eq!(air.links[0].tx_mode(), Mode::R4);
+        air.run(ms(130_000));
+        air.links[0].send_text("still there?").unwrap();
+        air.run(ms(10_000));
+        let all = modes(&air, 0);
+        assert_eq!(all[all.len() - 2..], [Mode::R1, Mode::R2]);
     }
 }

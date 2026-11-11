@@ -50,11 +50,11 @@ Seven bytes, always in mode R1:
 | 4    | payload length in bytes                                                                    |
 | 5–6  | CRC-16/CCITT-FALSE of bytes 0–4 (polynomial 0x1021, initial value 0xFFFF)                  |
 
-| Kind | Name            | Address and number                                   | Payload                                               |
-| ---- | --------------- | ---------------------------------------------------- | ----------------------------------------------------- |
-| 0    | data            | of the sender; it counts its frames, wrapping around | yes; asks for an acknowledgement                      |
-| 1    | acknowledgement | those of the data frame it answers                   | none: the frame ends with the header, the length is 0 |
-| 2    | broadcast       | of the sender                                        | yes; expects no answer                                |
+| Kind | Name            | Address and number                                   | Payload                                                                           |
+| ---- | --------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------- |
+| 0    | data            | of the sender; it counts its frames, wrapping around | yes; asks for an acknowledgement                                                  |
+| 1    | acknowledgement | those of the data frame it answers                   | none: the frame ends with the header; the length byte is the advised mode (below) |
+| 2    | broadcast       | of the sender                                        | yes; expects no answer                                                            |
 
 A receiver that does not know the version, the kind or the mode drops the
 frame.
@@ -66,30 +66,42 @@ PNG), in the mode named by the header.
 
 ## Modes
 
-| Id  | Name | Modulation                                 | Code                    | Net speed  |
-| --- | ---- | ------------------------------------------ | ----------------------- | ---------- |
-| 0   | R1   | 16-FSK on 4 sets of tones, 31.25 symbols/s | convolutional, rate 1/2 | 62.5 bit/s |
+| Id  | Name | Tones at once | Each one of | Sets in turn | Net speed  |
+| --- | ---- | ------------- | ----------- | ------------ | ---------- |
+| 0   | R1   | 1             | 16          | 4            | 62.5 bit/s |
+| 1   | R2   | 4             | 4           | 4            | 125 bit/s  |
+| 2   | R3   | 8             | 4           | 2            | 250 bit/s  |
+| 3   | R4   | 16            | 4           | 1            | 500 bit/s  |
 
-### R1 modulation (`mfsk.rs`)
+All modes share the symbol of 512 samples (32 ms), the grid of 64 frequencies
+31.25 Hz apart from 750 Hz to 2718.75 Hz, and the rate 1/2 convolutional
+code. The header of every frame is in R1.
 
-One of 16 tones per symbol of 512 samples (32 ms); a symbol carries 4 bits.
-The tones come from a grid of 64 frequencies 31.25 Hz apart, 750 Hz to
-2718.75 Hz, shared by four sets that take turns: symbol number `n` of a block
-(the header and the payload are blocks of their own, each counted from 0) uses
-the frequencies `750 + 31.25 · (4t + n mod 4)` Hz for the tones `t` = 0…15.
-Within a symbol the tones are 125 Hz apart. Tone `t` carries the value
-`t XOR (t >> 1)` (Gray code: neighbouring tones differ in one bit). The phase
-is continuous from symbol to symbol.
+### Modulation (`mfsk.rs`)
+
+A symbol is `G` tones sounding at once, one from each of `G` groups; a tone is
+one of `M` and carries log₂ M bits. The groups lie side by side on the grid,
+and the grid is shared by `S` sets that take turns: in symbol number `n` of a
+block (the header and the payload are blocks of their own, each counted from
+0), tone `t` of group `g` has the frequency
+
+    750 + 31.25 · ((g · M + t) · S + n mod S) Hz.
+
+The first log₂ M bits of the symbol choose the tone of group 0, and so on.
+Tone `t` carries the value `t XOR (t >> 1)` (Gray code: neighbouring tones
+differ in one bit). The phase of each group is continuous from symbol to
+symbol; each tone has 1/G of the amplitude, so the sum never exceeds it.
 
 Why the sets: in a room a tone rings on for a few tenths of a second — ten
 symbols. With one set of tones that echo lies exactly where the receiver
 looks for the next symbols, and a few metres from the speaker it is louder
 than the direct sound. With four sets the echo of the last three symbols
-falls between the tones in use ([measurements](measurements.md)).
+falls between the tones in use. The faster modes trade this away, and the
+power of each tone, for bits ([measurements](measurements.md)).
 
-The receiver measures the energy of each of the 16 tones of the symbol's set
-and never needs the phase or the level. The soft value of a bit is the
-amplitude of the loudest tone that has the bit clear minus that of the loudest
+The receiver measures the energy of each tone of the symbol's set and never
+needs the phase or the level. The soft value of a bit is the amplitude of the
+loudest tone of its group that has the bit clear minus that of the loudest
 that has it set.
 
 ### Block coding (`coding.rs`, `conv.rs`)
@@ -124,10 +136,10 @@ The first byte is the type in bits 3–0 and flags above: bit 6 — the first
 segment of a message, bit 7 — more segments follow. An empty payload and
 unknown types are acknowledged and otherwise ignored.
 
-| Type    | Content after the first byte                                                                                       |
-| ------- | ------------------------------------------------------------------------------------------------------------------ |
-| 0 text  | UTF-8 text, cut into segments of up to 63 bytes anywhere, also inside a character; a message is at most 1000 bytes |
-| 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment    |
+| Type    | Content after the first byte                                                                                    |
+| ------- | --------------------------------------------------------------------------------------------------------------- |
+| 0 text  | UTF-8 text, cut into segments anywhere, also inside a character; a message is at most 1000 bytes                |
+| 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment |
 
 A receiver starts a message at a segment with the "first" flag, appends
 segments in the order of arrival and delivers it at the one without "more".
@@ -147,6 +159,24 @@ Segments that come without a first one are dropped.
   (stop and wait).
 - A **broadcast** frame is sent once; its segments follow each other 0.2 s
   apart.
+
+### Choosing the mode
+
+- A segment carries up to 63 bytes of the message in R1, 127 in R2 and 254 in
+  R3 and R4: a frame has more than a second of preamble and header, and a
+  faster mode should not spend its time on those. A message is cut as it is
+  sent, each segment to the size of the mode at that moment.
+- An acknowledgement carries **advice** in its length byte: the id of the
+  fastest mode its sender expects to receive, from the signal-to-noise ratio
+  it measured on the acknowledged frame (echo counts as noise there): R2 from
+  −1 dB, R3 from 5 dB, R4 from 12 dB — 3 dB above where each mode stops in
+  white noise and in a simulated room.
+- A station starts in R1. On an acknowledgement it moves to the advised mode
+  if that is slower, and one mode faster if the advice is faster. When a frame
+  is not acknowledged it is repeated one mode slower. After two minutes
+  without an acknowledgement it starts from R1 again.
+- Each direction has its own mode. A station can instead be fixed to one
+  mode; broadcast frames always are.
 
 ### Taking turns
 
@@ -181,5 +211,5 @@ followed by an unreadable header, are reported as "heard but not read".
 
 ## Not there yet
 
-Other modes, tracking of the symbol clock inside a frame, addressed
-sessions, files and everything else above the link layer: see [the plan](../plans/PLAN.md).
+Coherent (OFDM) modes and LDPC, tracking of the symbol clock inside a frame,
+addressed sessions, files and everything else above the link layer: see [the plan](../plans/PLAN.md).

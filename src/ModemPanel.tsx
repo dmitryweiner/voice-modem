@@ -4,7 +4,7 @@ import { CLIP_LEVEL, SILENT, type Meter } from './audio/meter';
 import type { Messages } from './i18n';
 import { MAX_NAME_LENGTH } from './storage';
 import type { CoreClient } from './worker/client';
-import type { StationOptions } from './worker/protocol';
+import { MODE_BIT_RATES, type StationOptions } from './worker/protocol';
 
 export interface ModemPanelProps {
   t: Messages;
@@ -106,6 +106,8 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
   const [transmitting, setTransmitting] = useState(false);
   /** Push-to-talk: the modem waits for the button. */
   const [pttWanted, setPttWanted] = useState(false);
+  /** The speed texts go out at now, bit/s. */
+  const [bitRate, setBitRate] = useState<number>(MODE_BIT_RATES[0]);
   const [draft, setDraft] = useState('');
   const [sendFailed, setSendFailed] = useState(false);
   const nextKey = useRef(1);
@@ -142,6 +144,9 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           break;
         case 'retry':
           update(event.id, (item) => ({ ...item, attempt: event.attempt }));
+          break;
+        case 'txMode':
+          setBitRate(event.bitRate);
           break;
         case 'txRequest':
           setPttWanted(true);
@@ -191,6 +196,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
       session = await startAudio();
       const { maxTextBytes } = await core.start(session.sampleRate, session.port, station);
       running.current = session;
+      setBitRate(MODE_BIT_RATES[station.mode ?? 0] ?? MODE_BIT_RATES[0]);
       setLink({ status: 'on', session, maxTextBytes, manualPtt: station.manualPtt });
     } catch (error) {
       session?.stop();
@@ -262,14 +268,30 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           />
           {t.pttLabel}
         </label>
+        <select
+          id="mode"
+          aria-label={t.speedLabel}
+          value={station.mode ?? 'auto'}
+          onChange={(event) => onStationChange({ ...station, mode: event.target.value === 'auto' ? null : Number(event.target.value) })}
+        >
+          <option value="auto">{t.speedAuto}</option>
+          {MODE_BIT_RATES.map((rate, mode) => (
+            <option key={rate} value={mode}>
+              {t.bitRate(rate)}
+            </option>
+          ))}
+        </select>
       </fieldset>
 
       <div className="link">
         {on ? (
           <>
-            <span id="state" className={transmitting ? 'state transmitting' : 'state'} role="status">
-              {stateText()}
-            </span>
+            <div className="state-box">
+              <span id="state" className={transmitting ? 'state transmitting' : 'state'} role="status">
+                {stateText()}
+              </span>
+              <small id="speed">{t.bitRate(bitRate)}</small>
+            </div>
             <button id="hello" type="button" className="secondary" onClick={() => void core.hello().catch(() => {})}>
               {t.hello}
             </button>

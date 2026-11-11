@@ -38,13 +38,13 @@ const CHECKSUM_BYTES: usize = 4;
 /// Length of the header in samples.
 pub fn header_len() -> usize {
     let mfsk = HEADER_MODE.mfsk();
-    block_symbols(HEADER_BYTES, mfsk.bits_per_symbol) * mfsk.symbol_len
+    block_symbols(HEADER_BYTES, mfsk.bits_per_symbol()) * mfsk.symbol_len
 }
 
 /// Length in samples of a payload of `bytes` bytes with its checksum.
 pub fn payload_len(mode: Mode, bytes: usize) -> usize {
     let mfsk = mode.mfsk();
-    block_symbols(bytes + CHECKSUM_BYTES, mfsk.bits_per_symbol) * mfsk.symbol_len
+    block_symbols(bytes + CHECKSUM_BYTES, mfsk.bits_per_symbol()) * mfsk.symbol_len
 }
 
 /// What the receiver measured on a frame.
@@ -95,36 +95,43 @@ enum State {
     },
 }
 
-/// Tone energy sums over the symbols of a block.
+/// The signal and the noise seen in the tone filters over the symbols of a block.
 #[derive(Clone, Copy, Default)]
 struct SnrEstimate {
-    loudest: f32,
-    rest: f32,
-    symbols: f32,
+    /// Sums over the symbols of the power of the signal and of the noise, in
+    /// the same units.
+    signal: f32,
+    noise: f32,
 }
 
 impl SnrEstimate {
-    fn add(&mut self, energies: &[f32]) {
-        let loudest = energies.iter().copied().fold(0.0, f32::max);
-        self.loudest += loudest;
-        self.rest += (energies.iter().sum::<f32>() - loudest) / (energies.len() - 1) as f32;
-        self.symbols += 1.0;
+    /// Takes the tone energies of one symbol of `symbol_len` samples, in
+    /// groups of `tones`: the loudest tone of each group is the signal, the
+    /// rest is noise.
+    ///
+    /// A tone of power P gives the energy P·N²/2 in its own filter of N
+    /// samples; noise of power σ² gives N·σ² in every filter.
+    fn add(&mut self, energies: &[f32], tones: usize, symbol_len: usize) {
+        let groups = energies.len() / tones;
+        let loudest: f32 = energies
+            .chunks_exact(tones)
+            .map(|group| group.iter().copied().fold(0.0, f32::max))
+            .sum();
+        let noise = (energies.iter().sum::<f32>() - loudest) / (energies.len() - groups) as f32;
+        let n = symbol_len as f32;
+        self.signal += (loudest - groups as f32 * noise) * 2.0 / (n * n);
+        self.noise += noise / n;
     }
 
     fn merged(self, other: SnrEstimate) -> SnrEstimate {
         SnrEstimate {
-            loudest: self.loudest + other.loudest,
-            rest: self.rest + other.rest,
-            symbols: self.symbols + other.symbols,
+            signal: self.signal + other.signal,
+            noise: self.noise + other.noise,
         }
     }
 
-    /// A tone of power P gives the energy P·N²/2 in its own filter of N
-    /// samples; noise of power σ² gives N·σ² in every filter.
-    fn snr_db(self, symbol_len: usize) -> f32 {
-        let noise = self.rest / self.symbols;
-        let signal = self.loudest / self.symbols - noise;
-        let ratio = signal / noise.max(f32::MIN_POSITIVE) * 2.0 / symbol_len as f32;
+    fn snr_db(self) -> f32 {
+        let ratio = self.signal / self.noise.max(f32::MIN_POSITIVE);
         (10.0 * ratio.max(1e-4).log10()).min(60.0)
     }
 }
@@ -297,19 +304,19 @@ impl Receiver {
         freq_offset_hz: f32,
     ) -> Option<(Vec<f32>, SnrEstimate)> {
         let samples = self.samples(start, symbols * mfsk.symbol_len)?;
-        let mut soft = Vec::with_capacity(symbols * mfsk.bits_per_symbol);
+        let mut soft = Vec::with_capacity(symbols * mfsk.bits_per_symbol());
         let mut snr = SnrEstimate::default();
         for (index, symbol) in samples.chunks_exact(mfsk.symbol_len).enumerate() {
             let energies = tone_energies(mfsk, symbol, index, freq_offset_hz);
             soft_bits(mfsk, &energies, &mut soft);
-            snr.add(&energies);
+            snr.add(&energies, mfsk.tones(), mfsk.symbol_len);
         }
         Some((soft, snr))
     }
 
     fn stats(&self, header_start: u64, freq_offset_hz: f32, snr: SnrEstimate) -> RxStats {
         RxStats {
-            snr_db: snr.snr_db(HEADER_MODE.mfsk().symbol_len),
+            snr_db: snr.snr_db(),
             freq_offset_hz,
             start: header_start.saturating_sub((PREAMBLE_LEN + MAX_SHIFT) as u64),
         }
@@ -317,7 +324,7 @@ impl Receiver {
 
     fn header(&mut self, start: u64, freq_offset_hz: f32, resume: u64, clear: bool) -> bool {
         let mfsk = HEADER_MODE.mfsk();
-        let symbols = block_symbols(HEADER_BYTES, mfsk.bits_per_symbol);
+        let symbols = block_symbols(HEADER_BYTES, mfsk.bits_per_symbol());
         let Some((soft, header_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
         else {
             return false;
@@ -368,7 +375,7 @@ impl Receiver {
     ) -> bool {
         let mfsk = header.mode.mfsk();
         let bytes = usize::from(header.len) + CHECKSUM_BYTES;
-        let symbols = block_symbols(bytes, mfsk.bits_per_symbol);
+        let symbols = block_symbols(bytes, mfsk.bits_per_symbol());
         let start = header_start + header_len() as u64;
         let Some((soft, payload_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
         else {
@@ -377,7 +384,14 @@ impl Receiver {
 
         let mut payload = decode_block(&soft, bytes);
         let checksum = payload.split_off(usize::from(header.len));
-        let stats = self.stats(header_start, freq_offset_hz, header_snr.merged(payload_snr));
+        // The level is that of a single tone, as in the header: a payload of
+        // several tones at once has less power and would lower the estimate.
+        let snr = if mfsk.groups == 1 {
+            header_snr.merged(payload_snr)
+        } else {
+            header_snr
+        };
+        let stats = self.stats(header_start, freq_offset_hz, snr);
         let Header {
             kind,
             mode,
@@ -618,7 +632,7 @@ mod tests {
     #[test]
     fn receives_an_acknowledgement_which_is_a_header_alone() {
         let ack = Frame {
-            kind: Kind::Ack,
+            kind: Kind::Ack { advice: Mode::R3 },
             station: 0xABCD,
             seq: 77,
             payload: vec![],

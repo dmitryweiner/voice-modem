@@ -202,7 +202,7 @@ describe('microphone', () => {
   it('turns on: the audio device starts and its port goes to the modem', async () => {
     const { core, audio } = await listening();
     expect(audio.startAudio).toHaveBeenCalledTimes(1);
-    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false }]]);
+    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false, mode: null }]]);
     expect(text('#state')).toBe('Listening');
     expect(text('#mic')).toBe('Turn off');
     expect(exists('#level') && exists('#spectrum') && exists('#draft')).toBe(true);
@@ -451,14 +451,36 @@ describe('station', () => {
     typeName('UB1XYZ');
     expect($('#ptt-mode', HTMLInputElement).closest('label')?.textContent).toBe('Push-to-talk');
     fireEvent.click($('#ptt-mode', HTMLInputElement));
-    expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true });
+    fireEvent.change($('#mode', HTMLSelectElement), { target: { value: '2' } });
+    expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true, mode: 2 });
     await press(() => $('#mic', HTMLButtonElement).click());
-    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true });
+    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true, mode: 2 });
+    expect(text('#speed')).toBe('250 bit/s');
 
     cleanup();
     await start({ storage });
     expect($('#name', HTMLInputElement).value).toBe('UB1XYZ');
     expect($('#ptt-mode', HTMLInputElement).checked).toBe(true);
+    expect($('#mode', HTMLSelectElement).value).toBe('2');
+    fireEvent.change($('#mode', HTMLSelectElement), { target: { value: 'auto' } });
+    expect(loadSettings(storage).mode).toBeNull();
+  });
+
+  it('shows the speed the modem has settled on', async () => {
+    const { core } = await listening();
+    expect([...$('#mode', HTMLSelectElement).options].map((o) => o.textContent)).toEqual([
+      'Speed: by the channel',
+      '62.5 bit/s',
+      '125 bit/s',
+      '250 bit/s',
+      '500 bit/s',
+    ]);
+    expect(text('#speed')).toBe('62.5 bit/s');
+    core.emit({ kind: 'txMode', mode: 2, bitRate: 250 });
+    expect(text('#speed')).toBe('250 bit/s');
+    selectLocale('ru');
+    core.emit({ kind: 'txMode', mode: 0, bitRate: 62.5 });
+    expect(text('#speed')).toBe('62,5 бит/с');
   });
 
   it('cannot be changed while the modem runs', async () => {

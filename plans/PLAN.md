@@ -274,7 +274,7 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–3 are done (2026-11-10). What they settled is in
+**Progress**: stages 0–3 are done and stage 4 is half done (2026-11-11). What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
@@ -284,11 +284,22 @@ these places:
   modes at stage 4.
 - The link layer is stop-and-wait, one frame per acknowledgement; the
   selective acknowledgement of a burst waits for modes fast enough to need it
-  (stage 4).
+  (the OFDM modes).
+- **The medium group of modes is not OFDM.** Over the air the limit turned
+  out to be the echo of the room, not noise, and what beat it was tones that
+  avoid the frequencies still ringing. Differential OFDM keeps every carrier
+  on all the time and has no such escape. So the ladder above R1 is the same
+  idea made faster — several tones at once, fewer sets in turn: R2, R3, R4 at
+  125, 250 and 500 bit/s. Coherent OFDM (the F group, 1–5 kbit/s) remains
+  for channels without echo — a cable, a wired line, a metre of air — and
+  LDPC with it: the second half of stage 4.
+- Adaptation has no separate probing: the first frame goes in R1 and every
+  acknowledgement carries the mode the receiver advises, from the SNR it
+  measured. Per-frequency measurements wait for the modes that can use them.
 - There is no session yet, only a greeting that carries the name and the
   capabilities field. Frames have a sender but no destination, so the link is
-  for two stations. Addressed sessions come with probing (stage 4), which
-  needs them.
+  for two stations. Addressed sessions are not scheduled yet: the first thing
+  to need them is more than two stations on a channel.
 - Text is not compressed.
 - The core's API is methods (`send_text`, `hello`, `ptt_pressed`), not a
   command enum.
@@ -296,9 +307,16 @@ these places:
 - The web app shows the input level and spectrum but no output meter, and the
   spectrum is the browser's analyser, not the core's.
 
-Open: iLBC loses whole frames; AMR-WB/EVS and everything a
-real call adds to the codec are untested; the receiver's speed on a phone is
-not measured.
+Open:
+
+- Modes R2–R4 and the choice of mode have not been tried over the air: the
+  thresholds of the advice come from a simulated room.
+- The modem has not been tried through a real phone call or on an iPhone.
+- iLBC loses whole frames (the preamble or the header); AMR-WB/EVS and
+  everything a real call adds to the codec are untested.
+- The receiver's speed on a phone is not measured; its worst case is a frame
+  whose beginning was missed (36× real time natively).
+- The app icon is still the template's.
 
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.

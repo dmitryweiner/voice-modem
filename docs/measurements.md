@@ -6,30 +6,31 @@ channels. Each table says how to repeat it.
 SNR is the ratio of the signal power to the power of white noise over the
 whole band up to 8 kHz; in a 3 kHz band the same noise is 4.3 dB weaker.
 
-## Mode R1 in simulation (2026-11-10)
+## Mode R1 in simulation (2026-11-11)
 
-`cargo run --release -p modem-sim --example sweep` — 40-byte frames (6.7 s),
+`cargo run --release -p modem-sim --example sweep` — 40-byte frames (7 s),
 50 per point.
 
 | White noise, SNR | Frames received |
 | ---------------- | --------------- |
 | −15 dB and above | 50/50           |
 | −16 dB           | 46/50           |
-| −17 dB           | 26/50           |
-| −18 dB           | 1/50            |
+| −17 dB           | 33/50           |
+| −18 dB           | 0/50            |
 
 - **Frequency offset** (at −10 dB): received 50/50 at every offset tried from
   −250 to +250 Hz; the estimate is within 0.2 Hz on average.
 - **Sound-card clock offset**, the longest frame (255 bytes, 34 s), no noise:
-  received up to ±500 ppm, lost at ±700 ppm. The receiver does not track the
-  symbol clock yet, so shorter frames tolerate proportionally more.
+  received at every offset tried up to ±1000 ppm (±500 before the four sets
+  of tones, see the next section). The receiver does not track the symbol
+  clock; shorter frames tolerate proportionally more.
 - **False frames**: none in 10 minutes of pure noise.
 - No frame with a wrong payload was ever delivered: beyond the limit frames
   are lost or reported as damaged.
 
 `crates/modem-sim/tests/link.rs` guards these with about 3 dB of margin, plus
-a telephone band with echoes of 12–55 ms, clipping of a ten times overdriven
-signal and a signal 60 dB down.
+a telephone band with echoes of 12–55 ms, a reverberant room, clipping of a
+ten times overdriven signal and a signal 60 dB down.
 
 ## Mode R1 in a room, simulated (2026-11-11)
 
@@ -65,6 +66,41 @@ signal: it plays no part here. 40-byte frames, 25 rooms per point.
   a window that has slipped onto the previous symbol finds no energy in its
   own tones instead of a wrong tone.
 - Beyond −9 dB the preamble is the next thing to fail.
+
+## The four modes compared (2026-11-11)
+
+`cargo run --release -p modem-sim --example modes` — 40-byte frames, 20 per
+point. The level a mode needs, for 19 or 20 frames of 20:
+
+| Mode | Speed      | White noise, SNR | Room, RT60 0.3 s, direct | Room, RT60 0.5 s, direct |
+| ---- | ---------- | ---------------- | ------------------------ | ------------------------ |
+| R1   | 62.5 bit/s | −15 dB           | −9 dB or less            | −9 dB or less            |
+| R2   | 125 bit/s  | −6 dB            | −9 dB                    | −3 dB                    |
+| R3   | 250 bit/s  | 0 dB             | 3 dB                     | 3 dB                     |
+| R4   | 500 bit/s  | 9 dB             | 9 dB                     | 9 dB                     |
+
+SNR is that of the header, a single tone at full level; the faster modes
+split the same peak level between their tones. Each doubling of the speed
+costs 6–9 dB of noise and 6 dB of room, that is half the distance.
+
+Through the codecs (`node scripts/codecs.mjs --mode r2` and so on; messages
+of five that arrive):
+
+| Codec                                                     | R1  | R2  | R3  | R4  |
+| --------------------------------------------------------- | --- | --- | --- | --- |
+| G.711 µ-law, G.726 32 and 16 kbit/s, G.723.1, AMR-NB 12.2 | 5   | 5   | 5   | 5   |
+| AMR-NB, 4.75 kbit/s                                       | 5   | 5   | 2   | 0   |
+| Opus voice, 24 kbit/s                                     | 5   | 5   | 5   | 5   |
+| Opus voice, 16 kbit/s                                     | 5   | 5   | 5   | 4   |
+| Opus voice, 12, 8 and 6 kbit/s                            | 5   | 5   | 0–1 | 0   |
+| iLBC, 15.2 kbit/s                                         | 4   | 3   | 3   | 3   |
+
+The SNR the receiver measures on the header predicts this well enough for
+the choice of mode: where it reads below 5 dB (AMR 4.75, Opus 12 and less) R3
+fails and is not advised; where it reads 10 dB and more, R3 gets through.
+
+Not measured: the modes over the air, and the choice of mode on a real
+channel.
 
 ## Mode R1 through speech codecs (2026-11-10)
 

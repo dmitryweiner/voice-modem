@@ -15,6 +15,8 @@ export type CoreEvent =
   | { kind: 'retry'; id: number; attempt: number }
   /** Something was transmitted nearby but could not be read. */
   | { kind: 'frameLost'; snrDb: number; freqOffsetHz: number }
+  /** Data frames go out in this mode from now on (0 is the slowest), at so many bits per second. */
+  | { kind: 'txMode'; mode: number; bitRate: number }
   /** Push-to-talk: the modem waits for the `ptt` request. */
   | { kind: 'txRequest' }
   /** Sound of this length has gone to the speaker. */
@@ -27,7 +29,12 @@ export interface StationOptions {
   name: string;
   /** Every transmission waits for the `ptt` request. */
   manualPtt: boolean;
+  /** The number of the mode of every data frame (0 is the slowest), or null to adapt to the channel. */
+  mode: number | null;
 }
+
+/** The modes a station can be fixed to, slowest first, with their speed in bit/s. */
+export const MODE_BIT_RATES = [62.5, 125, 250, 500] as const;
 
 export type WorkerIn =
   | { type: 'version'; jobId: number }
@@ -70,7 +77,8 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
         isNumber(value.sampleRate) &&
         value.port instanceof MessagePort &&
         typeof value.name === 'string' &&
-        typeof value.manualPtt === 'boolean'
+        typeof value.manualPtt === 'boolean' &&
+        (value.mode === null || isNumber(value.mode))
       );
     case 'sendText':
       return typeof value.text === 'string';
@@ -95,6 +103,8 @@ function isCoreEvent(value: unknown): value is CoreEvent {
       return isNumber(value.id) && isNumber(value.attempt);
     case 'frameLost':
       return heard;
+    case 'txMode':
+      return isNumber(value.mode) && isNumber(value.bitRate);
     case 'txStart':
       return isNumber(value.seconds);
     case 'txRequest':

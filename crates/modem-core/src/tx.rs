@@ -83,14 +83,14 @@ pub fn encode_frame(
         len,
     };
     let mut modulator = Modulator::new(HEADER_MODE.mfsk(), amplitude);
-    for value in encode_block(&header.to_bytes(), HEADER_MODE.mfsk().bits_per_symbol) {
+    for value in encode_block(&header.to_bytes(), HEADER_MODE.mfsk().bits_per_symbol()) {
         modulator.symbol(value, &mut samples);
     }
     if kind.has_payload() {
         let mut block = payload.clone();
         block.extend(crc32(payload).to_be_bytes());
         let mut modulator = Modulator::new(mode.mfsk(), amplitude);
-        for value in encode_block(&block, mode.mfsk().bits_per_symbol) {
+        for value in encode_block(&block, mode.mfsk().bits_per_symbol()) {
             modulator.symbol(value, &mut samples);
         }
     }
@@ -136,14 +136,14 @@ mod tests {
     #[test]
     fn an_acknowledgement_is_the_preamble_and_the_header() {
         let ack = Frame {
-            kind: Kind::Ack,
+            kind: Kind::Ack { advice: Mode::R3 },
             station: 7,
             seq: 3,
             payload: vec![],
         };
         let frame = encode_frame(&ack, Mode::R1, &TxConfig::default()).unwrap();
         assert_eq!(frame.len(), 4096 + 31 * 512);
-        assert_eq!(frame.len(), frame_len(Kind::Ack, Mode::R1, 0));
+        assert_eq!(frame.len(), frame_len(ack.kind, Mode::R1, 0));
         assert!(frame[frame.len() - 1].abs() < 1e-3);
     }
 

@@ -7,16 +7,17 @@ use std::fs;
 
 use modem_core::link::{Link, LinkConfig, LinkEvent};
 use modem_core::rx::seconds;
-use modem_core::{Config, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig, VERSION};
+use modem_core::{Config, Mode, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig, VERSION};
 use modem_sim::{Awgn, BandPass, Chain, Channel, Clip, ClockOffset, FreqShift, rms};
 
 pub const USAGE: &str = "\
 modem-cli — the Voice Modem core from the command line
 
-  modem-cli encode <text>... -o out.wav [--lead-in MS] [--amplitude 0..1] [--pause S]
+  modem-cli encode <text>... -o out.wav [--mode r1..r4] [--lead-in MS]
+                                       [--amplitude 0..1] [--pause S]
       The texts (up to 1000 bytes of UTF-8 each) as one-way frames, sent once
       and not acknowledged, into a 16 kHz WAV file, with S seconds of silence
-      at the end.
+      at the end. The mode: r1 (62.5 bit/s, the default) to r4 (500 bit/s).
 
   modem-cli decode in.wav
       Prints every message heard in a 16 kHz WAV file with the time, the
@@ -39,6 +40,7 @@ pub enum Cli {
         output: String,
         lead_in_ms: u32,
         pause_s: f32,
+        mode: Mode,
         amplitude: f32,
     },
     Decode {
@@ -89,12 +91,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut positional = Vec::new();
     let mut output = None;
     let (mut lead_in_ms, mut amplitude, mut pause_s) = (0, TxConfig::default().amplitude, 0.0);
+    let mut mode = Mode::R1;
     let (mut telephone, mut shift_hz, mut ppm, mut clip, mut snr_db, mut seed) =
         (false, 0.0, 0.0, None, None, 1);
     while let Some(arg) = args.next() {
         let commands: &[&str] = match arg.as_str() {
             "-o" | "--output" => &["encode", "channel"],
-            "--lead-in" | "--amplitude" | "--pause" => &["encode"],
+            "--lead-in" | "--amplitude" | "--pause" | "--mode" => &["encode"],
             "--telephone" | "--shift" | "--ppm" | "--clip" | "--snr" | "--seed" => &["channel"],
             // A text may not start with "--"; a negative number is the value of an option.
             option if option.starts_with("--") => return Err(format!("unknown option {option}")),
@@ -110,6 +113,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "-o" | "--output" => output = Some(value::<String>(&arg, &mut args)?),
             "--lead-in" => lead_in_ms = value(&arg, &mut args)?,
             "--pause" => pause_s = value(&arg, &mut args)?,
+            "--mode" => {
+                let name: String = value(&arg, &mut args)?;
+                mode = Mode::ALL
+                    .into_iter()
+                    .find(|mode| format!("{mode:?}").eq_ignore_ascii_case(&name))
+                    .ok_or(format!("--mode: no mode {name:?}, there are r1 to r4"))?;
+            }
             "--amplitude" => amplitude = value(&arg, &mut args)?,
             "--telephone" => telephone = true,
             "--shift" => shift_hz = value(&arg, &mut args)?,
@@ -134,6 +144,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 output: output?,
                 lead_in_ms,
                 pause_s,
+                mode,
                 amplitude,
             }
         }
@@ -154,10 +165,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
 }
 
 /// The samples of the given texts, sent one way: nothing is expected back.
-pub fn encode(texts: &[String], tx: TxConfig) -> Result<Vec<f32>, String> {
+pub fn encode(texts: &[String], tx: TxConfig, mode: Mode) -> Result<Vec<f32>, String> {
     let config = Config {
         tx,
         reliable: false,
+        mode: Some(mode),
         ..Config::default()
     };
     let mut modem = Modem::new(config).map_err(|e| format!("{e:?}"))?;
@@ -193,6 +205,7 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
             reliable: false,
             manual_ptt: false,
             seed: 1,
+            mode: None,
         },
         0,
     );
@@ -210,7 +223,7 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
     while let Some(event) = receiver.poll() {
         match event {
             RxEvent::Frame { frame, stats, .. } => {
-                link.on_frame(&frame, stats.start);
+                link.on_frame(&frame, stats.snr_db, stats.start);
                 while let Some(event) = link.poll_event() {
                     if let LinkEvent::Text { text, .. } = event {
                         messages += 1;
@@ -246,6 +259,7 @@ pub fn run(cli: Cli) -> Result<String, String> {
             lead_in_ms,
             amplitude,
             pause_s,
+            mode,
         } => {
             let mut samples = encode(
                 &texts,
@@ -253,6 +267,7 @@ pub fn run(cli: Cli) -> Result<String, String> {
                     amplitude,
                     lead_in_ms,
                 },
+                mode,
             )?;
             samples.resize(
                 samples.len() + (pause_s.clamp(0.0, 3600.0) * SAMPLE_RATE as f32) as usize,
@@ -340,6 +355,7 @@ mod tests {
                 output: "a.wav".into(),
                 lead_in_ms: 300,
                 pause_s: 0.0,
+                mode: Mode::R1,
                 amplitude: 0.5
             }
         );
@@ -429,6 +445,7 @@ mod tests {
             output: clean.clone(),
             lead_in_ms: 200,
             pause_s: 0.0,
+            mode: Mode::R1,
             amplitude: 0.5,
         })
         .unwrap();
@@ -466,7 +483,7 @@ mod tests {
     #[test]
     fn a_long_text_is_cut_into_frames_and_put_together() {
         let long = "Съешь же ещё этих мягких французских булок, да выпей чаю. ".repeat(3);
-        let samples = encode(std::slice::from_ref(&long), TxConfig::default()).unwrap();
+        let samples = encode(std::slice::from_ref(&long), TxConfig::default(), Mode::R1).unwrap();
         let (report, messages) = decode(&samples);
         assert_eq!(messages, 1);
         assert!(report.trim_end().ends_with(long.trim_end()), "{report}");
@@ -478,6 +495,31 @@ mod tests {
         let (report, messages) = decode(&damaged);
         assert_eq!(messages, 0, "{report}");
         assert!(report.contains("(unreadable frame)"), "{report}");
+    }
+
+    #[test]
+    fn a_faster_mode_makes_a_shorter_file_with_the_same_text() {
+        let text = vec!["The quick brown fox jumps over the lazy dog. ".repeat(5)];
+        let mut lengths = Vec::new();
+        for name in ["r1", "R2", "r3", "r4"] {
+            let path = temp(&format!("{name}.wav"));
+            let Cli::Encode { mode, .. } =
+                parse(args(&format!("encode x -o {path} --mode {name}"))).unwrap()
+            else {
+                unreachable!()
+            };
+            let samples = encode(&text, TxConfig::default(), mode).unwrap();
+            let (report, messages) = decode(&samples);
+            assert_eq!(messages, 1, "{name}: {report}");
+            assert!(report.trim_end().ends_with(text[0].trim_end()), "{name}");
+            lengths.push((samples.len() as f32 / 16_000.0).round());
+        }
+        // 225 bytes: four frames in R1, two in R2, one in R3 and R4
+        assert_eq!(lengths, [38.0, 18.0, 9.0, 5.0]);
+        assert_eq!(
+            parse(args("encode x -o a.wav --mode r5")),
+            Err("--mode: no mode \"r5\", there are r1 to r4".to_string())
+        );
     }
 
     #[test]
@@ -512,11 +554,11 @@ mod tests {
 
     #[test]
     fn rejects_texts_it_cannot_send() {
-        let error = encode(&["x".repeat(1001)], TxConfig::default()).unwrap_err();
+        let error = encode(&["x".repeat(1001)], TxConfig::default(), Mode::R1).unwrap_err();
         assert!(
             error.starts_with("a text must have 1 to 1000 bytes, this has 1001"),
             "{error}"
         );
-        assert!(encode(&[String::new()], TxConfig::default()).is_err());
+        assert!(encode(&[String::new()], TxConfig::default(), Mode::R1).is_err());
     }
 }
