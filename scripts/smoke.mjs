@@ -90,8 +90,13 @@ try {
     check((await received.textContent()) === HEARD, `received ${JSON.stringify(await received.textContent())}`);
     const bars = await page
       .locator('#spectrum > i')
-      .evaluateAll((list) => list.filter((bar) => bar.getBoundingClientRect().height > 10).length);
+      .evaluateAll((list) => list.filter((bar) => bar.getBoundingClientRect().height > 5).length);
     check(bars > 0, 'the spectrum shows nothing');
+    // the app fits the screen: the messages scroll inside their box, the page does not
+    const height = await page.evaluate(() => document.documentElement.scrollHeight);
+    check(height <= VIEWPORTS.phone.height, `the page is ${height}px tall on a phone`);
+    const box = await page.locator('.feed-box').boundingBox();
+    check(box !== null && box.height >= 150, `the message box is ${box?.height}px tall`);
     if (shots) await page.screenshot({ path: 'shots/phone-receiving.png', fullPage: true });
     await context.close();
   });

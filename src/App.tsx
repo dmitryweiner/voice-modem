@@ -72,7 +72,7 @@ export function App({ storage, languages, core, startAudio }: AppProps) {
       </header>
       <main>
         <h1>{t.title}</h1>
-        <p>{t.intro}</p>
+        <p className="intro">{t.intro}</p>
         <ModemPanel
           t={t}
           core={core}

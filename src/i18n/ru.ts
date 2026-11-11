@@ -11,7 +11,8 @@ export const ru: Messages = {
   coreFailed: 'Ядро модема не загрузилось.',
 
   nameLabel: 'Ваше имя или позывной',
-  pttLabel: 'Рация с тангентой, которую я нажимаю сам',
+  pttLabel: 'Тангента',
+  pttHint: 'Рация с тангентой, которую я нажимаю сам',
   micOn: 'Включить микрофон',
   micOff: 'Выключить',
   micStarting: 'Запуск…',
@@ -32,6 +33,8 @@ export const ru: Messages = {
   messageLabel: 'Текст для отправки',
   send: 'Отправить',
   hello: 'Поздороваться',
+  clear: 'Очистить',
+  resend: 'Отправить ещё раз',
   received: 'Принято',
   sending: 'Отправляется…',
   sent: 'Отправлено',
