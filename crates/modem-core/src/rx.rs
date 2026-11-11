@@ -299,8 +299,8 @@ impl Receiver {
         let samples = self.samples(start, symbols * mfsk.symbol_len)?;
         let mut soft = Vec::with_capacity(symbols * mfsk.bits_per_symbol);
         let mut snr = SnrEstimate::default();
-        for symbol in samples.chunks_exact(mfsk.symbol_len) {
-            let energies = tone_energies(mfsk, symbol, freq_offset_hz);
+        for (index, symbol) in samples.chunks_exact(mfsk.symbol_len).enumerate() {
+            let energies = tone_energies(mfsk, symbol, index, freq_offset_hz);
             soft_bits(mfsk, &energies, &mut soft);
             snr.add(&energies);
         }
@@ -572,12 +572,13 @@ mod tests {
     fn reports_a_damaged_payload() {
         let mut samples = frame(5, &[0x55; 60]);
         let payload_at = PREAMBLE_LEN + header_len();
-        // Silence would only be erasures, which the code fills in; a wrong tone is believed.
-        for (n, x) in samples[payload_at + 2000..payload_at + 30_000]
-            .iter_mut()
-            .enumerate()
-        {
-            *x = (std::f32::consts::TAU * 1000.0 * n as f32 / SAMPLE_RATE as f32).sin() * 0.5;
+        // Silence is only erasures, one steady tone meets only every fourth
+        // symbol, and the code fills in even 3 s of noise: the whole payload
+        // has to go.
+        let mut seed = 1u32;
+        for x in &mut samples[payload_at..] {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *x = (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
         }
         let events = receive(&samples);
         assert!(
@@ -684,7 +685,6 @@ mod tests {
             first_tone_hz: 790.0,
             ..Mode::R1.mfsk()
         };
-        let mut modulator = crate::mfsk::Modulator::new(shifted, 0.5);
         let header = Header {
             kind: Kind::Data,
             mode: Mode::R1,
@@ -694,11 +694,12 @@ mod tests {
         };
         let mut block = b"hi".to_vec();
         block.extend(crc32(b"hi").to_be_bytes());
-        for value in crate::coding::encode_block(&header.to_bytes(), 4)
-            .into_iter()
-            .chain(crate::coding::encode_block(&block, 4))
-        {
-            modulator.symbol(value, &mut samples);
+        // the header and the payload are blocks of their own: each starts with the first set of tones
+        for bytes in [&header.to_bytes()[..], &block] {
+            let mut modulator = crate::mfsk::Modulator::new(shifted, 0.5);
+            for value in crate::coding::encode_block(bytes, 4) {
+                modulator.symbol(value, &mut samples);
+            }
         }
         let events = receive(&samples);
         assert_eq!(payloads(&events), [(3, b"hi".to_vec())]);

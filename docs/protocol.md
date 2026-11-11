@@ -66,20 +66,31 @@ PNG), in the mode named by the header.
 
 ## Modes
 
-| Id  | Name | Modulation              | Code                    | Net speed  |
-| --- | ---- | ----------------------- | ----------------------- | ---------- |
-| 0   | R1   | 16-FSK, 31.25 symbols/s | convolutional, rate 1/2 | 62.5 bit/s |
+| Id  | Name | Modulation                                 | Code                    | Net speed  |
+| --- | ---- | ------------------------------------------ | ----------------------- | ---------- |
+| 0   | R1   | 16-FSK on 4 sets of tones, 31.25 symbols/s | convolutional, rate 1/2 | 62.5 bit/s |
 
 ### R1 modulation (`mfsk.rs`)
 
-One of 16 tones per symbol of 512 samples (32 ms): 750 Hz, 875 Hz, … 2625 Hz,
-125 Hz apart. The phase is continuous from symbol to symbol. A symbol carries
-4 bits; tone number `t` carries the value `t XOR (t >> 1)` (Gray code:
-neighbouring tones differ in one bit).
+One of 16 tones per symbol of 512 samples (32 ms); a symbol carries 4 bits.
+The tones come from a grid of 64 frequencies 31.25 Hz apart, 750 Hz to
+2718.75 Hz, shared by four sets that take turns: symbol number `n` of a block
+(the header and the payload are blocks of their own, each counted from 0) uses
+the frequencies `750 + 31.25 · (4t + n mod 4)` Hz for the tones `t` = 0…15.
+Within a symbol the tones are 125 Hz apart. Tone `t` carries the value
+`t XOR (t >> 1)` (Gray code: neighbouring tones differ in one bit). The phase
+is continuous from symbol to symbol.
 
-The receiver measures the energy of each tone over the symbol and never needs
-the phase or the level. The soft value of a bit is the amplitude of the
-loudest tone that has the bit clear minus that of the loudest that has it set.
+Why the sets: in a room a tone rings on for a few tenths of a second — ten
+symbols. With one set of tones that echo lies exactly where the receiver
+looks for the next symbols, and a few metres from the speaker it is louder
+than the direct sound. With four sets the echo of the last three symbols
+falls between the tones in use ([measurements](measurements.md)).
+
+The receiver measures the energy of each of the 16 tones of the symbol's set
+and never needs the phase or the level. The soft value of a bit is the
+amplitude of the loudest tone that has the bit clear minus that of the loudest
+that has it set.
 
 ### Block coding (`coding.rs`, `conv.rs`)
 

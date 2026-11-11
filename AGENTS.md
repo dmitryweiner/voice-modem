@@ -98,10 +98,10 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   and a clock (acknowledgements, repeats, turns, segments, greetings,
   push-to-talk); `tx.rs` / `rx.rs` — a frame to samples and a
   stream of samples to frames; `sync.rs` — the chirp preamble; `mfsk.rs` —
-  tones; `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
+  tones (four sets in turn, against room echo); `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler; `conv.rs` — convolutional code
   and Viterbi; `frame.rs` — modes and the header; `crc.rs`, `bits.rs`.
-- `crates/modem-sim` — channel models (noise, band-pass, echo, frequency and
-  clock offset, clipping); `tests/link.rs` — the modem through them;
+- `crates/modem-sim` — channel models (noise, band-pass, echo, room
+  reverberation, frequency and clock offset, clipping); `tests/link.rs` — the modem through them;
   `examples/sweep.rs` — the measurements.
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
