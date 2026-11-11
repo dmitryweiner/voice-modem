@@ -7,7 +7,7 @@ use crate::conv;
 /// Pseudo-noise bits (a 16-bit Galois LFSR, taps 0xB400, seed 0xACE1). XORed
 /// over the coded bits so that repeating data does not become one long tone,
 /// which vocoders and voice detectors treat as noise.
-fn scramble_bits(len: usize) -> impl Iterator<Item = u8> {
+pub(crate) fn scramble_bits(len: usize) -> impl Iterator<Item = u8> {
     let mut state: u16 = 0xACE1;
     (0..len).map(move |_| {
         let bit = state & 1;

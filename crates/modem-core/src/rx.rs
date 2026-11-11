@@ -12,8 +12,9 @@ use std::collections::VecDeque;
 use crate::SAMPLE_RATE;
 use crate::coding::{block_symbols, decode_block};
 use crate::crc::crc32;
-use crate::frame::{Frame, HEADER_BYTES, HEADER_MODE, Header, Mode};
+use crate::frame::{Frame, HEADER_BYTES, HEADER_MFSK, Header, Mode, Scheme};
 use crate::mfsk::{MfskParams, soft_bits, tone_energies};
+use crate::ofdm;
 use crate::sync::{CHIRP_LEN, HZ_PER_SAMPLE, PREAMBLE_LEN, Reference};
 
 /// The up-chirp is looked for at every `SEARCH_STEP`-th position; its
@@ -37,14 +38,16 @@ const CHECKSUM_BYTES: usize = 4;
 
 /// Length of the header in samples.
 pub fn header_len() -> usize {
-    let mfsk = HEADER_MODE.mfsk();
-    block_symbols(HEADER_BYTES, mfsk.bits_per_symbol()) * mfsk.symbol_len
+    block_symbols(HEADER_BYTES, HEADER_MFSK.bits_per_symbol()) * HEADER_MFSK.symbol_len
 }
 
 /// Length in samples of a payload of `bytes` bytes with its checksum.
 pub fn payload_len(mode: Mode, bytes: usize) -> usize {
-    let mfsk = mode.mfsk();
-    block_symbols(bytes + CHECKSUM_BYTES, mfsk.bits_per_symbol()) * mfsk.symbol_len
+    let bytes = bytes + CHECKSUM_BYTES;
+    match mode.scheme() {
+        Scheme::Tones(mfsk) => block_symbols(bytes, mfsk.bits_per_symbol()) * mfsk.symbol_len,
+        Scheme::Carriers(params) => params.block_symbols(bytes) * ofdm::SYMBOL_LEN,
+    }
 }
 
 /// What the receiver measured on a frame.
@@ -57,6 +60,9 @@ pub struct RxStats {
     pub freq_offset_hz: f32,
     /// Position of the first sample of the preamble in the stream.
     pub start: u64,
+    /// For a payload in a fast mode: the signal-to-noise ratio on its
+    /// carriers, dB, as the pilots show it.
+    pub carriers_snr_db: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -319,11 +325,12 @@ impl Receiver {
             snr_db: snr.snr_db(),
             freq_offset_hz,
             start: header_start.saturating_sub((PREAMBLE_LEN + MAX_SHIFT) as u64),
+            carriers_snr_db: None,
         }
     }
 
     fn header(&mut self, start: u64, freq_offset_hz: f32, resume: u64, clear: bool) -> bool {
-        let mfsk = HEADER_MODE.mfsk();
+        let mfsk = HEADER_MFSK;
         let symbols = block_symbols(HEADER_BYTES, mfsk.bits_per_symbol());
         let Some((soft, header_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
         else {
@@ -373,25 +380,35 @@ impl Receiver {
         header: Header,
         header_snr: SnrEstimate,
     ) -> bool {
-        let mfsk = header.mode.mfsk();
         let bytes = usize::from(header.len) + CHECKSUM_BYTES;
-        let symbols = block_symbols(bytes, mfsk.bits_per_symbol());
         let start = header_start + header_len() as u64;
-        let Some((soft, payload_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
-        else {
-            return false;
+        let len = payload_len(header.mode, usize::from(header.len));
+        let mut stats = self.stats(header_start, freq_offset_hz, header_snr);
+        let mut payload = match header.mode.scheme() {
+            Scheme::Tones(mfsk) => {
+                let symbols = len / mfsk.symbol_len;
+                let Some((soft, payload_snr)) =
+                    self.demodulate(&mfsk, start, symbols, freq_offset_hz)
+                else {
+                    return false;
+                };
+                // The level is that of a single tone, as in the header: a payload of
+                // several tones at once has less power and would lower the estimate.
+                if mfsk.groups == 1 {
+                    stats.snr_db = header_snr.merged(payload_snr).snr_db();
+                }
+                decode_block(&soft, bytes)
+            }
+            Scheme::Carriers(params) => {
+                let Some(samples) = self.samples(start, len) else {
+                    return false;
+                };
+                let block = ofdm::demodulate(&params, samples, bytes, freq_offset_hz);
+                stats.carriers_snr_db = Some(block.snr_db);
+                block.bytes
+            }
         };
-
-        let mut payload = decode_block(&soft, bytes);
         let checksum = payload.split_off(usize::from(header.len));
-        // The level is that of a single tone, as in the header: a payload of
-        // several tones at once has less power and would lower the estimate.
-        let snr = if mfsk.groups == 1 {
-            header_snr.merged(payload_snr)
-        } else {
-            header_snr
-        };
-        let stats = self.stats(header_start, freq_offset_hz, snr);
         let Header {
             kind,
             mode,
@@ -420,7 +437,7 @@ impl Receiver {
                 }
             });
         self.state = State::Search {
-            from: start + (symbols * mfsk.symbol_len) as u64,
+            from: start + len as u64,
         };
         true
     }
@@ -482,9 +499,58 @@ mod tests {
 
     #[test]
     fn receives_empty_and_full_frames() {
-        let full: Vec<u8> = (0..255).collect();
+        let full: Vec<u8> = (0..=254).collect();
         assert_eq!(payloads(&receive(&frame(0, &[]))), [(0, vec![])]);
-        assert_eq!(payloads(&receive(&frame(255, &full))), [(255, full)]);
+        assert_eq!(payloads(&receive(&frame(63, &full))), [(63, full)]);
+    }
+
+    #[test]
+    fn receives_frames_in_every_mode() {
+        for mode in Mode::ALL {
+            for len in [0usize, 40, 255] {
+                let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+                let mut samples = vec![0.0; 1234];
+                samples
+                    .extend(encode_frame(&data(9, &payload), mode, &TxConfig::default()).unwrap());
+                samples.extend(frame(10, b"next"));
+                let events = receive(&samples);
+                assert_eq!(
+                    payloads(&events),
+                    [(9, payload), (10, b"next".to_vec())],
+                    "{mode:?}, {len} bytes"
+                );
+                let RxEvent::Frame {
+                    mode: seen, stats, ..
+                } = &events[0]
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*seen, mode);
+                // only the fast modes have carriers to measure
+                assert_eq!(
+                    stats.carriers_snr_db.is_some(),
+                    mode >= Mode::F1,
+                    "{mode:?}"
+                );
+                assert!(
+                    stats.carriers_snr_db.is_none_or(|snr| snr > 25.0),
+                    "{stats:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fast_frame_carries_a_whole_long_text() {
+        let payload: Vec<u8> = (0..1023).map(|i| (i * 13 + 5) as u8).collect();
+        for mode in [Mode::F1, Mode::F3] {
+            let samples = encode_frame(&data(1, &payload), mode, &TxConfig::default()).unwrap();
+            assert_eq!(
+                payloads(&receive(&samples)),
+                [(1, payload.clone())],
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -634,7 +700,7 @@ mod tests {
         let ack = Frame {
             kind: Kind::Ack { advice: Mode::R3 },
             station: 0xABCD,
-            seq: 77,
+            seq: 37,
             payload: vec![],
         };
         let mut samples = vec![0.0; 900];
@@ -697,7 +763,7 @@ mod tests {
         crate::sync::preamble_shifted(0.5, 40.0, &mut samples);
         let shifted = MfskParams {
             first_tone_hz: 790.0,
-            ..Mode::R1.mfsk()
+            ..HEADER_MFSK
         };
         let header = Header {
             kind: Kind::Data,
@@ -732,6 +798,8 @@ mod tests {
     fn lengths() {
         assert_eq!(header_len(), 31 * 512);
         assert_eq!(payload_len(Mode::R1, 0), 19 * 512);
+        // two training symbols, then 32 + 324 coded bits in symbols of 112
+        assert_eq!(payload_len(Mode::F1, 0), (2 + 4) * 640);
         assert_eq!(seconds(16_000), 1.0);
     }
 }

@@ -156,6 +156,95 @@ fn overdriven_and_very_quiet() {
     stats_of(&receive(&quiet), &payload);
 }
 
+/// A data frame in a mode, and the level of its header: what "SNR" is counted from.
+fn frame_in(mode: Mode, payload: &[u8]) -> (Vec<f32>, f32) {
+    let frame = Frame {
+        kind: Kind::Data,
+        station: 1,
+        seq: 1,
+        payload: payload.to_vec(),
+    };
+    let samples = encode_frame(&frame, mode, &TxConfig::default()).unwrap();
+    let level = rms(&samples[4096..4096 + 8000]);
+    (samples, level)
+}
+
+#[test]
+fn fast_modes_in_white_noise() {
+    let payload = payload(200);
+    // 3 dB above where each stops (`examples/modes.rs`)
+    for (mode, snr) in [(Mode::F1, 6.0), (Mode::F2, 12.0), (Mode::F3, 15.0)] {
+        let (frame, level) = frame_in(mode, &payload);
+        for seed in 0..12 {
+            let heard = padded()
+                .then(Awgn::with_snr(level, snr, seed))
+                .process(&frame);
+            let stats = stats_of(&receive(&heard), &payload);
+            // the carriers have the level of the header tone over the same noise
+            let carriers = stats.carriers_snr_db.unwrap();
+            assert!((carriers - snr).abs() < 2.5, "{mode:?}: {carriers} dB");
+        }
+    }
+}
+
+#[test]
+fn fast_modes_near_the_speaker_in_a_room() {
+    let payload = payload(200);
+    // The direct sound over all reflections: 9 dB is within a metre of a small speaker.
+    for (mode, direct) in [(Mode::F1, 9.0), (Mode::F2, 18.0), (Mode::F3, 21.0)] {
+        let (frame, level) = frame_in(mode, &payload);
+        for seed in 0..12 {
+            let heard = padded()
+                .then(Reverb::new(0.5, direct, 100 + seed))
+                .then(Awgn::with_snr(level, 30.0, seed))
+                .process(&frame);
+            stats_of(&receive(&heard), &payload);
+        }
+    }
+}
+
+#[test]
+fn fast_modes_with_a_frequency_offset_and_drifting_clocks() {
+    // The longest frame of each: 6 s, 3 s and 2 s.
+    let payload = payload(1023);
+    for mode in [Mode::F1, Mode::F2, Mode::F3] {
+        let (frame, level) = frame_in(mode, &payload);
+        for (seed, shift) in [-200.0f32, -31.0, 77.7].into_iter().enumerate() {
+            let heard = padded()
+                .then(FreqShift(shift))
+                .then(Awgn::with_snr(level, 20.0, seed as u64))
+                .process(&frame);
+            stats_of(&receive(&heard), &payload);
+        }
+        // at 200 ppm the end of a 6 s frame is 20 samples off
+        for ppm in [-200.0, 200.0] {
+            let heard = padded()
+                .then(ClockOffset { ppm })
+                .then(Awgn::with_snr(level, 20.0, 5))
+                .process(&frame);
+            stats_of(&receive(&heard), &payload);
+        }
+    }
+}
+
+#[test]
+fn fast_modes_over_a_telephone_line_and_through_a_clipping_input() {
+    let payload = payload(300);
+    for mode in [Mode::F1, Mode::F2, Mode::F3] {
+        let (frame, level) = frame_in(mode, &payload);
+        // echoes of 2 and 5 ms: inside the cyclic prefix
+        let line = padded()
+            .then(Echo(vec![(32, 0.5), (80, -0.3)]))
+            .then(BandPass::telephone())
+            .then(Awgn::with_snr(level, 20.0, 3))
+            .process(&frame);
+        stats_of(&receive(&line), &payload);
+        // a level meant for the tones cuts the peaks of the carriers: 6 dB above their RMS
+        let loud = padded().then(Clip(0.35)).process(&frame);
+        stats_of(&receive(&loud), &payload);
+    }
+}
+
 /// Two modems with sound cards at the same rate, each hearing the other
 /// through `noise` after a delay of one block, and itself at half the level.
 fn talk(

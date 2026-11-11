@@ -33,8 +33,11 @@ export interface StationOptions {
   mode: number | null;
 }
 
-/** The modes a station can be fixed to, slowest first, with their speed in bit/s. */
-export const MODE_BIT_RATES = [62.5, 125, 250, 500] as const;
+/**
+ * The modes a station can be fixed to, slowest first, with their speed in
+ * bit/s: four of tones, then three of carriers (`Mode` in the core).
+ */
+export const MODE_BIT_RATES = [62.5, 125, 250, 500, 1400, 2800, 4200] as const;
 
 export type WorkerIn =
   | { type: 'version'; jobId: number }
