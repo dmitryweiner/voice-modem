@@ -58,12 +58,12 @@ describe('settings storage', () => {
     expect(loadSettings(storage)).toEqual({ locale: 'ru', name: '', manualPtt: false, mode: null });
     save({ locale: 'ru', name: 'x'.repeat(33) });
     expect(loadSettings(storage).name).toBe('');
-    for (const mode of [4, -1, 1.5, '2']) {
+    for (const mode of [7, -1, 1.5, '2']) {
       save({ mode });
       expect(loadSettings(storage).mode).toBeNull();
     }
-    save({ mode: 3 });
-    expect(loadSettings(storage).mode).toBe(3);
+    save({ mode: 6 });
+    expect(loadSettings(storage).mode).toBe(6);
   });
 
   it('reads what an earlier version saved: the new fields get their defaults', () => {

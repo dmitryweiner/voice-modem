@@ -151,7 +151,7 @@ impl Modem {
     /// the address of this station and `seed` feeds its random waits: both
     /// random numbers. With `manual_ptt` every transmission waits for `pttPressed`.
     /// `mode` is the number of a mode to use for every data frame (0 = R1 … 3 =
-    /// R4), or 255 to adapt to the channel.
+    /// R4, 4 = F1 … 6 = F3), or 255 to adapt to the channel.
     #[wasm_bindgen(constructor)]
     pub fn new(
         sample_rate: u32,
@@ -308,6 +308,20 @@ mod tests {
             bob.poll_event().unwrap().text,
             "at 500 bit/s from the first frame"
         );
+        assert_eq!(
+            kinds(&mut alice),
+            [("delivered".to_string(), String::new(), 1)]
+        );
+    }
+
+    #[test]
+    fn the_fast_modes_have_numbers_too() {
+        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, 1, 6).unwrap());
+        let mut bob = modem(2);
+        let long = "at 4200 bit/s from the first frame. ".repeat(25);
+        send_text(&mut alice.0, &long).unwrap();
+        run(&mut alice, &mut bob, 6);
+        assert_eq!(bob.poll_event().unwrap().text, long);
         assert_eq!(
             kinds(&mut alice),
             [("delivered".to_string(), String::new(), 1)]

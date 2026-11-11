@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use crate::SAMPLE_RATE;
 use crate::frame::{Kind, Mode};
-use crate::link::{GAP, Link, LinkConfig, LinkEvent, SendError};
+use crate::link::{GAP, Heard, Link, LinkConfig, LinkEvent, SendError};
 use crate::resample::Resampler;
 use crate::rx::{Receiver, RxEvent, RxStats};
 use crate::tx::{TxConfig, encode_frame, frame_len};
@@ -196,7 +196,11 @@ impl Modem {
         while let Some(event) = self.receiver.poll() {
             match event {
                 RxEvent::Frame { frame, stats, .. } => {
-                    self.link.on_frame(&frame, stats.snr_db, self.clock);
+                    let heard = Heard {
+                        snr_db: stats.snr_db,
+                        carriers_snr_db: stats.carriers_snr_db,
+                    };
+                    self.link.on_frame(&frame, heard, self.clock);
                     self.take_link_events(Some(stats));
                 }
                 RxEvent::Damaged { stats, .. } | RxEvent::Unreadable { stats } => {
@@ -437,8 +441,10 @@ mod tests {
     fn over_a_clean_channel_the_speed_climbs_to_the_fastest_mode() {
         let (mut alice, mut bob) = (modem(1), modem(2));
         let long = "The quick brown fox jumps over the lazy dog. ".repeat(20);
-        let id = alice.send_text(&long).unwrap();
-        // 900 bytes: 190 in the first two frames, the rest at 250 and 500 bit/s
+        let first = alice.send_text(&long).unwrap();
+        let second = alice.send_text(&long).unwrap();
+        // 900 bytes: 440 in three frames of tones, the rest in one of
+        // carriers; then all of it again in one frame, in half a second
         run(&mut [&mut alice, &mut bob], 60.0);
         let at_alice = all_events(&mut alice);
         let modes: Vec<Mode> = at_alice
@@ -451,25 +457,27 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(modes, [Mode::R2, Mode::R3, Mode::R4]);
-        assert!(
-            at_alice.contains(&Event::MessageDelivered { id }),
-            "{at_alice:?}"
-        );
-        assert_eq!(texts(&events(&mut bob)), [(1, long.as_str())]);
+        assert_eq!(modes, [Mode::R2, Mode::R3, Mode::F1, Mode::F2, Mode::F3]);
+        for id in [first, second] {
+            assert!(
+                at_alice.contains(&Event::MessageDelivered { id }),
+                "{at_alice:?}"
+            );
+        }
+        assert_eq!(texts(&events(&mut bob)), [(1, long.as_str()); 2]);
     }
 
     #[test]
     fn a_fixed_mode_is_used_from_the_first_frame() {
         let mut alice = Modem::new(Config {
-            mode: Some(Mode::R4),
+            mode: Some(Mode::F3),
             reliable: false,
             ..Config::default()
         })
         .unwrap();
         let mut bob = modem(2);
-        alice.send_text(&"fast and one way ".repeat(12)).unwrap();
-        run(&mut [&mut alice, &mut bob], 6.0);
+        alice.send_text(&"fast and one way ".repeat(50)).unwrap();
+        run(&mut [&mut alice, &mut bob], 4.0);
         assert_eq!(all_events(&mut alice), [Event::MessageSent { id: 1 }]);
         assert_eq!(texts(&events(&mut bob)).len(), 1);
     }

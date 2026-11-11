@@ -525,6 +525,9 @@ describe('station', () => {
       '125 bit/s',
       '250 bit/s',
       '500 bit/s',
+      '1400 bit/s',
+      '2800 bit/s',
+      '4200 bit/s',
     ]);
     expect(text('#speed')).toBe('62.5 bit/s');
     core.emit({ kind: 'txMode', mode: 2, bitRate: 250 });

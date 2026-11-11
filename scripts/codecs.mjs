@@ -5,7 +5,7 @@
 // this ffmpeg build lacks are reported as "not available".
 //
 //   node scripts/codecs.mjs            # the table for the slowest mode, r1
-//   node scripts/codecs.mjs --mode r3  # for another mode (r1 to r4)
+//   node scripts/codecs.mjs --mode r3  # for another mode (r1 to r4, f1 to f3)
 //   node scripts/codecs.mjs --keep     # also keeps the WAV files and prints where
 //
 // The results are recorded in docs/measurements.md.

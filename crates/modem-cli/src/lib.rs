@@ -5,7 +5,7 @@ pub mod wav;
 use std::fmt::Write as _;
 use std::fs;
 
-use modem_core::link::{Link, LinkConfig, LinkEvent};
+use modem_core::link::{Heard, Link, LinkConfig, LinkEvent};
 use modem_core::rx::seconds;
 use modem_core::{Config, Mode, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig, VERSION};
 use modem_sim::{Awgn, BandPass, Chain, Channel, Clip, ClockOffset, FreqShift, rms};
@@ -13,11 +13,12 @@ use modem_sim::{Awgn, BandPass, Chain, Channel, Clip, ClockOffset, FreqShift, rm
 pub const USAGE: &str = "\
 modem-cli — the Voice Modem core from the command line
 
-  modem-cli encode <text>... -o out.wav [--mode r1..r4] [--lead-in MS]
+  modem-cli encode <text>... -o out.wav [--mode r1..r4|f1..f3] [--lead-in MS]
                                        [--amplitude 0..1] [--pause S]
       The texts (up to 1000 bytes of UTF-8 each) as one-way frames, sent once
       and not acknowledged, into a 16 kHz WAV file, with S seconds of silence
-      at the end. The mode: r1 (62.5 bit/s, the default) to r4 (500 bit/s).
+      at the end. The mode: r1 (62.5 bit/s, the default) to r4 (500 bit/s)
+      are tones; f1 to f3 (1400, 2800 and 4200 bit/s) are carriers.
 
   modem-cli decode in.wav
       Prints every message heard in a 16 kHz WAV file with the time, the
@@ -118,7 +119,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 mode = Mode::ALL
                     .into_iter()
                     .find(|mode| format!("{mode:?}").eq_ignore_ascii_case(&name))
-                    .ok_or(format!("--mode: no mode {name:?}, there are r1 to r4"))?;
+                    .ok_or(format!(
+                        "--mode: no mode {name:?}, there are r1 to r4 and f1 to f3"
+                    ))?;
             }
             "--amplitude" => amplitude = value(&arg, &mut args)?,
             "--telephone" => telephone = true,
@@ -223,7 +226,11 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
     while let Some(event) = receiver.poll() {
         match event {
             RxEvent::Frame { frame, stats, .. } => {
-                link.on_frame(&frame, stats.snr_db, stats.start);
+                let heard = Heard {
+                    snr_db: stats.snr_db,
+                    carriers_snr_db: stats.carriers_snr_db,
+                };
+                link.on_frame(&frame, heard, stats.start);
                 while let Some(event) = link.poll_event() {
                     if let LinkEvent::Text { text, .. } = event {
                         messages += 1;
@@ -501,7 +508,7 @@ mod tests {
     fn a_faster_mode_makes_a_shorter_file_with_the_same_text() {
         let text = vec!["The quick brown fox jumps over the lazy dog. ".repeat(5)];
         let mut lengths = Vec::new();
-        for name in ["r1", "R2", "r3", "r4"] {
+        for name in ["r1", "R2", "r3", "r4", "f1", "F2", "f3"] {
             let path = temp(&format!("{name}.wav"));
             let Cli::Encode { mode, .. } =
                 parse(args(&format!("encode x -o {path} --mode {name}"))).unwrap()
@@ -514,11 +521,11 @@ mod tests {
             assert!(report.trim_end().ends_with(text[0].trim_end()), "{name}");
             lengths.push((samples.len() as f32 / 16_000.0).round());
         }
-        // 225 bytes: four frames in R1, two in R2, one in R3 and R4
-        assert_eq!(lengths, [38.0, 18.0, 9.0, 5.0]);
+        // 225 bytes: four frames in R1, two in R2, one in the others
+        assert_eq!(lengths, [38.0, 18.0, 9.0, 5.0, 3.0, 2.0, 2.0]);
         assert_eq!(
             parse(args("encode x -o a.wav --mode r5")),
-            Err("--mode: no mode \"r5\", there are r1 to r4".to_string())
+            Err("--mode: no mode \"r5\", there are r1 to r4 and f1 to f3".to_string())
         );
     }
 

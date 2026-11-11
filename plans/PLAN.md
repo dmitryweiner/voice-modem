@@ -274,25 +274,30 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–3 are done and stage 4 is half done (2026-11-11). What they settled is in
+**Progress**: stages 0–4 are done (2026-11-11). What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
 these places:
 
-- The code of mode R1 is the convolutional one; LDPC comes with the fast
-  modes at stage 4.
-- The link layer is stop-and-wait, one frame per acknowledgement; the
-  selective acknowledgement of a burst waits for modes fast enough to need it
-  (the OFDM modes).
+- The robust modes keep the convolutional code; LDPC (the 648-bit codes of
+  802.11n, rates 1/2 and 3/4) is the code of the fast modes.
+- The link layer is stop-and-wait, one frame per acknowledgement. Instead of
+  a burst of frames with a selective acknowledgement, a frame of a fast
+  mode is large: up to 1023 bytes, a whole text. Bursts wait for files
+  (stage 5), if they are needed at all.
 - **The medium group of modes is not OFDM.** Over the air the limit turned
   out to be the echo of the room, not noise, and what beat it was tones that
-  avoid the frequencies still ringing. Differential OFDM keeps every carrier
-  on all the time and has no such escape. So the ladder above R1 is the same
-  idea made faster — several tones at once, fewer sets in turn: R2, R3, R4 at
-  125, 250 and 500 bit/s. Coherent OFDM (the F group, 1–5 kbit/s) remains
-  for channels without echo — a cable, a wired line, a metre of air — and
-  LDPC with it: the second half of stage 4.
+  avoid the frequencies still ringing: R2, R3, R4 at 125, 250 and 500 bit/s
+  are R1 made faster — several tones at once, fewer sets in turn.
+- **The fast group is three modes, not a ladder to 64-QAM**: F1 (QPSK, code
+  rate 1/2, 1400 bit/s), F2 (16-QAM, 1/2, 2800 bit/s), F3 (16-QAM, 3/4,
+  4200 bit/s), on the 64 frequencies of the tones (750–2720 Hz) rather than
+  99 carriers over 300–3400 Hz: that band is what small speakers and every
+  codec tried so far pass. In simulation F1 turned out more robust than R4,
+  so a station goes R1 → R2 → R3 → F1 → F2 → F3 and R4 is set by hand.
+  Wider bands and 64-QAM belong to the presets (stage 6), once real channels
+  show there is room for them.
 - Adaptation has no separate probing: the first frame goes in R1 and every
   acknowledgement carries the mode the receiver advises, from the SNR it
   measured. Per-frequency measurements wait for the modes that can use them.
@@ -309,14 +314,34 @@ these places:
 
 Open:
 
-- Modes R2–R4 and the choice of mode have not been tried over the air: the
-  thresholds of the advice come from a simulated room.
+- The fast modes have not been tried over the air: whether small speakers
+  and microphones pass 64 carriers at once as the simulated room does. The
+  robust ones and the choice of mode have (2026-11-11): 125–250 bit/s next
+  to each other, 62.5 bit/s at 8 m.
 - The modem has not been tried through a real phone call or on an iPhone.
 - iLBC loses whole frames (the preamble or the header); AMR-WB/EVS and
   everything a real call adds to the codec are untested.
 - The receiver's speed on a phone is not measured; its worst case is a frame
   whose beginning was missed (36× real time natively).
 - The app icon is still the template's.
+
+Where stage 5 starts from:
+
+- A frame carries 1023 bytes at most, and only in a fast mode (64 in R1): a
+  file goes as a message of many segments, so the limit of 1000 bytes per
+  message (`MAX_TEXT_BYTES`) and the two-byte offset of a segment are the
+  first things files outgrow.
+- The link is stop-and-wait: every frame costs 1.25 s of preamble and header
+  and as much again for its acknowledgement. At 4200 bit/s a full frame is
+  2 s of data in about 6 s of exchange — bursts with a selective
+  acknowledgement, postponed twice, pay off here if anywhere.
+- Message types are the low four bits of the first payload byte (0 text,
+  1 hello); unknown ones are acknowledged and ignored, so new types do not
+  break old stations. The capabilities field of the greeting is still 0.
+- Broadcast frames exist (`reliable: false`, sent once in a fixed mode) but
+  the web app has no switch for them.
+- Cancelling exists for texts (`Link::cancel`); a file transfer needs the
+  same on both sides.
 
 Every stage ends with a working, checkable result. One branch and PR per
 feature; `main` deploys.

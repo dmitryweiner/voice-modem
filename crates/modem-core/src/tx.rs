@@ -5,8 +5,10 @@ use std::f32::consts::TAU;
 use crate::SAMPLE_RATE;
 use crate::coding::encode_block;
 use crate::crc::crc32;
-use crate::frame::{Frame, HEADER_MODE, Header, Kind, MAX_PAYLOAD, Mode};
+use crate::frame::{Frame, HEADER_MFSK, Header, Kind, MAX_PAYLOAD, Mode, Scheme};
 use crate::mfsk::Modulator;
+use crate::ofdm;
+use crate::rx::payload_pause;
 use crate::sync::preamble;
 
 /// Frequency of the lead-in tone, Hz.
@@ -38,7 +40,7 @@ pub struct PayloadTooLong;
 /// Length of a frame in samples, without the lead-in tone.
 pub fn frame_len(kind: Kind, mode: Mode, payload_len: usize) -> usize {
     let payload = if kind.has_payload() {
-        crate::rx::payload_len(mode, payload_len)
+        payload_pause(mode) + crate::rx::payload_len(mode, payload_len)
     } else {
         0
     };
@@ -58,8 +60,10 @@ pub fn encode_frame(
         seq,
         ref payload,
     } = *frame;
-    let len = u8::try_from(payload.len()).map_err(|_| PayloadTooLong)?;
-    debug_assert!(payload.len() <= MAX_PAYLOAD);
+    if payload.len() > MAX_PAYLOAD {
+        return Err(PayloadTooLong);
+    }
+    let len = payload.len() as u16;
     debug_assert!(
         kind.has_payload() || payload.is_empty(),
         "an acknowledgement carries no payload"
@@ -82,19 +86,36 @@ pub fn encode_frame(
         seq,
         len,
     };
-    let mut modulator = Modulator::new(HEADER_MODE.mfsk(), amplitude);
-    for value in encode_block(&header.to_bytes(), HEADER_MODE.mfsk().bits_per_symbol()) {
+    let mut modulator = Modulator::new(HEADER_MFSK, amplitude);
+    for value in encode_block(&header.to_bytes(), HEADER_MFSK.bits_per_symbol()) {
         modulator.symbol(value, &mut samples);
     }
-    if kind.has_payload() {
-        let mut block = payload.clone();
-        block.extend(crc32(payload).to_be_bytes());
-        let mut modulator = Modulator::new(mode.mfsk(), amplitude);
-        for value in encode_block(&block, mode.mfsk().bits_per_symbol()) {
-            modulator.symbol(value, &mut samples);
-        }
+    if !kind.has_payload() {
+        fade(&mut samples[data_start..]);
+        return Ok(samples);
     }
-    fade(&mut samples[data_start..]);
+    let mut block = payload.clone();
+    block.extend(crc32(payload).to_be_bytes());
+    // A payload in the mode of the header goes on where the header ends;
+    // before any other the header falls silent for a moment.
+    let mut tones_start = data_start;
+    if payload_pause(mode) > 0 {
+        fade(&mut samples[data_start..]);
+        samples.resize(samples.len() + payload_pause(mode), 0.0);
+        tones_start = samples.len();
+    }
+    match mode.scheme() {
+        Scheme::Tones(mfsk) => {
+            let mut modulator = Modulator::new(mfsk, amplitude);
+            for value in encode_block(&block, mfsk.bits_per_symbol()) {
+                modulator.symbol(value, &mut samples);
+            }
+            fade(&mut samples[tones_start..]);
+        }
+        // The carriers start and stop at every symbol anyway, and a fade
+        // would take a piece out of the last one.
+        Scheme::Carriers(params) => ofdm::modulate(&params, &block, amplitude, &mut samples),
+    }
     Ok(samples)
 }
 
@@ -131,6 +152,47 @@ mod tests {
         // preamble + 31 header symbols + ((5 + 4) · 8 + 6) · 2 / 4 = 39 payload symbols
         assert_eq!(frame.len(), 4096 + (31 + 39) * 512);
         assert_eq!(frame.len(), frame_len(Kind::Data, Mode::R1, 5));
+    }
+
+    #[test]
+    fn a_fast_frame_is_carriers_after_the_header() {
+        let frame = encode_frame(&data(b"hello"), Mode::F1, &TxConfig::default()).unwrap();
+        // a pause, then 9 bytes: 72 + 324 coded bits in 4 symbols of 112 bits, after 2 of training
+        assert_eq!(frame.len(), 4096 + 31 * 512 + 1024 + 6 * 640);
+        assert_eq!(frame.len(), frame_len(Kind::Data, Mode::F1, 5));
+        // the longest frame is six seconds at the slowest of the fast modes
+        let longest = frame_len(Kind::Data, Mode::F1, MAX_PAYLOAD);
+        assert_eq!(longest, 4096 + 31 * 512 + 1024 + 151 * 640);
+        // the header keeps its level, the carriers are quieter on average
+        let rms =
+            |part: &[f32]| (part.iter().map(|x| x * x).sum::<f32>() / part.len() as f32).sqrt();
+        let (header, rest) = frame[4096..].split_at(31 * 512);
+        let (pause, carriers) = rest.split_at(1024);
+        assert!((rms(header) - 0.354).abs() < 0.01 && (rms(carriers) - 0.18).abs() < 0.02);
+        assert_eq!(pause, [0.0; 1024]);
+        assert!(header[header.len() - 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn only_a_payload_in_the_mode_of_the_header_follows_it_without_a_pause() {
+        let silent = |mode| {
+            let frame = encode_frame(&data(b"hello"), mode, &TxConfig::default()).unwrap();
+            let after_header = 4096 + 31 * 512;
+            frame[after_header..after_header + 1024]
+                .iter()
+                .all(|&x| x == 0.0)
+        };
+        assert_eq!(
+            Mode::ALL.map(silent),
+            [false, true, true, true, true, true, true]
+        );
+        // tones fade in after the pause
+        let frame = encode_frame(&data(b"hello"), Mode::R4, &TxConfig::default()).unwrap();
+        assert!(frame[4096 + 31 * 512 + 1024].abs() < 1e-3);
+        assert_eq!(
+            frame.len(),
+            4096 + 31 * 512 + 1024 + crate::rx::payload_len(Mode::R4, 5)
+        );
     }
 
     #[test]

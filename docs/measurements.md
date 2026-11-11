@@ -67,40 +67,98 @@ signal: it plays no part here. 40-byte frames, 25 rooms per point.
   own tones instead of a wrong tone.
 - Beyond −9 dB the preamble is the next thing to fail.
 
-## The four modes compared (2026-11-11)
+## The modes compared (2026-11-11)
 
 `cargo run --release -p modem-sim --example modes` — 40-byte frames, 20 per
-point. The level a mode needs, for 19 or 20 frames of 20:
+point, each with another frame number. The level a mode needs, for 19 or 20
+frames of 20:
 
 | Mode | Speed      | White noise, SNR | Room, RT60 0.3 s, direct | Room, RT60 0.5 s, direct |
 | ---- | ---------- | ---------------- | ------------------------ | ------------------------ |
 | R1   | 62.5 bit/s | −15 dB           | −9 dB or less            | −9 dB or less            |
-| R2   | 125 bit/s  | −6 dB            | −9 dB                    | −3 dB                    |
-| R3   | 250 bit/s  | 0 dB             | 3 dB                     | 3 dB                     |
-| R4   | 500 bit/s  | 9 dB             | 9 dB                     | 9 dB                     |
+| R2   | 125 bit/s  | −6 dB            | −9 dB or less            | −6 dB                    |
+| R3   | 250 bit/s  | 3 dB             | −3 dB                    | −3 dB                    |
+| R4   | 500 bit/s  | 9 dB             | 3 dB                     | 3 dB                     |
+| F1   | 1400 bit/s | 3 dB             | 0 dB                     | 3 dB                     |
+| F2   | 2800 bit/s | 9 dB             | 6 dB                     | 6 dB                     |
+| F3   | 4200 bit/s | 12 dB            | 12 dB                    | 12 dB                    |
 
-SNR is that of the header, a single tone at full level; the faster modes
-split the same peak level between their tones. Each doubling of the speed
-costs 6–9 dB of noise and 6 dB of room, that is half the distance.
+SNR is that of the header, a single tone at full level. The tones of the
+faster robust modes split the same peak level between them, which is why
+each doubling of their speed costs 6–9 dB. The carriers of the fast modes
+are added up as they come and the rare peak is cut off, so each of the 64
+keeps the power a single tone would have over the same noise — and
+**F1 is no worse than R4 anywhere**: nearly three times the speed, 6 dB more
+noise, the same room or a little more. The station therefore goes from R3
+straight to F1 and leaves R4 for channels that carry tones but not phases.
+
+What the receiver reports on such channels (the numbers the choice of mode
+goes by): in white noise the SNR itself, on the header and on the carriers
+alike; in the room the header reads 1–3 dB below the "direct" figure, and
+the carriers from 1 dB below it (at 20 dB) to 3 dB above it (at 0 dB).
+
+**The pause after the header.** In a room the last tones of the header, at
+full level, ring into the first symbols of the payload, whose tones or
+carriers are each 12–24 dB weaker. With the payload right after the header
+R4 needed a direct sound of 9 dB, F1 3–6 dB, F2 12–15 dB and F3 15–18 dB,
+and how a frame fared depended on its number — on which tones its header
+ended with. 64 ms of silence in between (before every payload but one in
+R1) gave the table above: 3–6 dB for every mode from R3 up.
+`cargo run --release -p modem-sim --example pause` shows what still more
+silence would give: another 64 ms, about 1 dB for F2 and F3.
+
+Other things about the fast modes, same example and `tests/link.rs`:
+
+- **Clock offset**, the longest frame (1023 bytes: 7.4 s in F1, 3.4 s in
+  F3): F1 and F2 are received at every offset tried up to ±1000 ppm, F3 up
+  to ±500 ppm.
+- **Frequency offset**: received at ±200 Hz.
+- A telephone band with echoes of 2 and 5 ms, and an input that cuts
+  everything above 70 % of the level of the tones: received in all three.
+- The receiver takes 14 ms for the carriers of the longest frame (native).
 
 Through the codecs (`node scripts/codecs.mjs --mode r2` and so on; messages
 of five that arrive):
 
-| Codec                                                     | R1  | R2  | R3  | R4  |
-| --------------------------------------------------------- | --- | --- | --- | --- |
-| G.711 µ-law, G.726 32 and 16 kbit/s, G.723.1, AMR-NB 12.2 | 5   | 5   | 5   | 5   |
-| AMR-NB, 4.75 kbit/s                                       | 5   | 5   | 2   | 0   |
-| Opus voice, 24 kbit/s                                     | 5   | 5   | 5   | 5   |
-| Opus voice, 16 kbit/s                                     | 5   | 5   | 5   | 4   |
-| Opus voice, 12, 8 and 6 kbit/s                            | 5   | 5   | 0–1 | 0   |
-| iLBC, 15.2 kbit/s                                         | 4   | 3   | 3   | 3   |
+| Codec                        | R1  | R2  | R3  | R4  | F1  | F2  | F3  |
+| ---------------------------- | --- | --- | --- | --- | --- | --- | --- |
+| G.711 µ-law, G.726 32 and 16 | 5   | 5   | 5   | 5   | 5   | 5   | 5   |
+| G.723.1, 6.3 kbit/s          | 5   | 5   | 5   | 5   | 0   | 0   | 0   |
+| AMR-NB, 12.2 kbit/s          | 5   | 5   | 5   | 5   | 5   | 4   | 1   |
+| AMR-NB, 4.75 kbit/s          | 5   | 5   | 2   | 0   | 0   | 0   | 0   |
+| Opus voice, 24 kbit/s        | 5   | 5   | 5   | 5   | 5   | 5   | 1   |
+| Opus voice, 16 kbit/s        | 5   | 5   | 5   | 4   | 3   | 1   | 0   |
+| Opus voice, 12 kbit/s        | 5   | 5   | 0   | 0   | 0   | 0   | 0   |
+| Opus voice, 8 and 6 kbit/s   | 5   | 4   | 0   | 0   | 0   | 0   | 0   |
+| iLBC, 15.2 kbit/s            | 4   | 4   | 4   | 4   | 0   | 0   | 0   |
 
-The SNR the receiver measures on the header predicts this well enough for
-the choice of mode: where it reads below 5 dB (AMR 4.75, Opus 12 and less) R3
-fails and is not advised; where it reads 10 dB and more, R3 gets through.
+The SNR the receiver measures on the header predicts most of this: where it
+reads below 5 dB (AMR 4.75, Opus 12 and less) neither R3 nor F1 is advised.
+It does not predict all: G.723.1 reads 6–8 dB and Opus at 16 kbit/s 11–13 dB,
+and both lose the carriers. There a station tries F1, gets no answer, goes
+on in R3 and tries again a minute later. Vocoders model a voice, and 64
+steady carriers are not one; the waveform codecs (G.711, G.726) carry them
+down to 16 kbit/s, and so does AMR at its highest rate.
 
-Not measured: the modes over the air, and the choice of mode on a real
-channel.
+## The choice of mode over the air (2026-11-11)
+
+The build with the modes R1–R4 and the advice in acknowledgements, MacBook
+and Android phone in a room, by the author:
+
+| Distance   | SNR shown under received texts | Speed the station settled on |
+| ---------- | ------------------------------ | ---------------------------- |
+| next to it | +8 … +9 dB                     | 125–250 bit/s (R2, R3)       |
+| about 8 m  | −3 … −1 dB                     | 62.5 bit/s (R1)              |
+
+- The choice works on a real channel as in the simulated one: texts are
+  delivered at both distances, and the speed follows the SNR (R3 from 5 dB;
+  R4 would need 12 dB and was never advised).
+- Next to each other the two devices read 8–9 dB, where a cable reads 26 dB
+  and more. In the model of the room that is a direct sound 9–10 dB above
+  the reflections — where F1 has 6–9 dB to spare and F2 about 3 dB. Whether small speakers and microphones pass 64 carriers at once
+  as well as the model does is what the next test over the air will show.
+
+Not measured: the fast modes over the air.
 
 ## Mode R1 through speech codecs (2026-11-10)
 
