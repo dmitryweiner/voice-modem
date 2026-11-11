@@ -336,6 +336,65 @@ describe('messages', () => {
     expect($('#feed .sent', HTMLElement).dataset.status).toBe('failed');
   });
 
+  it('sends a failed text again at a press, in place of the old one', async () => {
+    const { core } = await listening();
+    await send('lost');
+    await send('fine');
+    expect(exists('.resend')).toBe(false);
+    core.emit({ kind: 'failed', id: 1 });
+    core.emit({ kind: 'delivered', id: 2 });
+    const again = $('#feed .resend', HTMLButtonElement);
+    expect(again.getAttribute('aria-label')).toBe('Send again');
+
+    await press(() => again.click());
+    expect(core.calls.sent).toEqual(['lost', 'fine', 'lost']);
+    const feed = [...document.querySelectorAll('#feed .sent')].map((item) => [
+      item.querySelector('.text')?.textContent,
+      item.querySelector('small')?.textContent,
+    ]);
+    expect(feed).toEqual([
+      ['fine', 'Delivered'],
+      ['lost', 'Sending…'],
+    ]);
+    expect(exists('.resend')).toBe(false);
+    core.emit({ kind: 'delivered', id: 3 });
+    expect(text('#feed .sent:last-child small')).toBe('Delivered');
+  });
+
+  it('keeps a failed text when sending it again is refused', async () => {
+    let refuse = false;
+    const core = fakeCore({ sendText: () => (refuse ? Promise.reject(new Error('no')) : Promise.resolve({ id: 1 })) });
+    await listening({ core });
+    await send('lost');
+    core.emit({ kind: 'failed', id: 1 });
+    refuse = true;
+    await press(() => $('#feed .resend', HTMLButtonElement).click());
+    expect(text('#send-failed')).toBe('The text was not sent.');
+    expect(text('#feed .sent small')).toBe('Not delivered: no answer');
+  });
+
+  it('clears the messages at a press', async () => {
+    const { core } = await listening();
+    expect(exists('#clear')).toBe(false);
+    core.emit(received('one'));
+    await send('two');
+    await press(() => $('#clear', HTMLButtonElement).click());
+    expect(exists('#feed')).toBe(false);
+    expect(text('.feed-box .empty')).toBe('Nothing yet. Texts sent and received appear here.');
+    // what was on its way still reports, to nobody
+    core.emit({ kind: 'delivered', id: 1 });
+    core.emit(received('three'));
+    expect(text('#feed .received .text')).toBe('three');
+  });
+
+  it('scrolls to the newest message', async () => {
+    const { core } = await listening();
+    const box = $('.feed-box', HTMLDivElement);
+    Object.defineProperty(box, 'scrollHeight', { value: 900, configurable: true });
+    core.emit(received('new'));
+    expect(box.scrollTop).toBe(900);
+  });
+
   it('queues more texts while one is on its way, each with its own fate', async () => {
     const { core } = await listening();
     await send('one');
@@ -390,6 +449,7 @@ describe('station', () => {
   it('remembers the name and the kind of radio, and gives them to the modem', async () => {
     const { storage, core } = await start();
     typeName('UB1XYZ');
+    expect($('#ptt-mode', HTMLInputElement).closest('label')?.textContent).toBe('Push-to-talk');
     fireEvent.click($('#ptt-mode', HTMLInputElement));
     expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true });
     await press(() => $('#mic', HTMLButtonElement).click());

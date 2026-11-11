@@ -76,7 +76,7 @@ function InputMeter({ t, session }: { t: Messages; session: AudioSession }) {
   );
 }
 
-function FeedItem({ t, item }: { t: Messages; item: Item }) {
+function FeedItem({ t, item, onResend }: { t: Messages; item: Item; onResend: (item: Item & { kind: 'sent' }) => void }) {
   if (item.kind === 'lost') return <li className="note">{t.frameLost}</li>;
   if (item.kind === 'peer') return <li className="note peer">{item.name === '' ? t.peerAnonymous : t.peerNamed(item.name)}</li>;
   let note: string;
@@ -90,6 +90,11 @@ function FeedItem({ t, item }: { t: Messages; item: Item }) {
     <li className={item.kind} data-status={item.kind === 'sent' ? item.status : undefined}>
       <span className="text">{item.text}</span>
       <small>{note}</small>
+      {item.kind === 'sent' && item.status === 'failed' && (
+        <button type="button" className="resend" aria-label={t.resend} title={t.resend} onClick={() => onResend(item)}>
+          ↻
+        </button>
+      )}
     </li>
   );
 }
@@ -106,6 +111,13 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
   const nextKey = useRef(1);
   /** The running audio device, for the clean-up when the panel goes away. */
   const running = useRef<AudioSession | null>(null);
+  const feedBox = useRef<HTMLDivElement>(null);
+
+  // The newest message is the one to see.
+  useEffect(() => {
+    const box = feedBox.current;
+    if (box && items.length > 0) box.scrollTop = box.scrollHeight;
+  }, [items.length]);
 
   useEffect(() => {
     const add = (item: Item) => setItems((list) => [...list, item]);
@@ -201,18 +213,25 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
   const text = draft.trim();
   const over = link.status === 'on' ? encoder.encode(text).length - link.maxTextBytes : 0;
 
+  /** Queues a text in the modem and shows it; false when the modem refused. */
+  const transmit = async (message: string, replaces?: number) => {
+    setSendFailed(false);
+    try {
+      const { id } = await core.sendText(message);
+      const item: Item = { key: nextKey.current++, kind: 'sent', id, text: message, status: 'sending', attempt: 1 };
+      setItems((list) => [...list.filter((other) => other.key !== replaces), item]);
+      return true;
+    } catch {
+      setSendFailed(true);
+      return false;
+    }
+  };
+
   const send = async (event: FormEvent) => {
     event.preventDefault();
     if (link.status !== 'on' || text === '' || over > 0) return;
-    setSendFailed(false);
     setDraft('');
-    try {
-      const { id } = await core.sendText(text);
-      setItems((list) => [...list, { key: nextKey.current++, kind: 'sent', id, text, status: 'sending', attempt: 1 }]);
-    } catch {
-      setDraft(text);
-      setSendFailed(true);
-    }
+    if (!(await transmit(text))) setDraft(text);
   };
 
   const on = link.status === 'on';
@@ -234,7 +253,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           value={station.name}
           onChange={(event) => onStationChange({ ...station, name: event.target.value })}
         />
-        <label>
+        <label title={t.pttHint}>
           <input
             id="ptt-mode"
             type="checkbox"
@@ -279,16 +298,25 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
       )}
       {on && <InputMeter t={t} session={link.session} />}
 
-      <h2>{t.messages}</h2>
-      {items.length === 0 ? (
-        <p className="empty">{t.noMessages}</p>
-      ) : (
-        <ol id="feed" className="feed" aria-live="polite">
-          {items.map((item) => (
-            <FeedItem key={item.key} t={t} item={item} />
-          ))}
-        </ol>
-      )}
+      <div className="feed-head">
+        <h2>{t.messages}</h2>
+        {items.length > 0 && (
+          <button id="clear" type="button" className="secondary" onClick={() => setItems([])}>
+            {t.clear}
+          </button>
+        )}
+      </div>
+      <div className="feed-box" ref={feedBox}>
+        {items.length === 0 ? (
+          <p className="empty">{t.noMessages}</p>
+        ) : (
+          <ol id="feed" className="feed" aria-live="polite">
+            {items.map((item) => (
+              <FeedItem key={item.key} t={t} item={item} onResend={(failed) => void (on && transmit(failed.text, failed.key))} />
+            ))}
+          </ol>
+        )}
+      </div>
 
       {on && (
         <form className="composer" onSubmit={(event) => void send(event)}>

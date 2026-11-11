@@ -12,7 +12,8 @@ export const en = {
   coreFailed: 'The modem core did not load.',
 
   nameLabel: 'Your name or callsign',
-  pttLabel: 'A radio with a push-to-talk button that I press myself',
+  pttLabel: 'Push-to-talk',
+  pttHint: 'A radio with a push-to-talk button that I press myself',
   micOn: 'Turn the microphone on',
   micOff: 'Turn off',
   micStarting: 'Starting…',
@@ -33,6 +34,8 @@ export const en = {
   messageLabel: 'Text to send',
   send: 'Send',
   hello: 'Say hello',
+  clear: 'Clear',
+  resend: 'Send again',
   received: 'Received',
   sending: 'Sending…',
   sent: 'Sent',

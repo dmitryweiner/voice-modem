@@ -296,8 +296,7 @@ these places:
 - The web app shows the input level and spectrum but no output meter, and the
   spectrum is the browser's analyser, not the core's.
 
-Open: over the air the range is about 4 m and the cause is not known (not
-noise, by the numbers); iLBC loses whole frames; AMR-WB/EVS and everything a
+Open: iLBC loses whole frames; AMR-WB/EVS and everything a
 real call adds to the codec are untested; the receiver's speed on a phone is
 not measured.
 

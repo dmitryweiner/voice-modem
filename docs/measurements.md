@@ -57,8 +57,8 @@ signal: it plays no part here. 40-byte frames, 25 rooms per point.
   seen in the real room at 3 m just before it stopped (below). The "noise" it
   measured was its own echo.
 - Four sets of tones used in turn move the limit by 9 dB, which in a room is
-  nearly three times the distance. Whether a real room agrees is to be
-  measured.
+  nearly three times the distance. The real room agreed: 3 m became 8 m
+  (below).
 - Other things unchanged by the four sets: white noise (50/50 at −15 dB),
   frequency offsets, the codecs below. One thing improved by accident: the
   34 s frame now survives a clock offset of ±1000 ppm (it was ±500), because
@@ -157,8 +157,11 @@ Android phone: texts are delivered and acknowledged both ways, greetings and
 statuses work. Received texts show SNR −2, −4, −6 dB as the distance grows;
 **at about 3 m** frames are "heard but could not be read" and nothing gets
 through. The simulated room above gives the same picture, which is what
-pointed at reverberation; the four sets of tones are the answer to it and
-have not been tried in the room yet.
+pointed at reverberation; the four sets of tones are the answer to it.
+
+The build with four sets of tones (2026-11-11), same room and devices:
+**delivery is reliable at about 8 m** — where the model said three times the
+3 m would be. The far limit was not looked for.
 
 On a Mac the display must be awake for a browser to process sound at all:
 with the display asleep an AudioContext reports "running" while its clock

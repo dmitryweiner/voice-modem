@@ -18,7 +18,7 @@ to press it.
 
 One robust mode only so far: 62.5 bit/s over 16 tones, received down to 15 dB
 below white noise and through speech codecs down to 4.75 kbit/s; over the air
-between a laptop and a phone it has worked up to about 4 m
+between a laptop and a phone it is reliable at 8 m
 ([measurements](docs/measurements.md), [protocol](docs/protocol.md),
 [sound in the browser](docs/web-audio.md)). The rest is being built stage by
 stage — see [plans/PLAN.md](plans/PLAN.md).
