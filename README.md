@@ -8,13 +8,15 @@ as sound in the voice band; speed and modulation adapt to the channel.
 No server: a static, offline-capable web app (PWA). The signal-processing core
 is written in Rust and runs in the browser as WebAssembly inside a Web Worker.
 
-**Status: stage 4 of 7 done.** Two devices exchange texts through the air: open
+**Status: stage 4 of 7 done, stage 5 under way.** Two devices exchange texts and files through the air: open
 [the app](https://dmitryweiner.github.io/voice-modem/) on both, next to each
 other, turn on the microphone and write. Every text is acknowledged by the
 other side and repeated until it is, up to five times; the sender sees
 "delivered" or "not delivered". Stations take turns, can greet each other by
 name, and a radio with a push-to-talk button is supported: the app asks when
-to press it.
+to press it. A file is offered first and sent once the other side accepts it,
+with the progress and the time left on both screens; a transfer that broke
+off goes on from where it stopped when the file is sent again.
 
 Seven modes from 62.5 to 4200 bit/s, chosen by the modem itself from how well
 the other side hears it: tones for noise, distance and phone codecs, and

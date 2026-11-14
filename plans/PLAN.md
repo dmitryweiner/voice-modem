@@ -274,7 +274,7 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–4 are done (2026-11-11). What they settled is in
+**Progress**: stages 0–4 are done (2026-11-11); stage 5 is under way. What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
@@ -325,7 +325,27 @@ Open:
   whose beginning was missed (36× real time natively).
 - The app icon is still the template's.
 
-Where stage 5 starts from:
+Stage 5 so far (2026-11-13): files over the two-way link — offer, consent,
+chunks, progress and the time left, cancelling on both sides, going on
+after a break, texts ahead of chunks ([protocol](../docs/protocol.md#files-filesrs)).
+It differs from section 7 in these places:
+
+- The "hash" of the offer is the CRC-32 of the content: it guards against
+  mistakes of the transfer, not against a forger, and so will the
+  authenticated encryption when it comes.
+- A file is a row of messages of one frame each, not one long message: the
+  limit of 1000 bytes and the two-byte offset stayed as they were.
+- The warning about a long transfer is a note on the offered file (more
+  than 10 minutes at the speed of the moment), not a question before it.
+- A transfer goes on after a break when the human sends the file again;
+  the modem does not retry by itself.
+
+Still to come in stage 5, each a PR: several frames per acknowledgement
+(a full frame of F3 is 2 s of data in 5.8 s of exchange: a third of the
+speed of the mode, see [measurements](../docs/measurements.md)); compression;
+broadcast with fountain codes; encryption.
+
+Where stage 5 started from:
 
 - A frame carries 1023 bytes at most, and only in a fast mode (64 in R1): a
   file goes as a message of many segments, so the limit of 1000 bytes per

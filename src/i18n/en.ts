@@ -32,7 +32,7 @@ export const en = {
   clipping: 'Too loud: turn the volume down or move the devices apart.',
   spectrum: 'Spectrum of the input, 0 to 4 kHz',
   messages: 'Messages',
-  noMessages: 'Nothing yet. Texts sent and received appear here.',
+  noMessages: 'Nothing yet. Texts and files sent and received appear here.',
   messageLabel: 'Text to send',
   send: 'Send',
   hello: 'Say hello',
@@ -48,6 +48,17 @@ export const en = {
   peerAnonymous: 'A station is on the channel.',
   frameLost: 'A message was heard but could not be read.',
   sendFailed: 'The text was not sent.',
+  attach: 'Send a file',
+  accept: 'Accept',
+  decline: 'Decline',
+  save: 'Save',
+  fileOffered: 'Wants to send you this file',
+  fileWaiting: 'Waiting for the other side to accept…',
+  fileReceiving: 'Receiving…',
+  fileRefused: 'Refused by the other side',
+  fileGivenUp: 'Cancelled by the sender',
+  fileNotReceived: 'Not received',
+  fileNotSent: 'The file was not sent.',
 
   coreReady: (version: string) => `Modem core ${version} is ready.`,
   tooLong: (bytes: number) => `Too long by ${bytes} ${plural('en', bytes, { one: 'byte', other: 'bytes' })}.`,
@@ -55,6 +66,12 @@ export const en = {
   bitRate: (rate: number) => `${rate} bit/s`,
   attempt: (attempt: number) => `attempt ${attempt}`,
   peerNamed: (name: string) => `${name} is on the channel.`,
+  fileSize: (bytes: number) => {
+    if (bytes < 1024) return `${bytes} ${plural('en', bytes, { one: 'byte', other: 'bytes' })}`;
+    return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  },
+  timeLeft: (seconds: number) => (seconds < 90 ? `about ${seconds} s left` : `about ${Math.round(seconds / 60)} min left`),
+  fileSlow: (seconds: number) => `about ${Math.round(seconds / 60)} min at the current speed`,
 };
 
 export type Messages = typeof en;

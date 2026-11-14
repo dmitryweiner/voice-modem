@@ -306,7 +306,8 @@ input {
   font-size: 0.875rem;
   text-align: center;
 }
-.feed > [data-status='failed'] {
+.feed > [data-status='failed'],
+.feed > [data-status='refused'] {
   background: var(--danger);
 }
 .feed > [data-status='cancelled'] {
@@ -316,11 +317,30 @@ input {
   display: block;
   opacity: 0.75;
 }
-.feed > li:has(button) {
+.feed > li:has(button),
+.feed > li:has(.save) {
   display: grid;
   grid-template-columns: 1fr auto;
   column-gap: 8px;
   align-items: center;
+}
+/* an offered file: accept and decline side by side */
+.feed > li:has(.accept) {
+  grid-template-columns: 1fr auto auto;
+}
+.feed > li:has(.accept) > .cancel {
+  grid-column: 3;
+}
+.feed progress {
+  grid-column: 1 / -1;
+  inline-size: 100%;
+  margin-block-start: 4px;
+  accent-color: currentColor;
+}
+.feed .save {
+  grid-area: 1 / 2 / 3;
+  color: inherit;
+  font-weight: 600;
 }
 .feed button {
   grid-area: 1 / 2 / 3;
@@ -341,6 +361,27 @@ input {
 }
 .composer > input {
   flex: 1;
+  min-inline-size: 0;
+}
+/* the file input itself is hidden: its label is the button */
+.attach {
+  display: grid;
+  place-items: center;
+  inline-size: 44px;
+  min-block-size: 44px;
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 1.25rem;
+  cursor: pointer;
+}
+.attach > input {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  opacity: 0;
+}
+.attach:focus-within {
+  outline: 2px solid var(--accent);
 }
 .composer > p {
   flex-basis: 100%;

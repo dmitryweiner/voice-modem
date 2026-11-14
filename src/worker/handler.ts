@@ -4,6 +4,14 @@ import { AUDIO_IDLE, type CoreEvent, type StationOptions, type WorkerIn, type Wo
 export interface CoreModem {
   /** Queues a text and returns its id; throws when the text is empty or too long. */
   sendText(text: string): number;
+  /** Offers a file and returns its id; throws when the modem cannot send files. */
+  sendFile(name: string, bytes: Uint8Array): number;
+  /** Consents to an offered file; false when there is no such offer. */
+  acceptFile(id: number): boolean;
+  /** Gives up a file, sent or received, or declines an offer; false when there is no such file any more. */
+  cancelFile(id: number): boolean;
+  /** Seconds a file of this size takes at the speed of the moment. */
+  fileSeconds(size: number): number;
   hello(): void;
   pttPressed(): void;
   /** Takes back a text that is not delivered yet; false when it is no longer waiting. */
@@ -25,6 +33,11 @@ export interface CoreModemEvent {
   station: number;
   snrDb: number;
   freqOffsetHz: number;
+  bytes: Uint8Array;
+  size: number;
+  done: number;
+  /** 0 when unknown. */
+  secondsLeft: number;
   free?: () => void;
 }
 
@@ -46,6 +59,9 @@ export interface Core {
 
 function toEvent(event: CoreModemEvent): CoreEvent | null {
   const { kind, text, id, attempt, mode, bitRate, station, snrDb, freqOffsetHz } = event;
+  // Each read of `bytes` copies the file out of the WASM memory: only when it is one.
+  const bytes = kind === 'fileReceived' ? event.bytes : null;
+  const { size, done, secondsLeft } = event;
   event.free?.();
   switch (kind) {
     case 'message':
@@ -64,6 +80,16 @@ function toEvent(event: CoreModemEvent): CoreEvent | null {
       return { kind, mode, bitRate };
     case 'txRequest':
       return { kind };
+    case 'fileOffer':
+      return { kind, id, name: text, size, station };
+    case 'fileProgress':
+      return { kind, id, done, secondsLeft: secondsLeft > 0 ? secondsLeft : null };
+    case 'fileReceived':
+      return bytes && { kind, id, name: text, bytes };
+    case 'fileDelivered':
+    case 'fileFailed':
+    case 'fileRefused':
+      return { kind, id };
     default:
       return null;
   }
@@ -147,6 +173,17 @@ export function createSession(
       }
       case 'sendText':
         return { type: 'queued', jobId, id: running().modem.sendText(message.text) };
+      case 'sendFile': {
+        const { modem: current } = running();
+        const seconds = current.fileSeconds(message.bytes.length);
+        return { type: 'fileQueued', jobId, id: current.sendFile(message.name, message.bytes), seconds };
+      }
+      case 'acceptFile':
+        running().modem.acceptFile(message.id);
+        break;
+      case 'cancelFile':
+        running().modem.cancelFile(message.id);
+        break;
       case 'hello':
         running().modem.hello();
         break;

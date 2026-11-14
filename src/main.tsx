@@ -14,7 +14,14 @@ const core = coreClient(() => new Worker(new URL('./worker/modem.worker.ts', imp
 
 createRoot(root).render(
   <StrictMode>
-    <App storage={browserStorage()} languages={navigator.languages} core={core} startAudio={startAudio} />
+    <App
+      storage={browserStorage()}
+      languages={navigator.languages}
+      core={core}
+      startAudio={startAudio}
+      // never revoked: the files are small and live as long as the page
+      fileUrl={(bytes) => URL.createObjectURL(new Blob([bytes.slice()]))}
+    />
   </StrictMode>,
 );
 if (import.meta.env.PROD) registerServiceWorker(navigator, window, document);

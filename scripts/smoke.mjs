@@ -1,6 +1,7 @@
 // Browser smoke of the real app: language detection and memory, the modem
 // core loaded through the worker, a message received from the microphone and
-// one transmitted, no horizontal scroll on a phone, no console errors. With
+// one transmitted, a file offered, no horizontal scroll on a phone, no
+// console errors. With
 // --preview it runs against a fresh production build and also checks that
 // the service worker makes the app (WASM core included) work offline and
 // that a new deploy reaches a page that is already open (phones suspend
@@ -125,6 +126,33 @@ try {
     await page.click('#feed .cancel');
     const cancelled = page.locator('#feed .sent small', { hasText: 'Cancelled' });
     await cancelled.waitFor({ timeout: 5000 }).catch(() => check(false, 'the text was not cancelled'));
+    await context.close();
+  });
+
+  await step('a chosen file is read, offered over the air and given up', async () => {
+    const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
+    await coreReady(page);
+    await page.click('#mic');
+    await page.locator('#file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('a'.repeat(3000)) });
+    const note = page.locator('#feed .file.sent small');
+    await note.waitFor({ timeout: 5000 }).catch(() => check(false, 'the file is not in the feed'));
+    check((await page.locator('#feed .file .text').textContent()) === 'notes.txt', 'the name of the file is wrong');
+    // 3000 bytes at the 62.5 bit/s a station starts with: more than the ten minutes worth a warning
+    const text = await note.textContent();
+    check(/^2\.9 KB · Waiting for the other side to accept… · about \d+ min at the current speed$/.test(text), `the note is ${text}`);
+    // the offer goes out when the recording falls silent; nothing answers it
+    await page
+      .locator('#state.transmitting')
+      .waitFor({ timeout: 20_000 })
+      .catch(() => check(false, 'the offer was never transmitted'));
+    const width = await page.evaluate(() => document.documentElement.scrollWidth);
+    check(width <= VIEWPORTS.phone.width, `with a file in the feed the page is ${width}px wide`);
+    if (shots) await page.screenshot({ path: 'shots/phone-file.png', fullPage: true });
+    await page.click('#feed .file .cancel');
+    await page
+      .locator('#feed .file small', { hasText: 'Cancelled' })
+      .waitFor({ timeout: 5000 })
+      .catch(() => check(false, 'the file was not given up'));
     await context.close();
   });
 

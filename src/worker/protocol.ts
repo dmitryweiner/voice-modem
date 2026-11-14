@@ -19,6 +19,21 @@ export type CoreEvent =
   | { kind: 'txMode'; mode: number; bitRate: number }
   /** Push-to-talk: the modem waits for the `ptt` request. */
   | { kind: 'txRequest' }
+  /** A station offers a file: the answer is the `acceptFile` or the `cancelFile` request with this id. */
+  | { kind: 'fileOffer'; id: number; name: string; size: number; station: number }
+  /**
+   * So many bytes of the file are with the other side (sending) or here
+   * (receiving); the time left in seconds, null before the first chunk.
+   * The first of these for a file sent says that the offer was accepted.
+   */
+  | { kind: 'fileProgress'; id: number; done: number; secondsLeft: number | null }
+  /** The whole file arrived and its checksum is right. */
+  | { kind: 'fileReceived'; id: number; name: string; bytes: Uint8Array }
+  /**
+   * The other side has the whole file / stopped answering (or, receiving:
+   * the content arrived damaged) / declined the file or gave it up.
+   */
+  | { kind: 'fileDelivered' | 'fileFailed' | 'fileRefused'; id: number }
   /** Sound of this length has gone to the speaker. */
   | { kind: 'txStart'; seconds: number }
   /** The last sample has been played. */
@@ -43,6 +58,12 @@ export type WorkerIn =
   | { type: 'version'; jobId: number }
   | ({ type: 'start'; jobId: number; sampleRate: number; port: MessagePort } & StationOptions)
   | { type: 'sendText'; jobId: number; text: string }
+  /** Offers a file to the other side; its content goes only when the offer is accepted there. */
+  | { type: 'sendFile'; jobId: number; name: string; bytes: Uint8Array }
+  /** Consents to the offered file with this id. */
+  | { type: 'acceptFile'; jobId: number; id: number }
+  /** Gives up the file with this id, sent or received, or declines its offer. */
+  | { type: 'cancelFile'; jobId: number; id: number }
   /** Takes back the text with this id if it is not delivered yet. */
   | { type: 'cancel'; jobId: number; id: number }
   | { type: 'hello'; jobId: number }
@@ -54,6 +75,12 @@ export type WorkerOut =
   | { type: 'started'; jobId: number; maxTextBytes: number }
   /** The text waits for its turn; events will tell its fate under this id. */
   | { type: 'queued'; jobId: number; id: number }
+  /**
+   * The file is offered; the file events will tell its fate under this id
+   * (files and texts are numbered apart). `seconds` is what it takes at the
+   * speed of the moment once it is accepted.
+   */
+  | { type: 'fileQueued'; jobId: number; id: number; seconds: number }
   /** A request that has nothing to return was carried out. */
   | { type: 'done'; jobId: number }
   | { type: 'error'; jobId: number; message: string }
@@ -87,7 +114,11 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
       );
     case 'sendText':
       return typeof value.text === 'string';
+    case 'sendFile':
+      return typeof value.name === 'string' && value.bytes instanceof Uint8Array;
     case 'cancel':
+    case 'acceptFile':
+    case 'cancelFile':
       return isNumber(value.id);
     default:
       return false;
@@ -114,6 +145,16 @@ function isCoreEvent(value: unknown): value is CoreEvent {
       return isNumber(value.mode) && isNumber(value.bitRate);
     case 'txStart':
       return isNumber(value.seconds);
+    case 'fileOffer':
+      return isNumber(value.id) && typeof value.name === 'string' && isNumber(value.size) && isNumber(value.station);
+    case 'fileProgress':
+      return isNumber(value.id) && isNumber(value.done) && (value.secondsLeft === null || isNumber(value.secondsLeft));
+    case 'fileReceived':
+      return isNumber(value.id) && typeof value.name === 'string' && value.bytes instanceof Uint8Array;
+    case 'fileDelivered':
+    case 'fileFailed':
+    case 'fileRefused':
+      return isNumber(value.id);
     case 'txRequest':
     case 'txEnd':
       return true;
@@ -133,6 +174,8 @@ export function isWorkerOut(value: unknown): value is WorkerOut {
       return isNumber(value.maxTextBytes);
     case 'queued':
       return isNumber(value.id);
+    case 'fileQueued':
+      return isNumber(value.id) && isNumber(value.seconds);
     case 'done':
       return true;
     case 'error':

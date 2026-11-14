@@ -10,6 +10,15 @@ export interface CoreClient {
   start(sampleRate: number, port: MessagePort, options: StationOptions): Promise<{ maxTextBytes: number }>;
   /** Queues a text for transmission; events tell its fate under the returned id. */
   sendText(text: string): Promise<{ id: number }>;
+  /**
+   * Offers a file to the other side; the file events tell its fate under the
+   * returned id. `seconds` is what it takes at the speed of the moment.
+   */
+  sendFile(name: string, bytes: Uint8Array): Promise<{ id: number; seconds: number }>;
+  /** Consents to an offered file: its content starts to arrive. */
+  acceptFile(id: number): Promise<void>;
+  /** Gives up a file, sent or received, or declines an offer; nothing more is told about it. */
+  cancelFile(id: number): Promise<void>;
   /** Transmits a greeting with the name of this station. */
   hello(): Promise<void>;
   /** Push-to-talk: the button of the radio is down, transmit what is waiting. */
@@ -96,6 +105,13 @@ export function coreClient(createWorker: () => WorkerPort): CoreClient {
       if (reply.type !== 'queued') throw unexpected(reply);
       return { id: reply.id };
     },
+    async sendFile(name, bytes) {
+      const reply = await request({ type: 'sendFile', name, bytes });
+      if (reply.type !== 'fileQueued') throw unexpected(reply);
+      return { id: reply.id, seconds: reply.seconds };
+    },
+    acceptFile: (id) => done({ type: 'acceptFile', id }),
+    cancelFile: (id) => done({ type: 'cancelFile', id }),
     hello: () => done({ type: 'hello' }),
     ptt: () => done({ type: 'ptt' }),
     cancel: (id) => done({ type: 'cancel', id }),

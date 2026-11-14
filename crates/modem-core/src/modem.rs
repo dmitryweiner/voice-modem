@@ -1,5 +1,6 @@
-//! The modem as the application sees it: texts and samples in, events and
-//! samples out. Connects the link layer to the transmitter and the receiver.
+//! The modem as the application sees it: texts, files and samples in, events
+//! and samples out. Connects the link layer to the transmitter and the
+//! receiver, and the file transfer to the link layer.
 //!
 //! Time is counted in received samples, so the application must keep
 //! feeding `push_rx` — silence too — for anything to happen: transmissions
@@ -10,6 +11,7 @@
 use std::collections::VecDeque;
 
 use crate::SAMPLE_RATE;
+use crate::files::{CHUNK_HEADER, FileError, FileEvent, Files};
 use crate::frame::{Kind, Mode};
 use crate::link::{GAP, Heard, Link, LinkConfig, LinkEvent, SendError};
 use crate::resample::Resampler;
@@ -66,6 +68,12 @@ pub enum CommandError {
     TextTooLong {
         max: usize,
     },
+    /// `max` is the limit in bytes.
+    FileTooLarge {
+        max: usize,
+    },
+    /// A file needs the consent of its receiver; this modem expects no answers.
+    NoAnswers,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +97,33 @@ pub enum Event {
     MessageFailed { id: u32 },
     /// No acknowledgement: part of the message goes out again, for the `attempt`-th time.
     Retry { id: u32, attempt: u8 },
+    /// A station offers a file: answer with `accept_file` or `cancel_file`.
+    FileOffered {
+        id: u32,
+        from: u16,
+        name: String,
+        size: u32,
+    },
+    /// The other side has `done` bytes of the file `id` (sending), or this
+    /// side has (receiving). The time left is unknown before the first chunk.
+    FileProgress {
+        id: u32,
+        done: u32,
+        seconds_left: Option<u32>,
+    },
+    /// The whole file arrived and its checksum is right.
+    FileReceived {
+        id: u32,
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// The other side has the whole file.
+    FileDelivered { id: u32 },
+    /// Sending: the other side stopped answering. Receiving: the content
+    /// arrived damaged, or the offer gave way to newer ones.
+    FileFailed { id: u32 },
+    /// The other side declined the file or gave the transfer up.
+    FileRefused { id: u32 },
     /// Something was transmitted nearby but could not be read.
     FrameLost { stats: RxStats },
     /// Push-to-talk: press the button and call `ptt_pressed`.
@@ -104,6 +139,11 @@ pub struct Modem {
     tx_resampler: Option<Resampler>,
     receiver: Receiver,
     link: Link,
+    files: Files,
+    /// Frames are acknowledged: the other side can answer an offer.
+    reliable: bool,
+    /// Length of the lead-in tone, samples at the core rate.
+    lead_in: u64,
     /// Samples received so far, at the core rate: the time of the link layer.
     clock: u64,
     tx: VecDeque<f32>,
@@ -127,8 +167,8 @@ impl Modem {
             mode,
             ..
         } = config;
-        let ack_len = frame_len(Kind::Ack { advice: Mode::R1 }, Mode::R1, 0) as u64
-            + u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
+        let lead_in = u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
+        let ack_len = frame_len(Kind::Ack { advice: Mode::R1 }, Mode::R1, 0) as u64 + lead_in;
         Ok(Self {
             tx_config: tx,
             rx_resampler: converts.then(|| Resampler::new(rate, SAMPLE_RATE)),
@@ -145,6 +185,9 @@ impl Modem {
                 },
                 ack_len,
             ),
+            files: Files::new(),
+            reliable,
+            lead_in,
             clock: 0,
             tx: VecDeque::new(),
             events: VecDeque::new(),
@@ -163,6 +206,48 @@ impl Modem {
     /// longer waiting. What is already playing is played to the end.
     pub fn cancel(&mut self, id: u32) -> bool {
         self.link.cancel(id)
+    }
+
+    /// Offers a file to the other side; its fate is reported in events under
+    /// the returned id (files and texts are numbered apart). Nothing of the
+    /// content is sent before the offer is accepted there.
+    pub fn send_file(&mut self, name: &str, bytes: Vec<u8>) -> Result<u32, CommandError> {
+        if !self.reliable {
+            return Err(CommandError::NoAnswers);
+        }
+        self.files
+            .send(name, bytes)
+            .map_err(|FileError::TooLarge { max }| CommandError::FileTooLarge { max })
+    }
+
+    /// Consents to an offered file; false when there is no such offer.
+    pub fn accept_file(&mut self, id: u32) -> bool {
+        self.files.accept(id, self.clock)
+    }
+
+    /// Gives up a file that is being sent or received, or declines an
+    /// offer; the other side is told. False when there is no such file any
+    /// more. Nothing more is reported about it.
+    pub fn cancel_file(&mut self, id: u32) -> bool {
+        self.files.cancel(id)
+    }
+
+    /// Seconds a file of `size` bytes takes at the speed of the moment, once
+    /// it is accepted and if no frame is lost.
+    pub fn file_seconds(&self, size: usize) -> u32 {
+        let mode = self.link.tx_mode();
+        let chunk = self.link.room() - CHUNK_HEADER;
+        // A frame with so many bytes of the file, its acknowledgement and the pause.
+        let exchange = |bytes: usize| {
+            let message = 1 + CHUNK_HEADER + bytes;
+            self.lead_in + frame_len(Kind::Data, mode, message) as u64 + self.link.answer_len()
+        };
+        let whole = (size / chunk) as u64 * exchange(chunk);
+        let rest = match size % chunk {
+            0 => 0,
+            bytes => exchange(bytes),
+        };
+        (whole + rest).div_ceil(u64::from(SAMPLE_RATE)) as u32
     }
 
     /// Queues a greeting with the name of this station; stations that hear it answer with theirs.
@@ -208,8 +293,52 @@ impl Modem {
                 }
             }
         }
+        self.pump_files();
         self.transmit();
         self.take_link_events(None);
+        while let Some(event) = self.files.poll_event() {
+            self.events.push_back(match event {
+                FileEvent::Offered {
+                    id,
+                    from,
+                    name,
+                    size,
+                } => Event::FileOffered {
+                    id,
+                    from,
+                    name,
+                    size,
+                },
+                FileEvent::Progress {
+                    id,
+                    done,
+                    seconds_left,
+                } => Event::FileProgress {
+                    id,
+                    done,
+                    seconds_left,
+                },
+                FileEvent::Received { id, name, bytes } => Event::FileReceived { id, name, bytes },
+                FileEvent::Delivered { id } => Event::FileDelivered { id },
+                FileEvent::Failed { id } => Event::FileFailed { id },
+                FileEvent::Refused { id } => Event::FileRefused { id },
+            });
+        }
+    }
+
+    /// Hands the messages of the file transfer to the link layer: answers
+    /// at once, a chunk only when nothing else waits there.
+    fn pump_files(&mut self) {
+        while let Some(token) = self.files.poll_take_back() {
+            self.link.cancel(token);
+        }
+        while let Some(bytes) = self
+            .files
+            .poll(self.link.room(), self.link.nothing_queued())
+        {
+            let token = self.link.send_file(bytes);
+            self.files.sent_as(token);
+        }
     }
 
     /// Asks the link layer what to transmit now and puts its samples into the queue.
@@ -251,6 +380,20 @@ impl Modem {
     /// Moves the events of the link layer out; `stats` are those of the frame that caused them.
     fn take_link_events(&mut self, stats: Option<RxStats>) {
         while let Some(event) = self.link.poll_event() {
+            // What becomes of a message of the file transfer is its business.
+            let files = match &event {
+                LinkEvent::File { from, bytes } => {
+                    self.files.on_message(*from, bytes, self.clock);
+                    true
+                }
+                LinkEvent::Delivered { id } => self.files.on_delivered(*id, self.clock),
+                LinkEvent::Failed { id } => self.files.on_failed(*id),
+                LinkEvent::Retry { id, .. } => self.files.owns(*id),
+                _ => false,
+            };
+            if files {
+                continue;
+            }
             self.events.push_back(match (event, stats) {
                 (LinkEvent::Text { from, text }, Some(stats)) => {
                     Event::MessageReceived { from, text, stats }
@@ -258,8 +401,9 @@ impl Modem {
                 (LinkEvent::Hello { from, name, .. }, Some(stats)) => {
                     Event::PeerHello { from, name, stats }
                 }
-                (LinkEvent::Text { .. } | LinkEvent::Hello { .. }, None) => {
-                    unreachable!("only a received frame brings a message")
+                (LinkEvent::Text { .. } | LinkEvent::Hello { .. }, None)
+                | (LinkEvent::File { .. }, _) => {
+                    unreachable!("only a received frame brings a message, and files took theirs")
                 }
                 (LinkEvent::Sent { id }, _) => Event::MessageSent { id },
                 (LinkEvent::Delivered { id }, _) => Event::MessageDelivered { id },
@@ -308,26 +452,42 @@ mod tests {
     }
 
     /// A perfect cable between sound cards: what each modem plays, the others hear a block later.
-    fn run(modems: &mut [&mut Modem], seconds: f32) {
+    #[derive(Default)]
+    struct Cable {
+        /// What each modem hears next. Kept between runs: a frame may be on its way.
+        heard: Vec<Vec<f32>>,
+    }
+
+    impl Cable {
         const BLOCK: usize = 512;
-        let mut heard = vec![vec![0.0f32; BLOCK]; modems.len()];
-        for _ in 0..(seconds * SAMPLE_RATE as f32) as usize / BLOCK {
-            let mut played = vec![vec![0.0f32; BLOCK]; modems.len()];
-            for (modem, (block, incoming)) in modems.iter_mut().zip(played.iter_mut().zip(&heard)) {
-                modem.push_rx(incoming);
-                modem.pull_tx(block);
-            }
-            for (index, mix) in heard.iter_mut().enumerate() {
-                mix.fill(0.0);
-                for (other, block) in played.iter().enumerate() {
-                    // a modem hears itself too, as through a speaker next to its microphone
-                    let gain = if other == index { 0.5 } else { 1.0 };
-                    mix.iter_mut()
-                        .zip(block)
-                        .for_each(|(sum, sample)| *sum += gain * sample);
+
+        fn run(&mut self, modems: &mut [&mut Modem], seconds: f32) {
+            self.heard.resize(modems.len(), vec![0.0; Self::BLOCK]);
+            for _ in 0..(seconds * SAMPLE_RATE as f32) as usize / Self::BLOCK {
+                let mut played = vec![vec![0.0f32; Self::BLOCK]; modems.len()];
+                for (modem, (block, incoming)) in
+                    modems.iter_mut().zip(played.iter_mut().zip(&self.heard))
+                {
+                    modem.push_rx(incoming);
+                    modem.pull_tx(block);
+                }
+                for (index, mix) in self.heard.iter_mut().enumerate() {
+                    mix.fill(0.0);
+                    for (other, block) in played.iter().enumerate() {
+                        // a modem hears itself too, as through a speaker next to its microphone
+                        let gain = if other == index { 0.5 } else { 1.0 };
+                        mix.iter_mut()
+                            .zip(block)
+                            .for_each(|(sum, sample)| *sum += gain * sample);
+                    }
                 }
             }
         }
+    }
+
+    /// A cable for one run: between runs the channel must be silent.
+    fn run(modems: &mut [&mut Modem], seconds: f32) {
+        Cable::default().run(modems, seconds);
     }
 
     fn all_events(modem: &mut Modem) -> Vec<Event> {
@@ -656,5 +816,175 @@ mod tests {
         }
         bob.push_rx(&samples);
         assert!(matches!(&events(&mut bob)[..], [Event::FrameLost { .. }]));
+    }
+
+    fn file(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 + i / 256) as u8).collect()
+    }
+
+    /// The modem `from` offers a file and `to` accepts it; their ids of the file.
+    fn offer_and_accept(from: &mut Modem, to: &mut Modem, len: usize) -> (u32, u32) {
+        let up = from.send_file("notes.txt", file(len)).unwrap();
+        run(&mut [from, to], 8.0);
+        let offered = events(to);
+        let [
+            Event::FileOffered {
+                id: down,
+                from: 1,
+                name,
+                size,
+            },
+        ] = &offered[..]
+        else {
+            panic!("{offered:?}");
+        };
+        assert_eq!((name.as_str(), *size), ("notes.txt", len as u32));
+        assert_eq!(events(from), []);
+        assert!(to.accept_file(*down));
+        (up, *down)
+    }
+
+    #[test]
+    fn a_file_is_offered_accepted_and_arrives_whole() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let (up, down) = offer_and_accept(&mut alice, &mut bob, 2000);
+        run(&mut [&mut alice, &mut bob], 60.0);
+        let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
+        // nothing of the link layer shows through: only the file is reported
+        assert!(
+            at_alice[..at_alice.len() - 1]
+                .iter()
+                .all(|e| matches!(e, Event::FileProgress { id, .. } if *id == up)),
+            "{at_alice:?}"
+        );
+        assert_eq!(at_alice.last(), Some(&Event::FileDelivered { id: up }));
+        // the offer went in the slowest mode; the chunks fill the frames of the next three
+        assert_eq!(
+            at_bob[..3]
+                .iter()
+                .map(|e| match e {
+                    Event::FileProgress { done, .. } => *done,
+                    _ => 0,
+                })
+                .collect::<Vec<_>>(),
+            [121, 369, 1385]
+        );
+        assert_eq!(
+            at_bob.last(),
+            Some(&Event::FileReceived {
+                id: down,
+                name: "notes.txt".into(),
+                bytes: file(2000)
+            })
+        );
+        assert!(alice.is_idle() && bob.is_idle());
+    }
+
+    #[test]
+    fn a_text_goes_ahead_of_the_rest_of_a_file() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        offer_and_accept(&mut alice, &mut bob, 1000);
+        run(&mut [&mut alice, &mut bob], 12.0);
+        let text = alice.send_text("meanwhile").unwrap();
+        run(&mut [&mut alice, &mut bob], 60.0);
+        let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
+        let place = |events: &[Event], wanted: fn(&Event) -> bool| {
+            events.iter().position(wanted).expect("the event")
+        };
+        assert!(at_alice.contains(&Event::MessageDelivered { id: text }));
+        let got_text = place(&at_bob, |e| matches!(e, Event::MessageReceived { .. }));
+        let got_file = place(&at_bob, |e| matches!(e, Event::FileReceived { .. }));
+        assert!(got_text < got_file);
+    }
+
+    #[test]
+    fn a_cancelled_file_stops_on_both_sides() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let (up, down) = offer_and_accept(&mut alice, &mut bob, 5000);
+        run(&mut [&mut alice, &mut bob], 12.0);
+        assert!(alice.cancel_file(up));
+        assert!(!alice.cancel_file(up));
+        run(&mut [&mut alice, &mut bob], 20.0);
+        assert_eq!(
+            events(&mut bob).last(),
+            Some(&Event::FileRefused { id: down })
+        );
+        assert!(
+            events(&mut alice)
+                .iter()
+                .all(|e| matches!(e, Event::FileProgress { .. }))
+        );
+        assert!(alice.is_idle() && bob.is_idle());
+    }
+
+    #[test]
+    fn a_declined_file_is_reported_to_its_sender() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let up = alice.send_file("notes.txt", file(100)).unwrap();
+        run(&mut [&mut alice, &mut bob], 8.0);
+        assert!(bob.cancel_file(1));
+        assert!(!bob.accept_file(1));
+        run(&mut [&mut alice, &mut bob], 8.0);
+        assert_eq!(events(&mut alice), [Event::FileRefused { id: up }]);
+    }
+
+    #[test]
+    fn a_file_into_the_void_fails() {
+        let mut alone = modem(1);
+        let up = alone.send_file("notes.txt", file(100)).unwrap();
+        run(&mut [&mut alone], 60.0);
+        assert_eq!(events(&mut alone), [Event::FileFailed { id: up }]);
+    }
+
+    #[test]
+    fn the_time_a_file_takes_is_known_beforehand() {
+        let fixed = |station, mode| {
+            Modem::new(Config {
+                station,
+                seed: u64::from(station),
+                mode: Some(mode),
+                ..Config::default()
+            })
+            .unwrap()
+        };
+        for (mode, len) in [(Mode::R1, 300), (Mode::R3, 1000), (Mode::F3, 20_000)] {
+            let (mut alice, mut bob) = (fixed(1, mode), fixed(2, mode));
+            let estimate = alice.file_seconds(len) as f32;
+            offer_and_accept(&mut alice, &mut bob, len);
+            let mut cable = Cable::default();
+            // from the consent of the receiver to the last acknowledgement
+            let (mut start, mut end, mut time) = (None, None, 0.0);
+            while end.is_none() && time < 2.0 * estimate + 20.0 {
+                cable.run(&mut [&mut alice, &mut bob], 0.5);
+                time += 0.5;
+                for event in events(&mut alice) {
+                    match event {
+                        Event::FileProgress { seconds_left, .. } if seconds_left.is_none() => {
+                            start = Some(time)
+                        }
+                        Event::FileDelivered { .. } => end = Some(time),
+                        _ => {}
+                    }
+                }
+            }
+            let took = end.expect("delivered") - start.expect("accepted");
+            assert!(
+                (estimate / took - 1.0).abs() < 0.1,
+                "{mode:?}: {estimate} s expected, took {took} s"
+            );
+        }
+    }
+
+    #[test]
+    fn files_need_a_channel_that_answers() {
+        let mut one_way = Modem::new(Config {
+            reliable: false,
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(
+            one_way.send_file("notes.txt", file(10)),
+            Err(CommandError::NoAnswers)
+        );
     }
 }

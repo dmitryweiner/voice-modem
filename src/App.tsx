@@ -12,6 +12,8 @@ export interface AppProps {
   core: CoreClient;
   /** Opens the microphone and the speaker. */
   startAudio: StartAudio;
+  /** Makes an address a received file can be saved from (`URL.createObjectURL`). */
+  fileUrl: (bytes: Uint8Array) => string;
 }
 
 type CoreState = { status: 'loading' } | { status: 'ready'; version: string } | { status: 'failed' };
@@ -21,7 +23,7 @@ function coreText(t: Messages, core: CoreState): string {
   return core.status === 'failed' ? t.coreFailed : t.coreLoading;
 }
 
-export function App({ storage, languages, core, startAudio }: AppProps) {
+export function App({ storage, languages, core, startAudio, fileUrl }: AppProps) {
   const [settings, setSettings] = useState<Settings>(() => loadSettings(storage));
   const [coreState, setCoreState] = useState<CoreState>({ status: 'loading' });
   const locale = detectLocale(settings.locale, languages);
@@ -77,6 +79,7 @@ export function App({ storage, languages, core, startAudio }: AppProps) {
           t={t}
           core={core}
           startAudio={startAudio}
+          fileUrl={fileUrl}
           coreReady={coreState.status === 'ready'}
           station={{ name: settings.name, manualPtt: settings.manualPtt, mode: settings.mode }}
           onStationChange={(station) => update({ ...settings, ...station })}

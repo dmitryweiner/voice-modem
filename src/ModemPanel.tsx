@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import { audioErrorKind, type AudioErrorKind, type AudioSession, type StartAudio } from './audio/engine';
 import { CLIP_LEVEL, SILENT, type Meter } from './audio/meter';
 import type { Messages } from './i18n';
@@ -10,6 +10,8 @@ export interface ModemPanelProps {
   t: Messages;
   core: CoreClient;
   startAudio: StartAudio;
+  /** Makes an address a received file can be saved from. */
+  fileUrl: (bytes: Uint8Array) => string;
   /** False until the core has loaded: the microphone cannot be turned on. */
   coreReady: boolean;
   /** The name of the station and whether it is a push-to-talk radio; they take effect when the microphone is turned on. */
@@ -23,20 +25,51 @@ type Link =
   | { status: 'on'; session: AudioSession; maxTextBytes: number; manualPtt: boolean }
   | { status: 'error'; kind: AudioErrorKind };
 
+/**
+ * A file: offered and waiting for consent, moving, whole on the other side,
+ * or stopped — nobody answers (received: the content is damaged), the other
+ * side refused or gave up, this side gave up.
+ */
+type FileStatus = 'offered' | 'moving' | 'done' | 'failed' | 'refused' | 'cancelled';
+
 type Item =
   | { key: number; kind: 'received'; text: string; snrDb: number }
-  /** `id` is the modem's; `attempt` grows with every repeat. */
+  /**
+   * `id` is the modem's, and `run` tells which modem: each one started counts
+   * from one again. `attempt` grows with every repeat.
+   */
   | {
       key: number;
       kind: 'sent';
+      run: number;
       id: number;
       text: string;
       status: 'sending' | 'sent' | 'delivered' | 'failed' | 'cancelled';
       attempt: number;
     }
+  | {
+      key: number;
+      kind: 'file';
+      run: number;
+      id: number;
+      outgoing: boolean;
+      name: string;
+      size: number;
+      /** Bytes that are through. */
+      done: number;
+      secondsLeft: number | null;
+      status: FileStatus;
+      /** Sent: the content, to offer it again; what it takes at the speed it was offered at, seconds. */
+      bytes?: Uint8Array;
+      seconds?: number;
+      /** Received: where to save it from. */
+      url?: string;
+    }
   | { key: number; kind: 'peer'; name: string }
   | { key: number; kind: 'lost' };
 
+/** A file that takes longer than this is offered with a warning, seconds. */
+const SLOW_FILE = 600;
 /** How often the level and the spectrum are redrawn, ms. */
 const METER_INTERVAL = 50;
 
@@ -84,10 +117,80 @@ function InputMeter({ t, session }: { t: Messages; session: AudioSession }) {
 }
 
 type SentItem = Item & { kind: 'sent' };
+type FileItem = Item & { kind: 'file' };
+
+const isLive = (item: FileItem) => item.status === 'offered' || item.status === 'moving';
+
+function fileNote(t: Messages, item: FileItem): string {
+  const { outgoing, status } = item;
+  const parts = [t.fileSize(item.size)];
+  if (status === 'offered') {
+    parts.push(outgoing ? t.fileWaiting : t.fileOffered);
+    if (item.seconds !== undefined && item.seconds > SLOW_FILE) parts.push(t.fileSlow(item.seconds));
+  } else if (status === 'moving') {
+    const percent = item.size > 0 ? Math.floor((item.done / item.size) * 100) : 0;
+    parts.push(`${outgoing ? t.sending : t.fileReceiving} ${percent}%`);
+    if (item.secondsLeft !== null) parts.push(t.timeLeft(item.secondsLeft));
+  } else if (status === 'done') {
+    parts.push(outgoing ? t.delivered : t.received);
+  } else if (status === 'failed') {
+    parts.push(outgoing ? t.notDelivered : t.fileNotReceived);
+  } else if (status === 'refused') {
+    parts.push(outgoing ? t.fileRefused : t.fileGivenUp);
+  } else {
+    parts.push(t.cancelled);
+  }
+  return parts.join(' · ');
+}
+
+interface FileRowProps {
+  t: Messages;
+  item: FileItem;
+  onAccept: (item: FileItem) => void;
+  onCancel: (item: FileItem) => void;
+  onResend: (item: FileItem) => void;
+}
+
+function FileRow({ t, item, onAccept, onCancel, onResend }: FileRowProps) {
+  const offer = !item.outgoing && item.status === 'offered';
+  return (
+    <li className={item.outgoing ? 'file sent' : 'file received'} data-status={item.status}>
+      <span className="text">{item.name}</span>
+      <small>{fileNote(t, item)}</small>
+      {item.status === 'moving' && <progress value={item.done} max={item.size} aria-label={item.name} />}
+      {offer && (
+        <button type="button" className="accept" aria-label={t.accept} title={t.accept} onClick={() => onAccept(item)}>
+          ✓
+        </button>
+      )}
+      {isLive(item) && (
+        <button
+          type="button"
+          className="cancel"
+          aria-label={offer ? t.decline : t.cancel}
+          title={offer ? t.decline : t.cancel}
+          onClick={() => onCancel(item)}
+        >
+          ✕
+        </button>
+      )}
+      {item.outgoing && !isLive(item) && item.status !== 'done' && (
+        <button type="button" className="resend" aria-label={t.resend} title={t.resend} onClick={() => onResend(item)}>
+          ↻
+        </button>
+      )}
+      {item.url !== undefined && (
+        <a className="save" href={item.url} download={item.name}>
+          {t.save}
+        </a>
+      )}
+    </li>
+  );
+}
 
 interface FeedItemProps {
   t: Messages;
-  item: Item;
+  item: Exclude<Item, FileItem>;
   onResend: (item: SentItem) => void;
   onCancel: (item: SentItem) => void;
 }
@@ -122,8 +225,11 @@ function FeedItem({ t, item, onResend, onCancel }: FeedItemProps) {
   );
 }
 
-/** The modem on the page: the station settings, the microphone switch, the input meter, the messages and the text to send. */
-export function ModemPanel({ t, core, startAudio, coreReady, station, onStationChange }: ModemPanelProps) {
+/**
+ * The modem on the page: the station settings, the microphone switch, the
+ * input meter, the messages and files, the text and the file to send.
+ */
+export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, onStationChange }: ModemPanelProps) {
   const [link, setLink] = useState<Link>({ status: 'off' });
   const [items, setItems] = useState<Item[]>([]);
   const [transmitting, setTransmitting] = useState(false);
@@ -132,8 +238,11 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
   /** The speed texts go out at now, bit/s. */
   const [bitRate, setBitRate] = useState<number>(MODE_BIT_RATES[0]);
   const [draft, setDraft] = useState('');
-  const [sendFailed, setSendFailed] = useState(false);
+  /** What the modem refused to take last. */
+  const [sendFailed, setSendFailed] = useState<'text' | 'file' | null>(null);
   const nextKey = useRef(1);
+  /** The number of the modem that runs: grows each time the microphone is turned on. */
+  const run = useRef(0);
   /** The running audio device, for the clean-up when the panel goes away. */
   const running = useRef<AudioSession | null>(null);
   const feedBox = useRef<HTMLDivElement>(null);
@@ -147,10 +256,44 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
   useEffect(() => {
     const add = (item: Item) => setItems((list) => [...list, item]);
     const update = (id: number, change: (item: SentItem) => Item) =>
-      setItems((list) => list.map((item) => (item.kind === 'sent' && item.id === id ? change(item) : item)));
+      setItems((list) => list.map((item) => (item.kind === 'sent' && item.run === run.current && item.id === id ? change(item) : item)));
+    const isFile = (item: Item, id: number): item is FileItem => item.kind === 'file' && item.run === run.current && item.id === id;
+    /** What the modem says about a file counts only while the file is on its way here. */
+    const updateFile = (id: number, change: Partial<FileItem>) =>
+      setItems((list) => list.map((item) => (isFile(item, id) && isLive(item) ? { ...item, ...change } : item)));
     return core.onEvent((event) => {
       const key = nextKey.current++;
       switch (event.kind) {
+        case 'fileOffer': {
+          const { id, name, size } = event;
+          add({ key, kind: 'file', run: run.current, id, outgoing: false, name, size, done: 0, secondsLeft: null, status: 'offered' });
+          break;
+        }
+        case 'fileProgress':
+          updateFile(event.id, { status: 'moving', done: event.done, secondsLeft: event.secondsLeft });
+          break;
+        case 'fileReceived': {
+          const { id, name, bytes } = event;
+          const whole = { status: 'done', size: bytes.length, done: bytes.length, url: fileUrl(bytes) } as const;
+          // The messages may have been cleared meanwhile: the file is shown all the same.
+          setItems((list) =>
+            list.some((item) => isFile(item, id))
+              ? list.map((item) => (isFile(item, id) ? { ...item, ...whole } : item))
+              : [...list, { key, kind: 'file', run: run.current, id, outgoing: false, name, secondsLeft: null, ...whole }],
+          );
+          break;
+        }
+        case 'fileDelivered':
+          setItems((list) =>
+            list.map((item) => (isFile(item, event.id) && isLive(item) ? { ...item, status: 'done', done: item.size } : item)),
+          );
+          break;
+        case 'fileFailed':
+          updateFile(event.id, { status: 'failed' });
+          break;
+        case 'fileRefused':
+          updateFile(event.id, { status: 'refused' });
+          break;
         case 'message':
           add({ key, kind: 'received', text: event.text, snrDb: event.snrDb });
           break;
@@ -183,7 +326,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           break;
       }
     });
-  }, [core]);
+  }, [core, fileUrl]);
 
   useEffect(
     () => () => {
@@ -219,6 +362,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
       session = await startAudio();
       const { maxTextBytes } = await core.start(session.sampleRate, session.port, station);
       running.current = session;
+      run.current++;
       setBitRate(MODE_BIT_RATES[station.mode ?? 0] ?? MODE_BIT_RATES[0]);
       setLink({ status: 'on', session, maxTextBytes, manualPtt: station.manualPtt });
     } catch (error) {
@@ -235,7 +379,12 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
     setTransmitting(false);
     setPttWanted(false);
     // What was still on its way will never be acknowledged now.
-    setItems((list) => list.map((item) => (item.kind === 'sent' && item.status === 'sending' ? { ...item, status: 'failed' } : item)));
+    setItems((list) =>
+      list.map((item) => {
+        if (item.kind === 'sent' && item.status === 'sending') return { ...item, status: 'failed' };
+        return item.kind === 'file' && isLive(item) ? { ...item, status: 'failed' } : item;
+      }),
+    );
     setLink({ status: 'off' });
   };
 
@@ -244,16 +393,78 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
 
   /** Queues a text in the modem and shows it; false when the modem refused. */
   const transmit = async (message: string, replaces?: number) => {
-    setSendFailed(false);
+    setSendFailed(null);
     try {
       const { id } = await core.sendText(message);
-      const item: Item = { key: nextKey.current++, kind: 'sent', id, text: message, status: 'sending', attempt: 1 };
+      const item: Item = { key: nextKey.current++, kind: 'sent', run: run.current, id, text: message, status: 'sending', attempt: 1 };
       setItems((list) => [...list.filter((other) => other.key !== replaces), item]);
       return true;
     } catch {
-      setSendFailed(true);
+      setSendFailed('text');
       return false;
     }
+  };
+
+  /** Offers a file to the other side and shows it. */
+  const offerFile = async (name: string, bytes: Uint8Array, replaces?: number) => {
+    setSendFailed(null);
+    try {
+      const { id, seconds } = await core.sendFile(name, bytes);
+      const item: Item = {
+        key: nextKey.current++,
+        kind: 'file',
+        run: run.current,
+        id,
+        outgoing: true,
+        name,
+        size: bytes.length,
+        done: 0,
+        secondsLeft: null,
+        status: 'offered',
+        bytes,
+        seconds,
+      };
+      setItems((list) => [...list.filter((other) => other.key !== replaces), item]);
+    } catch {
+      setSendFailed('file');
+    }
+  };
+
+  const chooseFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    // the same file can be chosen again
+    input.value = '';
+    if (link.status !== 'on' || !file) return;
+    try {
+      await offerFile(file.name, new Uint8Array(await file.arrayBuffer()));
+    } catch {
+      setSendFailed('file');
+    }
+  };
+
+  /** Consents to an offered file. */
+  const acceptFile = async ({ key, id }: FileItem) => {
+    try {
+      await core.acceptFile(id);
+    } catch {
+      return;
+    }
+    setItems((list) =>
+      list.map((item) => (item.key === key && item.kind === 'file' && item.status === 'offered' ? { ...item, status: 'moving' } : item)),
+    );
+  };
+
+  /** Gives a file up, or declines its offer; what arrived whole meanwhile stays. */
+  const cancelFile = async ({ key, id }: FileItem) => {
+    try {
+      await core.cancelFile(id);
+    } catch {
+      return;
+    }
+    setItems((list) =>
+      list.map((item) => (item.key === key && item.kind === 'file' && isLive(item) ? { ...item, status: 'cancelled' } : item)),
+    );
   };
 
   /** Takes a text back from the modem; what was delivered meanwhile stays delivered. */
@@ -368,15 +579,26 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           <p className="empty">{t.noMessages}</p>
         ) : (
           <ol id="feed" className="feed" aria-live="polite">
-            {items.map((item) => (
-              <FeedItem
-                key={item.key}
-                t={t}
-                item={item}
-                onResend={(failed) => void (on && transmit(failed.text, failed.key))}
-                onCancel={(sending) => void cancel(sending)}
-              />
-            ))}
+            {items.map((item) =>
+              item.kind === 'file' ? (
+                <FileRow
+                  key={item.key}
+                  t={t}
+                  item={item}
+                  onAccept={(offered) => void acceptFile(offered)}
+                  onCancel={(live) => void cancelFile(live)}
+                  onResend={(stopped) => void (on && stopped.bytes && offerFile(stopped.name, stopped.bytes, stopped.key))}
+                />
+              ) : (
+                <FeedItem
+                  key={item.key}
+                  t={t}
+                  item={item}
+                  onResend={(failed) => void (on && transmit(failed.text, failed.key))}
+                  onCancel={(sending) => void cancel(sending)}
+                />
+              ),
+            )}
           </ol>
         )}
       </div>
@@ -392,6 +614,10 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
           />
+          <label className="attach" title={t.attach}>
+            <input id="file" type="file" aria-label={t.attach} onChange={(event) => void chooseFile(event)} />
+            <span aria-hidden="true">📎</span>
+          </label>
           <button id="send" type="submit" disabled={text === '' || over > 0}>
             {t.send}
           </button>
@@ -402,7 +628,7 @@ export function ModemPanel({ t, core, startAudio, coreReady, station, onStationC
           )}
           {sendFailed && (
             <p id="send-failed" className="warning" role="alert">
-              {t.sendFailed}
+              {sendFailed === 'file' ? t.fileNotSent : t.sendFailed}
             </p>
           )}
         </form>

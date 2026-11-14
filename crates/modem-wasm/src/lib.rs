@@ -28,6 +28,11 @@ pub fn max_name_bytes() -> usize {
 #[derive(Default)]
 pub struct ModemEvent {
     /// "message": a text was received.
+    /// "fileOffer": a station offers the file `id` of `size` bytes; `text` is its name.
+    /// "fileProgress": `done` bytes of the file `id` are through; `secondsLeft` to go.
+    /// "fileReceived": the file `id` arrived whole: `bytes`; `text` is its name.
+    /// "fileDelivered", "fileFailed", "fileRefused": the fate of the file `id`
+    /// (refused: the other side declined it or gave the transfer up).
     /// "hello": a station greeted; `text` is its name.
     /// "sent", "delivered", "failed": the fate of the message `id`.
     /// "retry": no acknowledgement, the message `id` goes out for the `attempt`-th time.
@@ -36,8 +41,18 @@ pub struct ModemEvent {
     /// "txMode": data frames go out in the mode number `mode` from now on.
     pub kind: String,
     pub text: String,
-    /// The id `sendText` returned.
+    /// The id `sendText` returned; for the file events, the id `sendFile`
+    /// returned or the one of the offer. Texts and files are numbered apart.
     pub id: u32,
+    /// The content of a received file.
+    pub bytes: Vec<u8>,
+    /// The length of an offered file, bytes.
+    pub size: u32,
+    /// Bytes of the file that are through.
+    pub done: u32,
+    /// Seconds the rest of the file takes at the pace of the last chunks; 0 when unknown.
+    #[wasm_bindgen(js_name = secondsLeft)]
+    pub seconds_left: u32,
     pub attempt: u8,
     /// 0 is the slowest mode, R1.
     pub mode: u8,
@@ -101,6 +116,46 @@ impl From<Event> for ModemEvent {
                 attempt,
                 ..Self::of("retry")
             },
+            Event::FileOffered {
+                id,
+                from,
+                name,
+                size,
+            } => Self {
+                id,
+                station: from,
+                text: name,
+                size,
+                ..Self::of("fileOffer")
+            },
+            Event::FileProgress {
+                id,
+                done,
+                seconds_left,
+            } => Self {
+                id,
+                done,
+                seconds_left: seconds_left.unwrap_or(0),
+                ..Self::of("fileProgress")
+            },
+            Event::FileReceived { id, name, bytes } => Self {
+                id,
+                text: name,
+                bytes,
+                ..Self::of("fileReceived")
+            },
+            Event::FileDelivered { id } => Self {
+                id,
+                ..Self::of("fileDelivered")
+            },
+            Event::FileFailed { id } => Self {
+                id,
+                ..Self::of("fileFailed")
+            },
+            Event::FileRefused { id } => Self {
+                id,
+                ..Self::of("fileRefused")
+            },
             Event::FrameLost { stats } => Self::heard("frameLost", stats),
             Event::TxRequest => Self::of("txRequest"),
             Event::TxMode { mode } => Self {
@@ -135,11 +190,21 @@ fn new_modem(
     })
 }
 
-fn send_text(modem: &mut modem_core::Modem, text: &str) -> Result<u32, String> {
-    modem.send_text(text).map_err(|error| match error {
+fn words(error: CommandError) -> String {
+    match error {
         CommandError::EmptyText => "the text is empty".to_owned(),
         CommandError::TextTooLong { max } => format!("the text is longer than {max} bytes"),
-    })
+        CommandError::FileTooLarge { max } => format!("the file is larger than {max} bytes"),
+        CommandError::NoAnswers => "a file needs a channel that answers".to_owned(),
+    }
+}
+
+fn send_text(modem: &mut modem_core::Modem, text: &str) -> Result<u32, String> {
+    modem.send_text(text).map_err(words)
+}
+
+fn send_file(modem: &mut modem_core::Modem, name: &str, bytes: Vec<u8>) -> Result<u32, String> {
+    modem.send_file(name, bytes).map_err(words)
 }
 
 #[wasm_bindgen]
@@ -176,6 +241,34 @@ impl Modem {
     /// is no longer waiting.
     pub fn cancel(&mut self, id: u32) -> bool {
         self.0.cancel(id)
+    }
+
+    /// Offers a file to the other side; its fate is reported in the file
+    /// events under the returned id. Nothing of the content is sent before
+    /// the offer is accepted there.
+    #[wasm_bindgen(js_name = sendFile)]
+    pub fn send_file(&mut self, name: &str, bytes: Vec<u8>) -> Result<u32, JsError> {
+        send_file(&mut self.0, name, bytes).map_err(|message| JsError::new(&message))
+    }
+
+    /// Consents to the offered file `id`; false when there is no such offer.
+    #[wasm_bindgen(js_name = acceptFile)]
+    pub fn accept_file(&mut self, id: u32) -> bool {
+        self.0.accept_file(id)
+    }
+
+    /// Gives up the file `id`, sent or received, or declines its offer;
+    /// false when there is no such file any more.
+    #[wasm_bindgen(js_name = cancelFile)]
+    pub fn cancel_file(&mut self, id: u32) -> bool {
+        self.0.cancel_file(id)
+    }
+
+    /// Seconds a file of `size` bytes takes at the speed of the moment, once
+    /// it is accepted and if no frame is lost.
+    #[wasm_bindgen(js_name = fileSeconds)]
+    pub fn file_seconds(&self, size: u32) -> u32 {
+        self.0.file_seconds(size as usize)
     }
 
     /// Queues a greeting with the name of this station.
@@ -344,5 +437,87 @@ mod tests {
             kinds(&mut bob),
             [("hello".to_string(), "Alice".to_string(), 0)]
         );
+    }
+
+    #[test]
+    fn a_file_is_offered_accepted_and_received() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let content: Vec<u8> = (0..=255).collect();
+        // ten full frames of the slowest mode
+        assert_eq!(alice.file_seconds(570), 125);
+        let up = send_file(&mut alice.0, "байты.bin", content.clone()).unwrap();
+        run(&mut alice, &mut bob, 8);
+        let offer = bob.poll_event().unwrap();
+        assert_eq!(
+            (offer.kind.as_str(), offer.text.as_str(), offer.size),
+            ("fileOffer", "байты.bin", 256)
+        );
+        assert_eq!((offer.station, offer.id), (1, 1));
+        assert!(bob.accept_file(offer.id));
+        assert!(!bob.accept_file(offer.id));
+        run(&mut alice, &mut bob, 40);
+
+        let at_bob: Vec<ModemEvent> = std::iter::from_fn(|| bob.poll_event())
+            .filter(|e| e.kind != "txMode")
+            .collect();
+        let progress = &at_bob[0];
+        assert_eq!(
+            (progress.kind.as_str(), progress.id, progress.done),
+            ("fileProgress", 1, 121)
+        );
+        assert!(progress.seconds_left > 0);
+        let received = at_bob.last().unwrap();
+        assert_eq!(
+            (received.kind.as_str(), received.text.as_str(), received.id),
+            ("fileReceived", "байты.bin", 1)
+        );
+        assert_eq!(received.bytes, content);
+
+        let at_alice: Vec<ModemEvent> = std::iter::from_fn(|| alice.poll_event())
+            .filter(|e| e.kind != "txMode")
+            .collect();
+        // the consent: nothing sent yet, the time left unknown
+        assert_eq!(
+            (
+                at_alice[0].kind.as_str(),
+                at_alice[0].done,
+                at_alice[0].seconds_left
+            ),
+            ("fileProgress", 0, 0)
+        );
+        let delivered = at_alice.last().unwrap();
+        assert_eq!(
+            (delivered.kind.as_str(), delivered.id),
+            ("fileDelivered", up)
+        );
+    }
+
+    #[test]
+    fn a_file_is_declined_or_given_up() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let up = send_file(&mut alice.0, "a.txt", vec![1, 2, 3]).unwrap();
+        run(&mut alice, &mut bob, 8);
+        assert!(bob.cancel_file(1));
+        run(&mut alice, &mut bob, 8);
+        let refused = std::iter::from_fn(|| alice.poll_event()).last().unwrap();
+        assert_eq!((refused.kind.as_str(), refused.id), ("fileRefused", up));
+
+        let lonely = send_file(&mut alice.0, "b.txt", vec![1, 2, 3]).unwrap();
+        assert!(alice.cancel_file(lonely));
+        assert!(!alice.cancel_file(lonely));
+    }
+
+    #[test]
+    fn a_file_nobody_answers_fails() {
+        let mut alone = modem(1);
+        let mut nobody = modem(2);
+        let up = send_file(&mut alone.0, "a.txt", vec![1, 2, 3]).unwrap();
+        for _ in 0..60 * 48_000 / 2048 {
+            alone.push_rx(&[0.0; 2048]);
+            alone.pull_tx(2048);
+        }
+        let failed = std::iter::from_fn(|| alone.poll_event()).last().unwrap();
+        assert_eq!((failed.kind.as_str(), failed.id), ("fileFailed", up));
+        assert!(nobody.poll_event().is_none());
     }
 }

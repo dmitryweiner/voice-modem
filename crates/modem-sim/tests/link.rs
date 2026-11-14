@@ -271,12 +271,14 @@ fn fast_modes_over_a_telephone_line_and_through_a_clipping_input() {
 
 /// Two modems with sound cards at the same rate, each hearing the other
 /// through `noise` after a delay of one block, and itself at half the level.
+/// `jam` is asked before every block, with the time, whether interference
+/// drowns it; it may also work the modems as their applications would.
 fn talk(
     alice: &mut Modem,
     bob: &mut Modem,
     noise: &mut [Awgn; 2],
     seconds: f32,
-    mut jam: impl FnMut(f32) -> bool,
+    mut jam: impl FnMut(&mut Modem, &mut Modem, f32) -> bool,
 ) {
     const BLOCK: usize = 512;
     let mut heard = [vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]];
@@ -286,7 +288,7 @@ fn talk(
         alice.pull_tx(&mut played[0]);
         bob.push_rx(&heard[1]);
         bob.pull_tx(&mut played[1]);
-        let jammed = jam(step as f32 * BLOCK as f32 / 16_000.0);
+        let jammed = jam(alice, bob, step as f32 * BLOCK as f32 / 16_000.0);
         for side in 0..2 {
             let mix: Vec<f32> = played[1 - side]
                 .iter()
@@ -335,7 +337,7 @@ fn two_modems_chat_with_noise_6_db_above_the_signal() {
     let mut noise = [Awgn::new(0.7, 21), Awgn::new(0.7, 22)];
     let first = alice.send_text("Как слышно? Приём.").unwrap();
     let second = bob.send_text("Слышу хорошо 👍").unwrap();
-    talk(&mut alice, &mut bob, &mut noise, 60.0, |_| false);
+    talk(&mut alice, &mut bob, &mut noise, 60.0, |_, _, _| false);
     let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
     assert_eq!(texts(&at_bob), ["Как слышно? Приём."]);
     assert_eq!(texts(&at_alice), ["Слышу хорошо 👍"]);
@@ -355,7 +357,9 @@ fn a_frame_drowned_by_interference_is_repeated_and_delivered_once() {
     let mut noise = [Awgn::new(0.05, 1), Awgn::new(0.05, 2)];
     let id = alice.send_text("through the interference").unwrap();
     // loud noise over the first three seconds: most of the first attempt
-    talk(&mut alice, &mut bob, &mut noise, 30.0, |time| time < 3.0);
+    talk(&mut alice, &mut bob, &mut noise, 30.0, |_, _, time| {
+        time < 3.0
+    });
     let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
     assert_eq!(texts(&at_bob), ["through the interference"]);
     assert_eq!(
@@ -377,7 +381,7 @@ fn a_dead_channel_ends_in_not_delivered() {
     let (mut alice, mut bob) = (station(1), station(2));
     let mut noise = [Awgn::new(0.05, 1), Awgn::new(0.05, 2)];
     let id = alice.send_text("nobody will hear this").unwrap();
-    talk(&mut alice, &mut bob, &mut noise, 60.0, |_| true);
+    talk(&mut alice, &mut bob, &mut noise, 60.0, |_, _, _| true);
     assert_eq!(
         events(&mut alice).last(),
         Some(&Event::MessageFailed { id })
@@ -398,7 +402,7 @@ fn the_speed_settles_where_the_noise_allows() {
                 .unwrap()
         })
         .collect();
-    talk(&mut alice, &mut bob, &mut noise, 60.0, |_| false);
+    talk(&mut alice, &mut bob, &mut noise, 60.0, |_, _, _| false);
     let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
     assert_eq!(texts(&at_bob).len(), 5);
     for id in ids {
@@ -422,4 +426,62 @@ fn the_speed_settles_where_the_noise_allows() {
         !at_alice.iter().any(|e| matches!(e, Event::Retry { .. })),
         "{at_alice:?}"
     );
+}
+
+#[test]
+fn a_file_broken_off_by_interference_goes_on_from_where_it_stopped() {
+    let (mut alice, mut bob) = (station(1), station(2));
+    let mut noise = [Awgn::new(0.05, 1), Awgn::new(0.05, 2)];
+    let content: Vec<u8> = (0..6000u32).map(|i| (i * 31 + i / 256) as u8).collect();
+    alice.send_file("photo.jpg", content.clone()).unwrap();
+    let (mut at_alice, mut at_bob) = (Vec::new(), Vec::new());
+    // the interference starts when the first chunk has arrived
+    let mut jam_from = None;
+    talk(
+        &mut alice,
+        &mut bob,
+        &mut noise,
+        330.0,
+        |alice, bob, time| {
+            for event in events(bob) {
+                match event {
+                    Event::FileOffered { id, .. } => assert!(bob.accept_file(id)),
+                    Event::FileProgress { .. } => _ = jam_from.get_or_insert(time),
+                    _ => {}
+                }
+                at_bob.push(event);
+            }
+            for event in events(alice) {
+                // the human sees that the file did not get through and sends it again
+                if matches!(event, Event::FileFailed { .. }) {
+                    alice.send_file("photo.jpg", content.clone()).unwrap();
+                }
+                at_alice.push(event);
+            }
+            jam_from.is_some_and(|from| time < from + 100.0)
+        },
+    );
+    let count =
+        |events: &[Event], wanted: fn(&Event) -> bool| events.iter().filter(|e| wanted(e)).count();
+    assert!(count(&at_alice, |e| matches!(e, Event::FileFailed { .. })) >= 1);
+    // the receiver was asked once, and what it had was not sent again
+    assert_eq!(
+        count(&at_bob, |e| matches!(e, Event::FileOffered { .. })),
+        1
+    );
+    let resumed_at = at_alice.iter().rev().find_map(|e| match e {
+        Event::FileProgress {
+            done,
+            seconds_left: None,
+            ..
+        } => Some(*done),
+        _ => None,
+    });
+    assert!(resumed_at > Some(0), "{resumed_at:?}");
+    assert!(matches!(at_alice.last(), Some(Event::FileDelivered { .. })));
+    let Some(Event::FileReceived { name, bytes, .. }) = at_bob.last() else {
+        panic!("not received: {:?}", at_bob.len());
+    };
+    assert_eq!(name, "photo.jpg");
+    assert!(*bytes == content);
 }

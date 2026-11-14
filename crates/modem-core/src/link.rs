@@ -127,6 +127,7 @@ const MAX_PEERS: usize = 64;
 const TYPE_MASK: u8 = 0x0F;
 const TYPE_TEXT: u8 = 0;
 const TYPE_HELLO: u8 = 1;
+const TYPE_FILE: u8 = 2;
 /// The first segment of a message.
 const FLAG_FIRST: u8 = 0x40;
 /// More segments of the message follow.
@@ -160,6 +161,11 @@ pub enum LinkEvent {
     Text {
         from: u16,
         text: String,
+    },
+    /// A message of the file transfer, for `files.rs` to read.
+    File {
+        from: u16,
+        bytes: Vec<u8>,
     },
     /// A station greeted: its name and what it can do.
     Hello {
@@ -352,10 +358,43 @@ impl Link {
         Ok(id)
     }
 
-    /// Takes back a text that is not delivered yet: what is left of it is
+    /// Queues a message of the file transfer (`files.rs`), which may be as
+    /// long as a frame takes (`MAX_PAYLOAD` less the type); returns the id
+    /// its fate is reported under, as for a text.
+    pub fn send_file(&mut self, bytes: Vec<u8>) -> u32 {
+        debug_assert!(bytes.len() < MAX_PAYLOAD);
+        let id = self.next_message;
+        self.next_message += 1;
+        self.queue.push_back(Outgoing {
+            message: Some(id),
+            kind: TYPE_FILE,
+            bytes,
+            done: 0,
+        });
+        id
+    }
+
+    /// The longest message that goes in one frame of the mode of the moment.
+    pub fn room(&self) -> usize {
+        frame_bytes(self.tx_mode) - 1
+    }
+
+    /// From the end of a data frame to the start of the next one when the
+    /// frame is acknowledged: the acknowledgement and, on average, the wait
+    /// for a silent channel after it.
+    pub fn answer_len(&self) -> u64 {
+        ACK_DELAY + self.ack_len + (LISTEN.0 + LISTEN.1) / 2
+    }
+
+    /// No message waits or is on its way; acknowledgements may still be owed.
+    pub fn nothing_queued(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Takes back a message that is not delivered yet: what is left of it is
     /// not sent and nothing more is reported about it. False when there is
-    /// no such text any more. A frame already on the air still arrives, so
-    /// the other side may have the text all the same.
+    /// no such message any more. A frame already on the air still arrives, so
+    /// the other side may have the message all the same.
     pub fn cancel(&mut self, id: u32) -> bool {
         let is_it = |outgoing: &Outgoing| outgoing.message == Some(id);
         // The segment on its way is one of the first message of the queue.
@@ -523,7 +562,7 @@ impl Link {
             (offset, body) = (usize::from(u16::from_be_bytes(at)), rest);
         }
         match first & TYPE_MASK {
-            TYPE_TEXT => {
+            kind @ (TYPE_TEXT | TYPE_FILE) => {
                 if first & FLAG_FIRST != 0 {
                     peer.partial = Some(Vec::new());
                 }
@@ -538,10 +577,15 @@ impl Link {
                     return;
                 };
                 partial.extend_from_slice(body.get(known..).unwrap_or_default());
-                if first & FLAG_MORE == 0 {
-                    let text = String::from_utf8_lossy(partial).into_owned();
-                    peer.partial = None;
-                    self.events.push_back(LinkEvent::Text { from, text });
+                if first & FLAG_MORE == 0
+                    && let Some(bytes) = peer.partial.take()
+                {
+                    self.events.push_back(if kind == TYPE_TEXT {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        LinkEvent::Text { from, text }
+                    } else {
+                        LinkEvent::File { from, bytes }
+                    });
                 }
             }
             TYPE_HELLO if offset == 0 => {
@@ -1715,5 +1759,36 @@ mod tests {
         air.run(ms(10_000));
         let all = modes(&air, 0);
         assert_eq!(all[all.len() - 2..], [Mode::R1, Mode::R2]);
+    }
+
+    #[test]
+    fn a_message_of_the_file_transfer_is_carried_like_a_text() {
+        let mut air = Air::pair();
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert!(air.links[0].nothing_queued());
+        let id = air.links[0].send_file(bytes.clone());
+        assert!(!air.links[0].nothing_queued());
+        air.run(ms(60_000));
+        assert_eq!(air.events[1], [LinkEvent::File { from: 1, bytes }]);
+        assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
+        // too long for one frame of the slowest mode: it went in pieces
+        assert_eq!(air.sent(0, Kind::Data), 5);
+        assert!(air.links[0].nothing_queued());
+    }
+
+    #[test]
+    fn the_room_for_a_message_in_one_frame_follows_the_mode() {
+        let mut air = Air::pair();
+        air.snr = 20.0;
+        assert_eq!(air.links[0].room(), 63);
+        for _ in 0..3 {
+            let room = air.links[0].room();
+            air.links[0].send_file(vec![7; room]);
+            air.run(ms(20_000));
+        }
+        assert_eq!(air.links[0].tx_mode(), Mode::F1);
+        assert_eq!(air.links[0].room(), 1022);
+        // each fitted its frame
+        assert_eq!(data_frames(&air, 0), [(0, 64), (1, 128), (2, 255)]);
     }
 }

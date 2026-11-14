@@ -212,6 +212,7 @@ empty payload and unknown types are acknowledged and otherwise ignored.
 | ------- | --------------------------------------------------------------------------------------------------------------- |
 | 0 text  | UTF-8 text, cut into segments anywhere, also inside a character; at most 1000 bytes                             |
 | 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment |
+| 2 file  | a message of the file transfer ([below](#files-filesrs)), at most 1022 bytes                                    |
 
 A receiver starts a message at a segment with the "first" flag and delivers
 it at the one without "more". A segment adds the bytes from its offset on
@@ -281,6 +282,51 @@ every one that hears it acknowledges, at the same moment. The receiver takes
 the whole frame once it has read a header and does not notice another
 station's frame that starts meanwhile.
 
+## Files (`files.rs`)
+
+A file goes as messages of type 2 over the link layer, each acknowledged
+like a text. The first byte of such a message is its kind, the second the
+number of the transfer, which the sender counts from 0 (0 again after 255):
+
+| Kind     | From     | After the two bytes                                                                          |
+| -------- | -------- | -------------------------------------------------------------------------------------------- |
+| 0 offer  | sender   | length of the file, 4 bytes; CRC-32 of its content, 4 bytes; its name, up to 255 bytes UTF-8 |
+| 1 accept | receiver | the offset the content is wanted from, 4 bytes                                               |
+| 2 data   | sender   | the offset of the chunk in the file, 4 bytes; the chunk                                      |
+| 3 abort  | sender   | nothing: the sender gives the transfer up                                                    |
+| 4 refuse | receiver | nothing: the receiver declines the offer or gives the transfer up                            |
+
+- The sender offers; nothing of the content goes before the **accept**,
+  which is the decision of the human at the receiver. The sender waits for
+  it as long as it takes.
+- Chunks go in order, one at a time, each acknowledged before the next
+  (stop and wait, as everything on the link). A chunk is as long as one
+  frame of the mode of the moment takes: 57 bytes of the file in R1, 1016 in
+  a fast mode. If that frame is repeated in a slower mode, the link layer
+  cuts it into segments as it does a text.
+- A chunk is handed to the link layer only when nothing else waits there:
+  **a text goes ahead of the rest of a file**. A station sends one file at a
+  time; further ones wait, each offered when the one before is through.
+- The receiver appends the bytes of a chunk it does not have yet. To a chunk
+  from beyond what it has it answers with an accept that names the offset it
+  needs, and the sender goes on from there. To a chunk of a transfer it does
+  not know it answers with a refuse.
+- When it has as many bytes as the offer said, the receiver checks the
+  CRC-32 and delivers the file, or drops it if the checksum is wrong. The
+  sender takes the file for delivered when its last chunk is acknowledged.
+- **Going on after a break.** When a message of the transfer is not
+  acknowledged after every attempt, the transfer has failed at the sender;
+  the receiver keeps what it has. An offer with the same name, length and
+  checksum as a file the receiver has in part — from any station, under any
+  number — continues that file: if it was accepted before, the accept goes
+  out at once, with the offset of the first byte that is missing.
+- A receiver keeps at most 8 files offered or unfinished; the oldest gives
+  way.
+
+Frames have no destination, so a file, as a text, is for the one other
+station on the channel. A station that does not acknowledge (broadcast) has
+no way to consent: files need the two-way link.
+
 ## What the receiver reports (`rx.rs`)
 
 For every frame: the position of its first sample in the stream, the frequency
@@ -299,4 +345,5 @@ followed by an unreadable header, are reported as "heard but not read".
 
 More bits per carrier and bit loading by carrier, several frames per
 acknowledgement, tracking of the symbol clock inside a frame of tones,
-addressed sessions, files and everything else above the link layer: see [the plan](../plans/PLAN.md).
+addressed sessions, compression, files over a one-way channel and
+encryption: see [the plan](../plans/PLAN.md).

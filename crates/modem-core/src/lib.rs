@@ -11,6 +11,7 @@ pub mod bits;
 pub mod coding;
 pub mod conv;
 pub mod crc;
+pub mod files;
 pub mod frame;
 pub mod ldpc;
 pub mod link;
@@ -22,6 +23,7 @@ pub mod rx;
 pub mod sync;
 pub mod tx;
 
+pub use files::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES};
 pub use frame::{Frame, Kind};
 pub use frame::{MAX_PAYLOAD, Mode};
 pub use link::{MAX_NAME_BYTES, MAX_TEXT_BYTES};

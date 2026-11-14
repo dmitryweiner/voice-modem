@@ -160,6 +160,37 @@ and Android phone in a room, by the author:
 
 Not measured: the fast modes over the air.
 
+## What a file costs (2026-11-13)
+
+`cargo run --release -p modem-sim --example files` — the time a file takes
+once it is accepted, when no frame is lost, from the lengths of the frames
+and of the pauses between them (`Modem::file_seconds`; the modem through a
+cable takes this long within a tenth, which a test in `modem.rs` holds it
+to):
+
+| Mode | Speed of the mode | 10 KB  | 100 KB | Net speed  | Share |
+| ---- | ----------------- | ------ | ------ | ---------- | ----- |
+| R1   | 62.5 bit/s        | 36 min | 6 h    | 37 bit/s   | 59%   |
+| R2   | 125 bit/s         | 17 min | 2.8 h  | 79 bit/s   | 63%   |
+| R3   | 250 bit/s         | 8 min  | 81 min | 165 bit/s  | 66%   |
+| R4   | 500 bit/s         | 5 min  | 53 min | 252 bit/s  | 50%   |
+| F1   | 1400 bit/s        | 97 s   | 16 min | 832 bit/s  | 59%   |
+| F2   | 2800 bit/s        | 68 s   | 11 min | 1192 bit/s | 43%   |
+| F3   | 4200 bit/s        | 58 s   | 9 min  | 1406 bit/s | 33%   |
+
+- The rest is what stop-and-wait pays per frame: 1.25 s of preamble and
+  header, the acknowledgement (0.5 s of wait, 1.25 s of frame) and 0.65 s on
+  average until the channel counts as silent again — 3.7 s around at most
+  1016 bytes. The faster the mode, the larger that share: in F3 a full frame
+  is 2 s of data in 5.8 s of exchange.
+- That is the room for several frames per acknowledgement, which the plan
+  postponed twice: in F3 it would bring up to three times the speed, in the
+  robust modes a third to a half more.
+- A file through noise, with the link broken for 100 s in the middle and the
+  transfer going on from where it stopped: `tests/link.rs` in `modem-sim`.
+
+Not measured: a file between real devices.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through

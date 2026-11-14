@@ -31,7 +31,7 @@ export const ru: Messages = {
   clipping: 'Слишком громко: убавьте громкость или раздвиньте устройства.',
   spectrum: 'Спектр входного сигнала, от 0 до 4 кГц',
   messages: 'Сообщения',
-  noMessages: 'Пока пусто. Здесь появятся отправленные и принятые тексты.',
+  noMessages: 'Пока пусто. Здесь появятся отправленные и принятые тексты и файлы.',
   messageLabel: 'Текст для отправки',
   send: 'Отправить',
   hello: 'Поздороваться',
@@ -47,6 +47,17 @@ export const ru: Messages = {
   peerAnonymous: 'На канале появилась станция.',
   frameLost: 'Сообщение услышано, но прочитать его не удалось.',
   sendFailed: 'Текст не отправлен.',
+  attach: 'Отправить файл',
+  accept: 'Принять',
+  decline: 'Отклонить',
+  save: 'Сохранить',
+  fileOffered: 'Вам хотят передать этот файл',
+  fileWaiting: 'Ждём согласия другой стороны…',
+  fileReceiving: 'Принимается…',
+  fileRefused: 'Другая сторона отказалась',
+  fileGivenUp: 'Отправитель отменил передачу',
+  fileNotReceived: 'Не принято',
+  fileNotSent: 'Файл не отправлен.',
 
   coreReady: (version: string) => `Ядро модема ${version} готово.`,
   tooLong: (bytes: number) =>
@@ -55,4 +66,11 @@ export const ru: Messages = {
   bitRate: (rate: number) => `${String(rate).replace('.', ',')} бит/с`,
   attempt: (attempt: number) => `попытка ${attempt}`,
   peerNamed: (name: string) => `На канале ${name}.`,
+  fileSize: (bytes: number) => {
+    if (bytes < 1024) return `${bytes} ${plural('ru', bytes, { one: 'байт', few: 'байта', many: 'байт', other: 'байта' })}`;
+    const [value, unit] = bytes < 1024 * 1024 ? [bytes / 1024, 'КБ'] : [bytes / 1024 / 1024, 'МБ'];
+    return `${value.toFixed(1).replace('.', ',')} ${unit}`;
+  },
+  timeLeft: (seconds: number) => (seconds < 90 ? `осталось около ${seconds} с` : `осталось около ${Math.round(seconds / 60)} мин`),
+  fileSlow: (seconds: number) => `около ${Math.round(seconds / 60)} мин на текущей скорости`,
 };

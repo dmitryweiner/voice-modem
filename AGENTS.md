@@ -19,7 +19,10 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   turns, greetings, push-to-talk) and 4 (fast modes and adaptation: tone
   modes R2–R4, coherent OFDM modes F1–F3 under an LDPC code, the choice of
   mode by the advice in acknowledgements) are done. Stage 5 (files,
-  broadcast, encryption) is next.
+  broadcast, encryption) is under way: file transfer over the two-way link
+  is done (offer, consent, chunks, cancelling, going on after a break);
+  several frames per acknowledgement, compression, broadcast with fountain
+  codes and encryption are next.
 
 ## Commands
 
@@ -61,6 +64,9 @@ login shell may put an older one first). Rust — stable with the
   Source of the mode table and of the thresholds of `advise` in `link.rs`.
 - `cargo run --release -p modem-sim --example pause` — what more silence
   between the header and the payload would give in a room.
+- `cargo run --release -p modem-sim --example files` — what a file costs in
+  each mode: the time for 10 and 100 KB and the net speed against the speed
+  of the mode. Source of the file table in `docs/measurements.md`.
 - `node scripts/codecs.mjs` — the modem through real speech codecs with
   ffmpeg (`--mode r3` or `f1` for another mode, `--keep` keeps the WAV files).
 - `npm run smoke` — the browser smoke, see above.
@@ -76,7 +82,7 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | `npm run wasm`, clean           | ~40 s (first run also installs `wasm-bindgen-cli`) |
 | `npm run check`, warm           | ~8 s                                               |
 | `npm run smoke -- --preview`    | ~30 s                                              |
-| `cargo test --workspace`, warm  | ~2 s (the link tests take most of it)              |
+| `cargo test --workspace`, warm  | ~5 s (the link and file tests take most of it)     |
 | the sweep example               | ~50 s                                              |
 | the modes example               | ~2 min                                             |
 | the pause example               | ~1.5 min                                           |
@@ -115,7 +121,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   (texts, events, samples); `link.rs` — the link layer, pure logic on frames
   and a clock (acknowledgements, repeats, turns, segments and cutting them
   again for a slower mode, greetings, push-to-talk, cancelling, the ladder
-  of modes and the advice); `tx.rs` / `rx.rs` — a frame to samples
+  of modes and the advice); `files.rs` — file transfer, pure logic on
+  messages and a clock (offers, consent, chunks, the checksum, going on
+  after a break, the time left); `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
@@ -126,7 +134,7 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room
   reverberation, frequency and clock offset, clipping); `tests/link.rs` — the
   modem through them; `examples/sweep.rs`, `examples/modes.rs`,
-  `examples/pause.rs` — the measurements (see Scripts).
+  `examples/pause.rs`, `examples/files.rs` — the measurements (see Scripts).
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
 - `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter: `Modem`,
@@ -136,7 +144,8 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `src/App.tsx` — the shell: language, core status. `src/ModemPanel.tsx` —
   the modem on the page: station settings (name, push-to-talk, speed),
   microphone switch, state and speed, input meter, the scrolling box of
-  messages with delivery statuses, cancel, resend and clear, the text to send.
+  messages and files with their statuses, cancel, resend and clear, the
+  text and the file to send, the offer of a file to accept or decline.
 - `src/audio/` — `engine.ts` (AudioContext, microphone, wiring; browser
   glue), `modem-io.worklet.js` (the AudioWorklet: plain JS, no imports),
   `meter.ts` (peak and spectrum bars). Design: `docs/web-audio.md`.
@@ -175,7 +184,7 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - Sound never passes through the main thread: the worklet and the worker
   talk over their own MessageChannel. The worklet only moves samples.
 - Browser APIs reach components as parameters (`startAudio`, `core`,
-  `storage`), so component tests run without a browser.
+  `storage`, `fileUrl`), so component tests run without a browser.
 - The wire format is specified in `docs/protocol.md`; a change to it changes
   that file in the same PR. It is version 0 and changes freely: builds of
   different PRs do not talk to each other, so both devices are updated
@@ -185,7 +194,10 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - The core's clock is the count of received samples: the host must keep
   calling `push_rx` (silence too) and play what `pull_tx` gives at once.
   `link.rs` knows no sound and `rx.rs`/`tx.rs` know no link rules; only
-  `modem.rs` joins them.
+  `modem.rs` joins them. `files.rs` knows neither frames nor the link:
+  messages and their fates pass through `modem.rs` as well.
+- Nothing of a file's content is transmitted before its receiver consents,
+  and the receiver never delivers a file whose CRC-32 failed.
 - `modem-wasm` and the worker file stay thin adapters; logic lives where it is
   unit-tested (`modem-core`, `handler.ts`).
 

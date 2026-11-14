@@ -30,6 +30,7 @@ class FakeModem implements CoreModem {
   heard: Float32Array[] = [];
   events: CoreModemEvent[] = [];
   texts: string[] = [];
+  files: [string, Uint8Array][] = [];
   calls: (string | [string, number])[] = [];
   freed = false;
   /** Samples the modem wants played; the test sets it. */
@@ -39,6 +40,22 @@ class FakeModem implements CoreModem {
     if (text.length > 5) throw new Error('the text is longer than 5 bytes');
     this.texts.push(text);
     return this.texts.length;
+  }
+  sendFile(name: string, bytes: Uint8Array) {
+    if (name === '') throw new Error('a file needs a channel that answers');
+    this.files.push([name, bytes]);
+    return 40 + this.files.length;
+  }
+  acceptFile(id: number) {
+    this.calls.push(['acceptFile', id]);
+    return true;
+  }
+  cancelFile(id: number) {
+    this.calls.push(['cancelFile', id]);
+    return true;
+  }
+  fileSeconds(size: number) {
+    return size * 2;
   }
   hello() {
     this.calls.push('hello');
@@ -78,6 +95,10 @@ const coreEvent = (fields: Partial<CoreModemEvent> & { kind: string }): CoreMode
   station: 0,
   snrDb: 0,
   freqOffsetHz: 0,
+  bytes: new Uint8Array(),
+  size: 0,
+  done: 0,
+  secondsLeft: 0,
   ...fields,
 });
 
@@ -136,6 +157,9 @@ describe('protocol', () => {
       start,
       { type: 'sendText', jobId: 1, text: 'hi' },
       { type: 'cancel', jobId: 1, id: 3 },
+      { type: 'sendFile', jobId: 1, name: 'a.txt', bytes: new Uint8Array([1, 2]) },
+      { type: 'acceptFile', jobId: 1, id: 3 },
+      { type: 'cancelFile', jobId: 1, id: 3 },
     ];
     for (const request of good) expect({ request, ok: isWorkerIn(request) }).toEqual({ request, ok: true });
     const bad = [
@@ -147,6 +171,10 @@ describe('protocol', () => {
       { ...start, mode: 'fast' },
       { ...start, mode: undefined },
       { type: 'sendText', jobId: 1 },
+      { type: 'sendFile', jobId: 1, name: 'a.txt', bytes: [1, 2] },
+      { type: 'sendFile', jobId: 1, bytes: new Uint8Array(1) },
+      { type: 'acceptFile', jobId: 1 },
+      { type: 'cancelFile', jobId: 1, id: '3' },
       { type: 'other', jobId: 1 },
       null,
     ];
@@ -159,6 +187,7 @@ describe('protocol', () => {
       { type: 'version', jobId: 1, version: '0.1.0' },
       { type: 'started', jobId: 1, maxTextBytes: 1000 },
       { type: 'queued', jobId: 1, id: 3 },
+      { type: 'fileQueued', jobId: 1, id: 3, seconds: 40 },
       { type: 'done', jobId: 1 },
       { type: 'error', jobId: 1, message: 'x' },
       { type: 'event', event: { kind: 'message', text: 'hi', station: 7, snrDb: 10, freqOffsetHz: 0 } },
@@ -172,6 +201,13 @@ describe('protocol', () => {
       { type: 'event', event: { kind: 'txMode', mode: 1, bitRate: 125 } },
       { type: 'event', event: { kind: 'txStart', seconds: 2.5 } },
       { type: 'event', event: { kind: 'txEnd' } },
+      { type: 'event', event: { kind: 'fileOffer', id: 1, name: 'a.txt', size: 5, station: 7 } },
+      { type: 'event', event: { kind: 'fileProgress', id: 1, done: 3, secondsLeft: 9 } },
+      { type: 'event', event: { kind: 'fileProgress', id: 1, done: 0, secondsLeft: null } },
+      { type: 'event', event: { kind: 'fileReceived', id: 1, name: 'a.txt', bytes: new Uint8Array(5) } },
+      { type: 'event', event: { kind: 'fileDelivered', id: 1 } },
+      { type: 'event', event: { kind: 'fileFailed', id: 1 } },
+      { type: 'event', event: { kind: 'fileRefused', id: 1 } },
     ];
     for (const reply of good) expect({ reply, ok: isWorkerOut(reply) }).toEqual({ reply, ok: true });
     const bad = [
@@ -181,6 +217,11 @@ describe('protocol', () => {
       { type: 'event', event: { kind: 'message', text: 'hi', snrDb: 10, freqOffsetHz: 0 } },
       { type: 'event', event: { kind: 'retry', id: 1 } },
       { type: 'event', event: { kind: 'txStart' } },
+      { type: 'fileQueued', jobId: 1, id: 3 },
+      { type: 'event', event: { kind: 'fileOffer', id: 1, name: 'a.txt', station: 7 } },
+      { type: 'event', event: { kind: 'fileProgress', id: 1, done: 3 } },
+      { type: 'event', event: { kind: 'fileReceived', id: 1, name: 'a.txt', bytes: [1] } },
+      { type: 'event', event: { kind: 'fileDelivered' } },
       { type: 'event', event: { kind: 'unknown' } },
       { type: 'event' },
       'version',
@@ -308,6 +349,58 @@ describe('session', () => {
     await handle({ type: 'cancel', jobId: 2, id: 7 });
     expect(modem.calls).toEqual([['cancel', 7]]);
     expect(out).toEqual([{ type: 'done', jobId: 2 }]);
+  });
+
+  it('offers a file and returns its id and the time it takes at the speed of the moment', async () => {
+    const { handle, out, modem } = await startedSession();
+    out.length = 0;
+    const bytes = new Uint8Array([1, 2, 3]);
+    await handle({ type: 'sendFile', jobId: 2, name: 'a.txt', bytes });
+    expect(out).toEqual([{ type: 'fileQueued', jobId: 2, id: 41, seconds: 6 }]);
+    expect(modem.files).toEqual([['a.txt', bytes]]);
+    await handle({ type: 'sendFile', jobId: 3, name: '', bytes });
+    expect(out[1]).toEqual({ type: 'error', jobId: 3, message: 'a file needs a channel that answers' });
+  });
+
+  it('accepts an offered file and gives a file up by its id', async () => {
+    const { handle, out, modem } = await startedSession();
+    out.length = 0;
+    await handle({ type: 'acceptFile', jobId: 2, id: 5 });
+    await handle({ type: 'cancelFile', jobId: 3, id: 6 });
+    expect(modem.calls).toEqual([
+      ['acceptFile', 5],
+      ['cancelFile', 6],
+    ]);
+    expect(out).toEqual([
+      { type: 'done', jobId: 2 },
+      { type: 'done', jobId: 3 },
+    ]);
+  });
+
+  it('passes on what becomes of files', async () => {
+    const { out, audio, modem } = await startedSession();
+    out.length = 0;
+    const bytes = new Uint8Array([9, 8]);
+    modem.events = [
+      coreEvent({ kind: 'fileOffer', id: 1, text: 'a.txt', size: 2, station: 7 }),
+      coreEvent({ kind: 'fileProgress', id: 1, done: 0 }),
+      coreEvent({ kind: 'fileProgress', id: 1, done: 1, secondsLeft: 4 }),
+      coreEvent({ kind: 'fileReceived', id: 1, text: 'a.txt', bytes }),
+      coreEvent({ kind: 'fileDelivered', id: 2 }),
+      coreEvent({ kind: 'fileFailed', id: 3 }),
+      coreEvent({ kind: 'fileRefused', id: 4 }),
+    ];
+    audio.hear(new Float32Array(128));
+    expect(events(out)).toEqual([
+      { kind: 'fileOffer', id: 1, name: 'a.txt', size: 2, station: 7 },
+      // the core says 0 when it does not know the time left
+      { kind: 'fileProgress', id: 1, done: 0, secondsLeft: null },
+      { kind: 'fileProgress', id: 1, done: 1, secondsLeft: 4 },
+      { kind: 'fileReceived', id: 1, name: 'a.txt', bytes },
+      { kind: 'fileDelivered', id: 2 },
+      { kind: 'fileFailed', id: 3 },
+      { kind: 'fileRefused', id: 4 },
+    ]);
   });
 
   it('refuses a text the core refuses, and anything before the start', async () => {
@@ -461,6 +554,22 @@ describe('coreClient', () => {
     ]);
   });
 
+  it('offers a file, accepts one and gives one up', async () => {
+    const { client, workers } = setup();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const offered = client.sendFile('a.txt', bytes);
+    workers[0]?.reply({ type: 'fileQueued', jobId: 1, id: 4, seconds: 70 });
+    expect(await offered).toEqual({ id: 4, seconds: 70 });
+    const rest = [client.acceptFile(5), client.cancelFile(4)];
+    for (const jobId of [2, 3]) workers[0]?.reply({ type: 'done', jobId });
+    await Promise.all(rest);
+    expect(workers[0]?.sent).toEqual([
+      { type: 'sendFile', jobId: 1, name: 'a.txt', bytes },
+      { type: 'acceptFile', jobId: 2, id: 5 },
+      { type: 'cancelFile', jobId: 3, id: 4 },
+    ]);
+  });
+
   it('passes events to the listeners until they unsubscribe', async () => {
     const { client, workers } = setup();
     const heard: CoreEvent[] = [];
@@ -566,6 +675,30 @@ describe('the WASM core', () => {
     converse(alice, bob, 14);
     expect(events(bob.out).filter((event) => event.kind === 'hello')).toEqual([{ kind: 'hello', name: 'Alice', station: 100 }]);
     expect(events(alice.out).filter((event) => event.kind === 'hello')).toEqual([{ kind: 'hello', name: 'Боб', station: 200 }]);
+  });
+
+  it('carries a file from one session to another once it is accepted', async () => {
+    const [alice, bob] = [await realSession('Alice', 100), await realSession('Bob', 200)];
+    const bytes = Uint8Array.from({ length: 700 }, (_, index) => (index * 31) % 256);
+    await alice.handle({ type: 'sendFile', jobId: 3, name: 'байты.bin', bytes });
+    // 700 bytes in the slowest mode, which is where a station starts
+    expect(alice.out.at(-1)).toEqual({ type: 'fileQueued', jobId: 3, id: 1, seconds: 157 });
+    converse(alice, bob, 9);
+    expect(events(bob.out).filter((event) => event.kind === 'fileOffer')).toEqual([
+      { kind: 'fileOffer', id: 1, name: 'байты.bin', size: 700, station: 100 },
+    ]);
+    await bob.handle({ type: 'acceptFile', jobId: 4, id: 1 });
+    converse(alice, bob, 45);
+
+    const files = (side: RealSession) => events(side.out).filter((event) => event.kind.startsWith('file'));
+    expect(files(bob).at(-1)).toEqual({ kind: 'fileReceived', id: 1, name: 'байты.bin', bytes });
+    expect(files(alice)).toEqual([
+      { kind: 'fileProgress', id: 1, done: 0, secondsLeft: null },
+      // the speed climbs with every frame: the time left shrinks faster than the clock runs
+      { kind: 'fileProgress', id: 1, done: 121, secondsLeft: expect.any(Number) },
+      { kind: 'fileProgress', id: 1, done: 369, secondsLeft: expect.any(Number) },
+      { kind: 'fileDelivered', id: 1 },
+    ]);
   });
 
   it('refuses texts the core cannot send', async () => {

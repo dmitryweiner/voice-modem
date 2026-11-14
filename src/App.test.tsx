@@ -34,6 +34,9 @@ function fakeCore(overrides: Partial<CoreClient> = {}) {
     started: [] as [number, MessagePort, StationOptions][],
     sent: [] as string[],
     cancelled: [] as number[],
+    files: [] as [string, Uint8Array][],
+    accepted: [] as number[],
+    givenUp: [] as number[],
     stopped: 0,
     hello: 0,
     ptt: 0,
@@ -47,6 +50,18 @@ function fakeCore(overrides: Partial<CoreClient> = {}) {
     sendText(message) {
       calls.sent.push(message);
       return Promise.resolve({ id: calls.sent.length });
+    },
+    sendFile(name, bytes) {
+      calls.files.push([name, bytes]);
+      return Promise.resolve({ id: calls.files.length, seconds: 40 });
+    },
+    acceptFile(id) {
+      calls.accepted.push(id);
+      return Promise.resolve();
+    },
+    cancelFile(id) {
+      calls.givenUp.push(id);
+      return Promise.resolve();
     },
     hello() {
       calls.hello++;
@@ -101,7 +116,15 @@ interface Setup {
 async function start({ storage = new MemoryStorage(), languages = ['en-US'], core = fakeCore(), audio = fakeAudio() }: Setup = {}) {
   // oxlint-disable-next-line typescript/require-await -- async `act` flushes the promise of the core
   await act(async () => {
-    render(<App storage={storage} languages={languages} core={core.client} startAudio={audio.startAudio} />);
+    render(
+      <App
+        storage={storage}
+        languages={languages}
+        core={core.client}
+        startAudio={audio.startAudio}
+        fileUrl={(bytes) => `blob:${bytes.length}:${bytes[0]}`}
+      />,
+    );
   });
   return { storage, core, audio };
 }
@@ -302,7 +325,7 @@ const received = (message: string, snrDb = 3): CoreEvent => ({ kind: 'message', 
 describe('messages', () => {
   it('shows a received text with its quality', async () => {
     const { core } = await listening();
-    expect(text('.empty')).toBe('Nothing yet. Texts sent and received appear here.');
+    expect(text('.empty')).toBe('Nothing yet. Texts and files sent and received appear here.');
     core.emit(received('Привет!', 11.6));
     expect(text('#feed .received .text')).toBe('Привет!');
     expect(text('#feed .received small')).toBe('Received · signal +12 dB to noise');
@@ -431,7 +454,7 @@ describe('messages', () => {
     await send('two');
     await press(() => $('#clear', HTMLButtonElement).click());
     expect(exists('#feed')).toBe(false);
-    expect(text('.feed-box .empty')).toBe('Nothing yet. Texts sent and received appear here.');
+    expect(text('.feed-box .empty')).toBe('Nothing yet. Texts and files sent and received appear here.');
     // what was on its way still reports, to nobody
     core.emit({ kind: 'delivered', id: 1 });
     core.emit(received('three'));
@@ -495,6 +518,162 @@ describe('messages', () => {
 });
 
 const typeName = (name: string) => fireEvent.change($('#name', HTMLInputElement), { target: { value: name } });
+
+/** Picks a file in the file input, as the dialog of the browser would. */
+async function choose(name: string, bytes: Uint8Array<ArrayBuffer>) {
+  await press(() => fireEvent.change($('#file', HTMLInputElement), { target: { files: [new File([bytes], name)] } }));
+  // reading the file takes one more turn
+  await press(() => {});
+}
+
+const offer: CoreEvent = { kind: 'fileOffer', id: 7, name: 'photo.jpg', size: 1536, station: 9 };
+
+describe('files', () => {
+  it('offers a chosen file and follows it to delivery', async () => {
+    const { core } = await listening();
+    const bytes = new Uint8Array(2048).fill(7);
+    await choose('notes.txt', bytes);
+    expect(core.calls.files).toEqual([['notes.txt', bytes]]);
+    expect(text('#feed .file.sent .text')).toBe('notes.txt');
+    expect(text('#feed .file small')).toBe('2.0 KB · Waiting for the other side to accept…');
+    expect($('#feed .file', HTMLElement).dataset.status).toBe('offered');
+    expect(exists('#feed progress')).toBe(false);
+
+    core.emit({ kind: 'fileProgress', id: 1, done: 0, secondsLeft: null });
+    expect(text('#feed .file small')).toBe('2.0 KB · Sending… 0%');
+    core.emit({ kind: 'fileProgress', id: 1, done: 512, secondsLeft: 75 });
+    expect(text('#feed .file small')).toBe('2.0 KB · Sending… 25% · about 75 s left');
+    const bar = $('#feed progress', HTMLProgressElement);
+    expect([bar.value, bar.max]).toEqual([512, 2048]);
+    core.emit({ kind: 'fileProgress', id: 1, done: 1024, secondsLeft: 150 });
+    expect(text('#feed .file small')).toBe('2.0 KB · Sending… 50% · about 3 min left');
+
+    core.emit({ kind: 'fileDelivered', id: 1 });
+    expect(text('#feed .file small')).toBe('2.0 KB · Delivered');
+    expect(exists('#feed progress')).toBe(false);
+    expect(exists('#feed .cancel')).toBe(false);
+  });
+
+  it('says how long a file takes when that is more than ten minutes', async () => {
+    const core = fakeCore({ sendFile: () => Promise.resolve({ id: 1, seconds: 1500 }) });
+    await listening({ core });
+    await choose('big.bin', new Uint8Array(3_000_000));
+    expect(text('#feed .file small')).toBe('2.9 MB · Waiting for the other side to accept… · about 25 min at the current speed');
+  });
+
+  it('shows an offered file, accepts it and gives what arrives to save', async () => {
+    const { core } = await listening();
+    core.emit(offer);
+    expect(text('#feed .file.received .text')).toBe('photo.jpg');
+    expect(text('#feed .file small')).toBe('1.5 KB · Wants to send you this file');
+    expect($('#feed .accept', HTMLButtonElement).getAttribute('aria-label')).toBe('Accept');
+    expect($('#feed .cancel', HTMLButtonElement).getAttribute('aria-label')).toBe('Decline');
+
+    await press(() => $('#feed .accept', HTMLButtonElement).click());
+    expect(core.calls.accepted).toEqual([7]);
+    expect(text('#feed .file small')).toBe('1.5 KB · Receiving… 0%');
+    expect(exists('#feed .accept')).toBe(false);
+    expect($('#feed .cancel', HTMLButtonElement).getAttribute('aria-label')).toBe('Cancel');
+    core.emit({ kind: 'fileProgress', id: 7, done: 1000, secondsLeft: 4 });
+    expect(text('#feed .file small')).toBe('1.5 KB · Receiving… 65% · about 4 s left');
+
+    core.emit({ kind: 'fileReceived', id: 7, name: 'photo.jpg', bytes: new Uint8Array(1536).fill(5) });
+    expect(text('#feed .file small')).toBe('1.5 KB · Received');
+    const save = $('#feed .save', HTMLAnchorElement);
+    expect([save.textContent, save.getAttribute('href'), save.download]).toEqual(['Save', 'blob:1536:5', 'photo.jpg']);
+    expect(exists('#feed .cancel')).toBe(false);
+  });
+
+  it('declines an offered file', async () => {
+    const { core } = await listening();
+    core.emit(offer);
+    await press(() => $('#feed .cancel', HTMLButtonElement).click());
+    expect(core.calls.givenUp).toEqual([7]);
+    expect(text('#feed .file small')).toBe('1.5 KB · Cancelled');
+    expect(exists('#feed button')).toBe(false);
+  });
+
+  it('gives up a file on its way, and offers it again at a press', async () => {
+    const { core } = await listening();
+    const bytes = new Uint8Array([1, 2, 3]);
+    await choose('notes.txt', bytes);
+    core.emit({ kind: 'fileProgress', id: 1, done: 1, secondsLeft: 9 });
+    await press(() => $('#feed .cancel', HTMLButtonElement).click());
+    expect(core.calls.givenUp).toEqual([1]);
+    expect(text('#feed .file small')).toBe('3 bytes · Cancelled');
+    // a chunk acknowledged meanwhile changes nothing
+    core.emit({ kind: 'fileProgress', id: 1, done: 2, secondsLeft: 5 });
+    expect(text('#feed .file small')).toBe('3 bytes · Cancelled');
+
+    await press(() => $('#feed .resend', HTMLButtonElement).click());
+    expect(core.calls.files).toEqual([
+      ['notes.txt', bytes],
+      ['notes.txt', bytes],
+    ]);
+    expect(document.querySelectorAll('#feed .file')).toHaveLength(1);
+    expect(text('#feed .file small')).toBe('3 bytes · Waiting for the other side to accept…');
+  });
+
+  it('says what went wrong with a file sent', async () => {
+    const { core } = await listening();
+    await choose('one', new Uint8Array(1));
+    await choose('two', new Uint8Array(1));
+    core.emit({ kind: 'fileRefused', id: 1 });
+    core.emit({ kind: 'fileFailed', id: 2 });
+    const notes = [...document.querySelectorAll('#feed .file small')].map((note) => note.textContent);
+    expect(notes).toEqual(['1 byte · Refused by the other side', '1 byte · Not delivered: no answer']);
+    expect(document.querySelectorAll('#feed .resend')).toHaveLength(2);
+  });
+
+  it('says what went wrong with a file being received', async () => {
+    const { core } = await listening();
+    core.emit(offer);
+    core.emit({ ...offer, id: 8 });
+    await press(() => $('#feed .accept', HTMLButtonElement).click());
+    core.emit({ kind: 'fileFailed', id: 7 });
+    core.emit({ kind: 'fileRefused', id: 8 });
+    const notes = [...document.querySelectorAll('#feed .file small')].map((note) => note.textContent);
+    expect(notes).toEqual(['1.5 KB · Not received', '1.5 KB · Cancelled by the sender']);
+    expect(exists('#feed button')).toBe(false);
+  });
+
+  it('says when the file was not offered', async () => {
+    const core = fakeCore({ sendFile: () => Promise.reject(new Error('no')) });
+    await listening({ core });
+    await choose('notes.txt', new Uint8Array(1));
+    expect(text('#send-failed')).toBe('The file was not sent.');
+    expect(exists('#feed')).toBe(false);
+  });
+
+  it('keeps a file that arrives after the messages were cleared', async () => {
+    const { core } = await listening();
+    core.emit(offer);
+    await press(() => $('#feed .accept', HTMLButtonElement).click());
+    await press(() => $('#clear', HTMLButtonElement).click());
+    core.emit({ kind: 'fileReceived', id: 7, name: 'photo.jpg', bytes: new Uint8Array([4]) });
+    expect(text('#feed .file small')).toBe('1 byte · Received');
+    expect($('#feed .save', HTMLAnchorElement).getAttribute('href')).toBe('blob:1:4');
+  });
+
+  it('does not take the files of a restarted modem for the old ones with the same numbers', async () => {
+    const { core } = await listening();
+    await choose('old.txt', new Uint8Array(1));
+    await send('old');
+    await press(() => $('#mic', HTMLButtonElement).click());
+    expect(text('#feed .file small')).toBe('1 byte · Not delivered: no answer');
+    await press(() => $('#mic', HTMLButtonElement).click());
+    // the new modem counts from one again
+    core.emit({ kind: 'fileDelivered', id: 1 });
+    core.emit({ kind: 'delivered', id: 1 });
+    expect(text('#feed .file small')).toBe('1 byte · Not delivered: no answer');
+    expect(text('#feed .sent:not(.file) small')).toBe('Not delivered: no answer');
+  });
+
+  it('has nothing to attach while the microphone is off', async () => {
+    await start();
+    expect(exists('#file')).toBe(false);
+  });
+});
 
 describe('station', () => {
   it('remembers the name and the kind of radio, and gives them to the modem', async () => {
