@@ -8,7 +8,8 @@ as sound in the voice band; speed and modulation adapt to the channel.
 No server: a static, offline-capable web app (PWA). The signal-processing core
 is written in Rust and runs in the browser as WebAssembly inside a Web Worker.
 
-**Status: stage 4 of 7 done, stage 5 under way.** Two devices exchange texts and files through the air: open
+**Status: stage 5 of 7 done.** Two devices exchange texts and files through
+the air: open
 [the app](https://dmitryweiner.github.io/voice-modem/) on both, next to each
 other, turn on the microphone and write. Every text is acknowledged by the
 other side and repeated until it is, up to five times; the sender sees
@@ -20,7 +21,9 @@ off goes on from where it stopped when the file is sent again. Texts go
 packed (a Russian one in about 40% of its bytes), files deflated when that
 helps. A one-way station (a radio that only transmits, a recording) sends
 texts once and broadcasts files in a fountain code: whoever listens collects
-any of the symbols, as many as the file has pieces.
+any of the symbols, as many as the file has pieces. With a password shared
+by the stations everything they send goes sealed (Argon2id and
+ChaCha20-Poly1305): others hear only that the channel is busy.
 
 Seven modes from 62.5 to 4200 bit/s, chosen by the modem itself from how well
 the other side hears it: tones for noise, distance and phone codecs, and
@@ -42,6 +45,10 @@ cargo run --release -p modem-cli -- decode noisy.wav
 # a file broadcast into a recording, and collected from it
 cargo run --release -p modem-cli -- encode --file photo.jpg --times 2 --mode f1 -o photo.wav
 cargo run --release -p modem-cli -- decode photo.wav --save received/
+
+# sealed: only the password opens it
+cargo run --release -p modem-cli -- encode "Meet at the bridge" --password s3cret -o sealed.wav
+cargo run --release -p modem-cli -- decode sealed.wav --password s3cret
 ```
 
 ## Development

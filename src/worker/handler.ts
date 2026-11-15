@@ -42,6 +42,7 @@ export interface CoreModemEvent {
   secondsLeft: number;
   symbols: number;
   needed: number;
+  sealed: boolean;
   free?: () => void;
 }
 
@@ -51,6 +52,8 @@ export interface ModemOptions extends StationOptions {
   station: number;
   /** Seed of the random waits of the link layer, 32 bits. */
   seed: number;
+  /** Eight random bytes for the nonces of the seal. */
+  entropy: Uint8Array;
 }
 
 /** The part of the WASM core the worker uses; tests replace it. */
@@ -62,14 +65,16 @@ export interface Core {
 }
 
 function toEvent(event: CoreModemEvent): CoreEvent | null {
-  const { kind, text, id, attempt, mode, bitRate, station, snrDb, freqOffsetHz } = event;
+  const { kind, text, id, attempt, mode, bitRate, station, snrDb, freqOffsetHz, sealed } = event;
   // Each read of `bytes` copies the file out of the WASM memory: only when it is one.
   const bytes = kind === 'fileReceived' ? event.bytes : null;
   const { size, done, secondsLeft, symbols, needed } = event;
   event.free?.();
   switch (kind) {
     case 'message':
-      return { kind, text, station, snrDb, freqOffsetHz };
+      return { kind, text, station, snrDb, freqOffsetHz, sealed };
+    case 'unopened':
+      return { kind, station, snrDb, freqOffsetHz };
     case 'hello':
       return { kind, name: text, station };
     case 'delivered':
@@ -165,16 +170,19 @@ export function createSession(
         return { type: 'version', jobId, version: loaded.version() };
       case 'start': {
         stop();
-        const { name, manualPtt, oneWay, mode } = message;
+        const { name, manualPtt, oneWay, password, mode } = message;
         // An address of zero is as good as any other; the seed must not be zero for some generators.
         modem = loaded.createModem({
           sampleRate: message.sampleRate,
           name,
           manualPtt,
           oneWay,
+          password,
           mode,
           station: random() & 0xffff,
           seed: random() | 1,
+          // most significant byte first
+          entropy: Uint8Array.from([random(), random()].flatMap((n) => [n >>> 24, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff])),
         });
         sampleRate = message.sampleRate;
         audio = message.port;

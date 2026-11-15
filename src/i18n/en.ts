@@ -17,6 +17,13 @@ export const en = {
   speedAuto: 'Speed: by the channel',
   pttHint: 'A radio with a push-to-talk button that I press myself',
   oneWayLabel: 'One-way',
+  passwordLabel: 'Password',
+  passwordHint:
+    'Texts and files go sealed: only stations with the same password read them. Not saved: type it again after the page is reloaded.',
+  passwordWarning: 'Encryption is forbidden on amateur radio bands.',
+  sealing: 'Sealed with the password',
+  sealed: 'sealed',
+  unopened: 'A sealed message did not open: is the password the same?',
   oneWayHint:
     'Nothing comes back: texts go once, files go as a stream for anyone listening (a radio that only transmits, a recording). Choose the speed: by the channel is the slowest, with no answers to judge by.',
   micOn: 'Turn the microphone on',

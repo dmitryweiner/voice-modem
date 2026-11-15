@@ -8,6 +8,7 @@ use std::fs;
 use modem_core::files::{FileEvent, Files};
 use modem_core::link::{Heard, Link, LinkConfig, LinkEvent};
 use modem_core::rx::seconds;
+use modem_core::seal::Seal;
 use modem_core::{
     CommandError, Config, Event, Mode, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig,
     VERSION,
@@ -19,6 +20,7 @@ modem-cli — the Voice Modem core from the command line
 
   modem-cli encode [<text>...] [--file PATH [--times X]] -o out.wav
                    [--mode r1..r4|f1..f3] [--lead-in MS] [--amplitude 0..1] [--pause S]
+                   [--password P]
       The texts (up to 1000 bytes of UTF-8 each) as one-way frames, sent once
       and not acknowledged, into a 16 kHz WAV file, with S seconds of silence
       at the end. A file is broadcast after them: its pieces (deflated when
@@ -26,12 +28,13 @@ modem-cli — the Voice Modem core from the command line
       all (1.5 by default); a listener needs about as many as there are
       pieces, whichever. The mode: r1 (62.5 bit/s, the default) to r4
       (500 bit/s) are tones; f1 to f3 (1400, 2800 and 4200 bit/s) are carriers.
+      With a password everything is sealed: only it opens the recording.
 
-  modem-cli decode in.wav [--save DIR]
+  modem-cli decode in.wav [--save DIR] [--password P]
       Prints every message heard in a 16 kHz WAV file with the time, the
       signal-to-noise ratio (8 kHz band) and the frequency offset, and every
       file collected; with --save the files go into DIR under their names.
-      Fails when there is nothing.
+      With a password sealed messages are opened. Fails when there is nothing.
 
   modem-cli channel in.wav -o out.wav [--telephone] [--shift HZ] [--ppm N]
                                       [--clip LEVEL] [--snr DB] [--seed N]
@@ -49,6 +52,8 @@ pub enum Cli {
         /// A file to broadcast after the texts, and how many times its pieces to send.
         file: Option<String>,
         times: f32,
+        /// Seals everything with this password.
+        password: Option<String>,
         output: String,
         lead_in_ms: u32,
         pause_s: f32,
@@ -59,6 +64,8 @@ pub enum Cli {
         input: String,
         /// Where to write the files collected.
         save: Option<String>,
+        /// Opens sealed messages with this password.
+        password: Option<String>,
     },
     Channel {
         input: String,
@@ -104,6 +111,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
 
     let mut positional = Vec::new();
     let (mut output, mut file, mut times, mut save) = (None, None, 1.5f32, None);
+    let mut password = None;
     let (mut lead_in_ms, mut amplitude, mut pause_s) = (0, TxConfig::default().amplitude, 0.0);
     let mut mode = Mode::R1;
     let (mut telephone, mut shift_hz, mut ppm, mut clip, mut snr_db, mut seed) =
@@ -115,6 +123,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 &["encode"]
             }
             "--save" => &["decode"],
+            "--password" => &["encode", "decode"],
             "--telephone" | "--shift" | "--ppm" | "--clip" | "--snr" | "--seed" => &["channel"],
             // A text may not start with "--"; a negative number is the value of an option.
             option if option.starts_with("--") => return Err(format!("unknown option {option}")),
@@ -132,6 +141,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "--file" => file = Some(value::<String>(&arg, &mut args)?),
             "--times" => times = value(&arg, &mut args)?,
             "--save" => save = Some(value::<String>(&arg, &mut args)?),
+            "--password" => password = Some(value::<String>(&arg, &mut args)?),
             "--pause" => pause_s = value(&arg, &mut args)?,
             "--mode" => {
                 let name: String = value(&arg, &mut args)?;
@@ -170,6 +180,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 texts: positional,
                 file,
                 times,
+                password,
                 output: output?,
                 lead_in_ms,
                 pause_s,
@@ -180,6 +191,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         "decode" => Cli::Decode {
             input: one("input file", positional)?,
             save,
+            password,
         },
         _ => Cli::Channel {
             input: one("input file", positional)?,
@@ -211,13 +223,24 @@ pub struct Transmitted {
 
 /// The samples of the given texts, sent one way: nothing is expected back.
 pub fn encode(texts: &[String], tx: TxConfig, mode: Mode) -> Result<Vec<f32>, String> {
-    transmit(texts, None, tx, mode).map(|transmitted| transmitted.samples)
+    transmit(texts, None, None, tx, mode).map(|transmitted| transmitted.samples)
 }
 
-/// The samples of the given texts and then of a file broadcast, sent one way.
+/// Different in every run, for the nonces of the seal: the clock to the
+/// nanosecond and the process.
+fn entropy() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 32)
+}
+
+/// The samples of the given texts and then of a file broadcast, sent one
+/// way, sealed with the password if there is one.
 pub fn transmit(
     texts: &[String],
     file: Option<FileToSend>,
+    password: Option<&str>,
     tx: TxConfig,
     mode: Mode,
 ) -> Result<Transmitted, String> {
@@ -225,6 +248,8 @@ pub fn transmit(
         tx,
         reliable: false,
         mode: Some(mode),
+        password: password.unwrap_or_default().to_owned(),
+        entropy: entropy(),
         ..Config::default()
     };
     let mut modem = Modem::new(config).map_err(|e| format!("{e:?}"))?;
@@ -298,6 +323,11 @@ pub fn file_name(name: &str) -> String {
 
 /// What is heard in the samples: the messages and the files broadcast.
 pub fn decode(samples: &[f32]) -> Decoded {
+    decode_with(samples, None)
+}
+
+/// What is heard in the samples, sealed messages opened with the password.
+pub fn decode_with(samples: &[f32], password: Option<&str>) -> Decoded {
     // Only listens: the link layer puts the segments together and is never asked to answer.
     let mut receiver = Receiver::new();
     let mut link = Link::new(
@@ -311,6 +341,9 @@ pub fn decode(samples: &[f32]) -> Decoded {
         },
         0,
     );
+    if let Some(password) = password {
+        link.set_seal(Seal::new(password, 0));
+    }
     let mut files = Files::new();
     receiver.push(samples);
     let (mut report, mut messages, mut collected) = (String::new(), 0, Vec::new());
@@ -342,9 +375,16 @@ pub fn decode(samples: &[f32]) -> Decoded {
                 link.on_frame(&frame, heard, stats.start);
                 while let Some(event) = link.poll_event() {
                     match event {
-                        LinkEvent::Text { text, .. } => {
+                        LinkEvent::Text { text, sealed, .. } => {
                             messages += 1;
-                            line(stats, &text);
+                            if sealed {
+                                line(stats, &format!("{text} (sealed)"));
+                            } else {
+                                line(stats, &text);
+                            }
+                        }
+                        LinkEvent::Unopened { .. } => {
+                            line(stats, "(sealed: the password does not open it)");
                         }
                         LinkEvent::File { from, bytes } => {
                             files.on_message(from, &bytes, stats.start)
@@ -396,6 +436,7 @@ pub fn run(cli: Cli) -> Result<String, String> {
             texts,
             file,
             times,
+            password,
             output,
             lead_in_ms,
             amplitude,
@@ -418,7 +459,7 @@ pub fn run(cli: Cli) -> Result<String, String> {
             let Transmitted {
                 mut samples,
                 symbols,
-            } = transmit(&texts, file, tx, mode)?;
+            } = transmit(&texts, file, password.as_deref(), tx, mode)?;
             samples.resize(
                 samples.len() + (pause_s.clamp(0.0, 3600.0) * SAMPLE_RATE as f32) as usize,
                 0.0,
@@ -436,12 +477,16 @@ pub fn run(cli: Cli) -> Result<String, String> {
                 seconds(samples.len())
             ))
         }
-        Cli::Decode { input, save } => {
+        Cli::Decode {
+            input,
+            save,
+            password,
+        } => {
             let Decoded {
                 mut report,
                 messages,
                 files,
-            } = decode(&read(&input)?);
+            } = decode_with(&read(&input)?, password.as_deref());
             if messages == 0 && files.is_empty() {
                 return Err(format!("{report}{input}: no messages"));
             }
@@ -525,6 +570,7 @@ mod tests {
                 texts: vec!["hello there".into(), "second".into()],
                 file: None,
                 times: 1.5,
+                password: None,
                 output: "a.wav".into(),
                 lead_in_ms: 300,
                 pause_s: 0.0,
@@ -538,6 +584,7 @@ mod tests {
                 texts: vec![],
                 file: Some("photo.jpg".into()),
                 times: 3.0,
+                password: None,
                 output: "a.wav".into(),
                 lead_in_ms: 0,
                 pause_s: 0.0,
@@ -553,14 +600,16 @@ mod tests {
             parse(args("decode in.wav")),
             Ok(Cli::Decode {
                 input: "in.wav".into(),
-                save: None
+                save: None,
+                password: None
             })
         );
         assert_eq!(
-            parse(args("decode in.wav --save files")),
+            parse(args("decode in.wav --save files --password s3cret")),
             Ok(Cli::Decode {
                 input: "in.wav".into(),
-                save: Some("files".into())
+                save: Some("files".into()),
+                password: Some("s3cret".into())
             })
         );
         assert_eq!(
@@ -699,12 +748,41 @@ mod tests {
             times: 1.0,
         };
         let Transmitted { samples, symbols } =
-            transmit(&[], Some(file), TxConfig::default(), Mode::R3).unwrap();
+            transmit(&[], Some(file), None, TxConfig::default(), Mode::R3).unwrap();
         assert_eq!(symbols, Some((1, 1)));
         assert_eq!(
             decode(&samples).files,
             [("a.bin".to_string(), vec![7; 100])]
         );
+    }
+
+    #[test]
+    fn a_recording_sealed_by_a_password_opens_only_with_it() {
+        let path = temp("sealed.wav");
+        run(parse(args(&format!(
+            "encode meet-at-the-bridge --password s3cret -o {path}"
+        )))
+        .unwrap())
+        .unwrap();
+        let without = run(parse(args(&format!("decode {path}"))).unwrap()).unwrap_err();
+        assert!(
+            without.contains("(sealed: the password does not open it)"),
+            "{without}"
+        );
+        assert!(!without.contains("meet"), "{without}");
+        let wrong =
+            run(parse(args(&format!("decode {path} --password other"))).unwrap()).unwrap_err();
+        assert!(
+            wrong.contains("(sealed: the password does not open it)"),
+            "{wrong}"
+        );
+        let report =
+            run(parse(args(&format!("decode {path} --password s3cret"))).unwrap()).unwrap();
+        assert!(
+            report.ends_with("  meet-at-the-bridge (sealed)\n"),
+            "{report}"
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -723,6 +801,7 @@ mod tests {
             texts,
             file: None,
             times: 1.5,
+            password: None,
             output: clean.clone(),
             lead_in_ms: 200,
             pause_s: 0.0,
@@ -747,6 +826,7 @@ mod tests {
         let report = run(Cli::Decode {
             input: noisy.clone(),
             save: None,
+            password: None,
         })
         .unwrap();
         let lines: Vec<&str> = report.lines().collect();
@@ -828,7 +908,8 @@ mod tests {
         assert_eq!(
             run(Cli::Decode {
                 input: silent.clone(),
-                save: None
+                save: None,
+                password: None
             }),
             Err(format!("{silent}: no messages"))
         );
@@ -836,7 +917,8 @@ mod tests {
         assert!(
             run(Cli::Decode {
                 input: "/nonexistent/x.wav".into(),
-                save: None
+                save: None,
+                password: None
             })
             .unwrap_err()
             .starts_with("/nonexistent/x.wav: ")

@@ -19,6 +19,7 @@ use crate::frame::{Kind, Mode};
 use crate::link::{GAP, Heard, Link, LinkConfig, LinkEvent, SendError};
 use crate::resample::Resampler;
 use crate::rx::{Receiver, RxEvent, RxStats};
+use crate::seal::Seal;
 use crate::tx::{TxConfig, encode_frame, frame_len};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +43,12 @@ pub struct Config {
     /// The mode of every data frame, or None to adapt: start with the
     /// slowest and follow the advice of the other station.
     pub mode: Option<Mode>,
+    /// Texts and files go sealed with this password, and sealed ones are
+    /// opened with it; empty: none.
+    pub password: String,
+    /// Random, for the nonces of the seal: the same password with the same
+    /// entropy twice would use nonces twice.
+    pub entropy: u64,
 }
 
 impl Default for Config {
@@ -55,6 +62,8 @@ impl Default for Config {
             manual_ptt: false,
             seed: 1,
             mode: None,
+            password: String::new(),
+            entropy: 0,
         }
     }
 }
@@ -79,11 +88,16 @@ pub enum CommandError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// `sealed`: it came sealed and opened with the password of this station.
     MessageReceived {
         from: u16,
         text: String,
         stats: RxStats,
+        sealed: bool,
     },
+    /// A sealed message came that this station could not open: it has no
+    /// password, or another one.
+    Unopened { from: u16, stats: RxStats },
     /// A station greeted with its name.
     PeerHello {
         from: u16,
@@ -179,6 +193,8 @@ impl Modem {
             manual_ptt,
             seed,
             mode,
+            password,
+            entropy,
             ..
         } = config;
         let lead_in = u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
@@ -187,22 +203,26 @@ impl Modem {
             missing: 0,
         };
         let ack_len = frame_len(ack, Mode::R1, 0) as u64 + lead_in;
+        let mut link = Link::new(
+            LinkConfig {
+                station,
+                name,
+                reliable,
+                manual_ptt,
+                seed,
+                mode,
+            },
+            ack_len,
+        );
+        if !password.is_empty() {
+            link.set_seal(Seal::new(&password, entropy));
+        }
         Ok(Self {
             tx_config: tx,
             rx_resampler: converts.then(|| Resampler::new(rate, SAMPLE_RATE)),
             tx_resampler: converts.then(|| Resampler::new(SAMPLE_RATE, rate)),
             receiver: Receiver::new(),
-            link: Link::new(
-                LinkConfig {
-                    station,
-                    name,
-                    reliable,
-                    manual_ptt,
-                    seed,
-                    mode,
-                },
-                ack_len,
-            ),
+            link,
             files: Files::new(),
             reliable,
             lead_in,
@@ -470,13 +490,20 @@ impl Modem {
                 continue;
             }
             self.events.push_back(match (event, stats) {
-                (LinkEvent::Text { from, text }, Some(stats)) => {
-                    Event::MessageReceived { from, text, stats }
-                }
+                (LinkEvent::Text { from, text, sealed }, Some(stats)) => Event::MessageReceived {
+                    from,
+                    text,
+                    stats,
+                    sealed,
+                },
+                (LinkEvent::Unopened { from }, Some(stats)) => Event::Unopened { from, stats },
                 (LinkEvent::Hello { from, name, .. }, Some(stats)) => {
                     Event::PeerHello { from, name, stats }
                 }
-                (LinkEvent::Text { .. } | LinkEvent::Hello { .. }, None)
+                (
+                    LinkEvent::Text { .. } | LinkEvent::Hello { .. } | LinkEvent::Unopened { .. },
+                    None,
+                )
                 | (LinkEvent::File { .. }, _) => {
                     unreachable!("only a received frame brings a message, and files took theirs")
                 }
@@ -1195,6 +1222,74 @@ mod tests {
         assert_eq!(
             events(&mut alice).last(),
             Some(&Event::FileDelivered { id: up })
+        );
+    }
+
+    fn with_password(station: u16, password: &str) -> Modem {
+        Modem::new(Config {
+            station,
+            seed: u64::from(station),
+            password: password.into(),
+            entropy: u64::from(station) * 977,
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn stations_with_the_same_password_talk_sealed() {
+        let (mut alice, mut bob) = (with_password(1, "shared"), with_password(2, "shared"));
+        let id = alice.send_text("meet at the bridge").unwrap();
+        run(&mut [&mut alice, &mut bob], 10.0);
+        let at_bob = events(&mut bob);
+        assert!(
+            matches!(&at_bob[..], [Event::MessageReceived { text, sealed: true, .. }] if text == "meet at the bridge"),
+            "{at_bob:?}"
+        );
+        assert_eq!(events(&mut alice), [Event::MessageDelivered { id }]);
+    }
+
+    #[test]
+    fn a_station_without_the_password_hears_only_that_something_was_said() {
+        for mut bob in [modem(2), with_password(2, "another")] {
+            let mut alice = with_password(1, "shared");
+            alice.send_text("meet at the bridge").unwrap();
+            run(&mut [&mut alice, &mut bob], 10.0);
+            let at_bob = events(&mut bob);
+            assert!(
+                matches!(at_bob[..], [Event::Unopened { from: 1, .. }]),
+                "{at_bob:?}"
+            );
+        }
+        // and what goes unsealed is read as before, marked so
+        let (mut alice, mut bob) = (modem(1), with_password(2, "shared"));
+        alice.send_text("in the clear").unwrap();
+        run(&mut [&mut alice, &mut bob], 10.0);
+        assert!(matches!(
+            &events(&mut bob)[..],
+            [Event::MessageReceived { sealed: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_file_goes_sealed_too() {
+        let (mut alice, mut bob) = (with_password(1, "shared"), with_password(2, "shared"));
+        let content = file(500);
+        alice.send_file("secret.bin", content.clone()).unwrap();
+        run(&mut [&mut alice, &mut bob], 10.0);
+        let Some(Event::FileOffered { id, name, .. }) = events(&mut bob).pop() else {
+            panic!("no offer");
+        };
+        assert_eq!(name, "secret.bin");
+        assert!(bob.accept_file(id));
+        run(&mut [&mut alice, &mut bob], 60.0);
+        assert_eq!(
+            events(&mut bob).last(),
+            Some(&Event::FileReceived {
+                id,
+                name: "secret.bin".into(),
+                bytes: content
+            })
         );
     }
 }

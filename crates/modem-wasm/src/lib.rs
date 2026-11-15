@@ -27,7 +27,9 @@ pub fn max_name_bytes() -> usize {
 #[wasm_bindgen(getter_with_clone)]
 #[derive(Default)]
 pub struct ModemEvent {
-    /// "message": a text was received.
+    /// "message": a text was received; `sealed` when it came sealed.
+    /// "unopened": a sealed message came from `station` that the password of
+    /// this station does not open.
     /// "fileOffer": a station offers the file `id` of `size` bytes; `text` is its name.
     /// "fileProgress": `done` bytes of the file `id` are through; `secondsLeft` to go.
     /// "fileReceived": the file `id` arrived whole: `bytes`; `text` is its name.
@@ -60,6 +62,8 @@ pub struct ModemEvent {
     /// Symbols of a broadcast file that went, and how many make the file.
     pub symbols: u32,
     pub needed: u32,
+    /// The message came sealed and opened with the password.
+    pub sealed: bool,
     pub attempt: u8,
     /// 0 is the slowest mode, R1.
     pub mode: u8,
@@ -96,10 +100,20 @@ impl ModemEvent {
 impl From<Event> for ModemEvent {
     fn from(event: Event) -> Self {
         match event {
-            Event::MessageReceived { from, text, stats } => Self {
+            Event::MessageReceived {
+                from,
+                text,
+                stats,
+                sealed,
+            } => Self {
                 text,
                 station: from,
+                sealed,
                 ..Self::heard("message", stats)
+            },
+            Event::Unopened { from, stats } => Self {
+                station: from,
+                ..Self::heard("unopened", stats)
             },
             Event::PeerHello { from, name, stats } => Self {
                 text: name,
@@ -200,7 +214,9 @@ impl From<Event> for ModemEvent {
     }
 }
 
-/// `mode`: the number of the mode of every data frame, or anything else (255) to adapt.
+/// `mode`: the number of the mode of every data frame, or anything else (255)
+/// to adapt. `entropy`: up to eight random bytes for the nonces of the seal.
+#[allow(clippy::too_many_arguments)] // the constructor of JavaScript takes them as they are
 fn new_modem(
     sample_rate: u32,
     station: u16,
@@ -209,7 +225,13 @@ fn new_modem(
     one_way: bool,
     seed: u32,
     mode: u8,
+    password: String,
+    entropy: &[u8],
 ) -> Result<modem_core::Modem, String> {
+    let entropy = entropy
+        .iter()
+        .take(8)
+        .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
     let config = Config {
         sample_rate,
         station,
@@ -218,6 +240,8 @@ fn new_modem(
         reliable: !one_way,
         seed: u64::from(seed),
         mode: Mode::from_id(mode),
+        password,
+        entropy,
         ..Config::default()
     };
     modem_core::Modem::new(config).map_err(|ConfigError::UnsupportedSampleRate(rate)| {
@@ -252,8 +276,11 @@ impl Modem {
     /// With `one_way` nothing is acknowledged or expected back: texts go
     /// once, files are broadcast. `mode` is the number of a mode to use for
     /// every data frame (0 = R1 … 3 = R4, 4 = F1 … 6 = F3), or 255 to adapt
-    /// to the channel (one way: R1).
+    /// to the channel (one way: R1). With a `password` texts and files go
+    /// sealed; `entropy` is eight random bytes for that. The key takes a
+    /// fraction of a second to derive.
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)] // as JavaScript passes them
     pub fn new(
         sample_rate: u32,
         station: u16,
@@ -262,10 +289,22 @@ impl Modem {
         one_way: bool,
         seed: u32,
         mode: u8,
+        password: String,
+        entropy: &[u8],
     ) -> Result<Modem, JsError> {
-        new_modem(sample_rate, station, name, manual_ptt, one_way, seed, mode)
-            .map(Modem)
-            .map_err(|message| JsError::new(&message))
+        new_modem(
+            sample_rate,
+            station,
+            name,
+            manual_ptt,
+            one_way,
+            seed,
+            mode,
+            password,
+            entropy,
+        )
+        .map(Modem)
+        .map_err(|message| JsError::new(&message))
     }
 
     /// Queues a text; its fate is reported in events under the returned id.
@@ -366,6 +405,8 @@ mod tests {
                 false,
                 u32::from(station),
                 255,
+                String::new(),
+                &[],
             )
             .unwrap(),
         )
@@ -397,7 +438,18 @@ mod tests {
     #[test]
     fn errors_are_put_into_words() {
         assert_eq!(
-            new_modem(100, 1, String::new(), false, false, 1, 255).err(),
+            new_modem(
+                100,
+                1,
+                String::new(),
+                false,
+                false,
+                1,
+                255,
+                String::new(),
+                &[]
+            )
+            .err(),
             Some("unsupported sample rate: 100 Hz".to_string())
         );
         let mut modem = modem(1);
@@ -438,7 +490,20 @@ mod tests {
 
     #[test]
     fn a_fixed_mode_is_set_by_its_number() {
-        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, false, 1, 3).unwrap());
+        let mut alice = Modem(
+            new_modem(
+                48_000,
+                1,
+                String::new(),
+                false,
+                false,
+                1,
+                3,
+                String::new(),
+                &[],
+            )
+            .unwrap(),
+        );
         let mut bob = modem(2);
         send_text(&mut alice.0, "at 500 bit/s from the first frame").unwrap();
         run(&mut alice, &mut bob, 5);
@@ -454,7 +519,20 @@ mod tests {
 
     #[test]
     fn the_fast_modes_have_numbers_too() {
-        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, false, 1, 6).unwrap());
+        let mut alice = Modem(
+            new_modem(
+                48_000,
+                1,
+                String::new(),
+                false,
+                false,
+                1,
+                6,
+                String::new(),
+                &[],
+            )
+            .unwrap(),
+        );
         let mut bob = modem(2);
         let long = "at 4200 bit/s from the first frame. ".repeat(25);
         send_text(&mut alice.0, &long).unwrap();
@@ -468,7 +546,20 @@ mod tests {
 
     #[test]
     fn greetings_and_push_to_talk_reach_the_application() {
-        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, false, 1, 255).unwrap());
+        let mut alice = Modem(
+            new_modem(
+                48_000,
+                1,
+                "Alice".into(),
+                true,
+                false,
+                1,
+                255,
+                String::new(),
+                &[],
+            )
+            .unwrap(),
+        );
         let mut bob = modem(2);
         alice.hello();
         run(&mut alice, &mut bob, 1);
@@ -569,8 +660,22 @@ mod tests {
 
     #[test]
     fn a_one_way_modem_broadcasts_its_files() {
-        let one_way =
-            |station| Modem(new_modem(48_000, station, String::new(), false, true, 1, 0).unwrap());
+        let one_way = |station| {
+            Modem(
+                new_modem(
+                    48_000,
+                    station,
+                    String::new(),
+                    false,
+                    true,
+                    1,
+                    0,
+                    String::new(),
+                    &[],
+                )
+                .unwrap(),
+            )
+        };
         let (mut alice, mut bob) = (one_way(1), one_way(2));
         let content: Vec<u8> = (0..100u32).map(|i| ((i * 7919) >> 3) as u8).collect();
         let up = send_file(&mut alice.0, "a.bin", content.clone()).unwrap();
@@ -597,5 +702,47 @@ mod tests {
             .find(|e| e.kind == "fileCast" && e.symbols == 2)
             .unwrap();
         assert_eq!((cast.id, cast.needed), (up, 2));
+    }
+
+    #[test]
+    fn a_password_seals_what_goes_and_says_what_came_sealed() {
+        let sealing = |station, password: &str| {
+            Modem(
+                new_modem(
+                    48_000,
+                    station,
+                    String::new(),
+                    false,
+                    false,
+                    1,
+                    255,
+                    password.into(),
+                    &[station as u8; 8],
+                )
+                .unwrap(),
+            )
+        };
+        let (mut alice, mut bob, mut eve) = (sealing(1, "shared"), sealing(2, "shared"), modem(3));
+        send_text(&mut alice.0, "meet at the bridge").unwrap();
+        // Eve hears what Bob hears
+        let (mut to_bob, mut to_alice) = (vec![0.0; 2048], vec![0.0; 2048]);
+        for _ in 0..8 * 48_000 / 2048 {
+            alice.push_rx(&to_alice);
+            bob.push_rx(&to_bob);
+            eve.push_rx(&to_bob);
+            to_bob = alice.pull_tx(2048);
+            to_alice = bob.pull_tx(2048);
+            eve.pull_tx(2048);
+        }
+        let at_bob = bob.poll_event().unwrap();
+        assert_eq!(
+            (at_bob.kind.as_str(), at_bob.text.as_str(), at_bob.sealed),
+            ("message", "meet at the bridge", true)
+        );
+        let at_eve = eve.poll_event().unwrap();
+        assert_eq!(
+            (at_eve.kind.as_str(), at_eve.station, at_eve.text.as_str()),
+            ("unopened", 1, "")
+        );
     }
 }

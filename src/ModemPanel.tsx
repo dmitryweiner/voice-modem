@@ -22,7 +22,7 @@ export interface ModemPanelProps {
 type Link =
   | { status: 'off' }
   | { status: 'starting' }
-  | { status: 'on'; session: AudioSession; maxTextBytes: number; manualPtt: boolean; oneWay: boolean }
+  | { status: 'on'; session: AudioSession; maxTextBytes: number; manualPtt: boolean; oneWay: boolean; sealed: boolean }
   | { status: 'error'; kind: AudioErrorKind };
 
 /**
@@ -33,7 +33,8 @@ type Link =
 type FileStatus = 'offered' | 'moving' | 'done' | 'failed' | 'refused' | 'cancelled';
 
 type Item =
-  | { key: number; kind: 'received'; text: string; snrDb: number }
+  /** `sealed`: it came sealed and opened with the password. */
+  | { key: number; kind: 'received'; text: string; snrDb: number; sealed: boolean }
   /**
    * `id` is the modem's, and `run` tells which modem: each one started counts
    * from one again. `attempt` grows with every repeat.
@@ -68,7 +69,9 @@ type Item =
       url?: string;
     }
   | { key: number; kind: 'peer'; name: string }
-  | { key: number; kind: 'lost' };
+  | { key: number; kind: 'lost' }
+  /** A sealed message that the password did not open. */
+  | { key: number; kind: 'unopened' };
 
 /** A file that takes longer than this is offered with a warning, seconds. */
 const SLOW_FILE = 600;
@@ -209,10 +212,11 @@ interface FeedItemProps {
 
 function FeedItem({ t, item, onResend, onCancel }: FeedItemProps) {
   if (item.kind === 'lost') return <li className="note">{t.frameLost}</li>;
+  if (item.kind === 'unopened') return <li className="note">{t.unopened}</li>;
   if (item.kind === 'peer') return <li className="note peer">{item.name === '' ? t.peerAnonymous : t.peerNamed(item.name)}</li>;
   let note: string;
   if (item.kind === 'received') {
-    note = `${t.received} · ${t.snr(item.snrDb)}`;
+    note = [t.received, ...(item.sealed ? [t.sealed] : []), t.snr(item.snrDb)].join(' · ');
   } else {
     const status = { sending: t.sending, sent: t.sent, delivered: t.delivered, failed: t.notDelivered, cancelled: t.cancelled }[
       item.status
@@ -318,7 +322,10 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
           updateFile(event.id, { status: 'refused' });
           break;
         case 'message':
-          add({ key, kind: 'received', text: event.text, snrDb: event.snrDb });
+          add({ key, kind: 'received', text: event.text, snrDb: event.snrDb, sealed: event.sealed });
+          break;
+        case 'unopened':
+          add({ key, kind: 'unopened' });
           break;
         case 'hello':
           add({ key, kind: 'peer', name: event.name });
@@ -387,7 +394,14 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
       running.current = session;
       run.current++;
       setBitRate(MODE_BIT_RATES[station.mode ?? 0] ?? MODE_BIT_RATES[0]);
-      setLink({ status: 'on', session, maxTextBytes, manualPtt: station.manualPtt, oneWay: station.oneWay });
+      setLink({
+        status: 'on',
+        session,
+        maxTextBytes,
+        manualPtt: station.manualPtt,
+        oneWay: station.oneWay,
+        sealed: station.password !== '',
+      });
     } catch (error) {
       session?.stop();
       // The audio device started but the modem did not: not the browser's fault.
@@ -549,6 +563,21 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
           />
           {t.oneWayLabel}
         </label>
+        <input
+          id="password"
+          type="password"
+          autoComplete="off"
+          aria-label={t.passwordLabel}
+          placeholder={t.passwordLabel}
+          title={t.passwordHint}
+          value={station.password}
+          onChange={(event) => onStationChange({ ...station, password: event.target.value })}
+        />
+        {station.password !== '' && (
+          <p id="password-warning" className="warning">
+            {t.passwordWarning}
+          </p>
+        )}
         <select
           id="mode"
           aria-label={t.speedLabel}
@@ -572,6 +601,7 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
                 {stateText()}
               </span>
               <small id="speed">{t.bitRate(bitRate)}</small>
+              {link.sealed && <small id="sealing">{t.sealing}</small>}
             </div>
             <button id="hello" type="button" className="secondary" onClick={() => void core.hello().catch(() => {})}>
               {t.hello}

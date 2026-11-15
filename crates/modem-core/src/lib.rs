@@ -21,6 +21,7 @@ pub mod modem;
 pub mod ofdm;
 pub mod resample;
 pub mod rx;
+pub mod seal;
 pub mod sync;
 pub mod text;
 pub mod tx;

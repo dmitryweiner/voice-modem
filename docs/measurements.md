@@ -185,7 +185,8 @@ to):
   is 2 s of data in 5.8 s of exchange.
 - That is the room for several frames per acknowledgement, which the plan
   postponed twice: in F3 it would bring up to three times the speed, in the
-  robust modes a third to a half more.
+  robust modes a third to a half more. (Done as several blocks per frame:
+  twice the speed in F3, see below.)
 - A file through noise, with the link broken for 100 s in the middle and the
   transfer going on from where it stopped: `tests/link.rs` in `modem-sim`.
 
@@ -278,6 +279,21 @@ channel needs — and the largest file a broadcast takes (256 pieces):
   interference that takes some four frames in ten arrives whole.
 
 Not measured: a broadcast between real devices.
+
+## Sealed messages (2026-11-15)
+
+- The key of a password (Argon2id, 64 MiB, 3 passes) takes 110–120 ms as
+  WebAssembly in Node on an M-series Mac, once, when the microphone is
+  turned on; a phone needs several times that. With the cost OWASP names as
+  the least (19 MiB, 2 passes) it was 20–25 ms: cheap enough to spend more.
+- A sealed message is 29 bytes longer: the type, the nonce, the tag. A
+  packed Russian text of up to some 50 characters (34 packed bytes) still
+  goes in one frame of R1, where 95 did unsealed. A frame of R1 carries 28
+  bytes of a file instead of 57, a symbol of a broadcast 30 instead of 59
+  (the largest broadcast in R1: 7.7 KB instead of 15); a frame of F3
+  carries 4056 bytes instead of 4085.
+
+Not measured: a phone deriving the key.
 
 ## Mode R1 through speech codecs (2026-11-10)
 

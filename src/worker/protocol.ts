@@ -6,7 +6,10 @@
 
 /** Something the modem tells the application. */
 export type CoreEvent =
-  | { kind: 'message'; text: string; station: number; snrDb: number; freqOffsetHz: number }
+  /** A text; `sealed` when it came sealed and opened with the password. */
+  | { kind: 'message'; text: string; station: number; snrDb: number; freqOffsetHz: number; sealed: boolean }
+  /** A sealed message came that the password of this station does not open. */
+  | { kind: 'unopened'; station: number; snrDb: number; freqOffsetHz: number }
   /** A station greeted with its name (which may be empty). */
   | { kind: 'hello'; name: string; station: number }
   /** The message with this id was acknowledged / given up on / sent without asking for an answer. */
@@ -52,6 +55,8 @@ export interface StationOptions {
   manualPtt: boolean;
   /** Nothing comes back: texts go once, files are broadcast. */
   oneWay: boolean;
+  /** Texts and files go sealed with it, sealed ones are opened with it; empty: none. */
+  password: string;
   /** The number of the mode of every data frame (0 is the slowest), or null to adapt to the channel. */
   mode: number | null;
 }
@@ -119,6 +124,7 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
         typeof value.name === 'string' &&
         typeof value.manualPtt === 'boolean' &&
         typeof value.oneWay === 'boolean' &&
+        typeof value.password === 'string' &&
         (value.mode === null || isNumber(value.mode))
       );
     case 'sendText':
@@ -139,7 +145,9 @@ function isCoreEvent(value: unknown): value is CoreEvent {
   const heard = isNumber(value.snrDb) && isNumber(value.freqOffsetHz);
   switch (value.kind) {
     case 'message':
-      return heard && typeof value.text === 'string' && isNumber(value.station);
+      return heard && typeof value.text === 'string' && isNumber(value.station) && typeof value.sealed === 'boolean';
+    case 'unopened':
+      return heard && isNumber(value.station);
     case 'hello':
       return typeof value.name === 'string' && isNumber(value.station);
     case 'delivered':

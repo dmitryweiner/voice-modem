@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::SAMPLE_RATE;
 use crate::frame::{Frame, Kind, MAX_PAYLOAD, Mode, SEQ_MODULUS, blocks};
+use crate::seal::{SEAL_OVERHEAD, Seal};
 
 const fn ms(milliseconds: u64) -> u64 {
     milliseconds * SAMPLE_RATE as u64 / 1000
@@ -40,6 +41,24 @@ pub const fn frame_bytes(mode: Mode) -> usize {
         Mode::F2 | Mode::F3 => 4,
     };
     blocks * mode.block_bytes()
+}
+
+/// What a whole message of a type is: a text or a message of the file
+/// transfer; None for what does not unpack (its checksums were right: only
+/// a station with another code sends that).
+fn message(from: u16, kind: u8, bytes: Vec<u8>, sealed: bool) -> Option<LinkEvent> {
+    match kind {
+        TYPE_TEXT => Some(LinkEvent::Text {
+            from,
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            sealed,
+        }),
+        TYPE_PACKED_TEXT => {
+            crate::text::unpack(&bytes).map(|text| LinkEvent::Text { from, text, sealed })
+        }
+        TYPE_FILE => Some(LinkEvent::File { from, bytes }),
+        _ => None,
+    }
 }
 
 /// The modes a station chooses from by itself, from the most robust up.
@@ -141,14 +160,19 @@ const TYPE_HELLO: u8 = 1;
 const TYPE_FILE: u8 = 2;
 /// A text in the code of `text.rs`, sent when that is shorter than its UTF-8.
 const TYPE_PACKED_TEXT: u8 = 3;
+/// A message of another type sealed by a password (`seal.rs`): its type,
+/// then its content, sealed.
+const TYPE_SEALED: u8 = 4;
 /// The first segment of a message.
 const FLAG_FIRST: u8 = 0x40;
 /// More segments of the message follow.
 const FLAG_MORE: u8 = 0x80;
 
-/// What this version of the modem can do, sent in the greeting. Nothing
-/// optional exists yet; encryption and fast modes will claim bits here.
+/// What this version of the modem can do, sent in the greeting: every
+/// station has the fast modes and packs its texts, so no bit is set for those.
 pub const CAPABILITIES: u16 = 0;
+/// The bit of the greeting of a station that seals what it sends.
+pub const CAPABILITY_SEALED: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkConfig {
@@ -171,15 +195,17 @@ pub struct LinkConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkEvent {
+    /// `sealed`: it came sealed and opened with the password of this station.
     Text {
         from: u16,
         text: String,
+        sealed: bool,
     },
+    /// A sealed message that this station could not open: it has no
+    /// password, or another one.
+    Unopened { from: u16 },
     /// A message of the file transfer, for `files.rs` to read.
-    File {
-        from: u16,
-        bytes: Vec<u8>,
-    },
+    File { from: u16, bytes: Vec<u8> },
     /// A station greeted: its name and what it can do.
     Hello {
         from: u16,
@@ -187,28 +213,17 @@ pub enum LinkEvent {
         capabilities: u16,
     },
     /// An unacknowledged message has been transmitted.
-    Sent {
-        id: u32,
-    },
+    Sent { id: u32 },
     /// Every frame of the message was acknowledged.
-    Delivered {
-        id: u32,
-    },
+    Delivered { id: u32 },
     /// A frame of the message was never acknowledged; the rest of it is dropped.
-    Failed {
-        id: u32,
-    },
+    Failed { id: u32 },
     /// No acknowledgement came; the frame goes out again, for the `attempt`-th time.
-    Retry {
-        id: u32,
-        attempt: u8,
-    },
+    Retry { id: u32, attempt: u8 },
     /// Push-to-talk: there is something to transmit, waiting for `ptt_pressed`.
     TxRequest,
     /// Data frames go out in this mode from now on.
-    TxMode {
-        mode: Mode,
-    },
+    TxMode { mode: Mode },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +342,8 @@ pub struct Link {
     ptt_requested: bool,
     ptt_armed: bool,
     events: VecDeque<LinkEvent>,
+    /// Seals texts and file messages when there is a password.
+    seal: Option<Seal>,
 }
 
 impl Link {
@@ -353,6 +370,7 @@ impl Link {
             ptt_requested: false,
             ptt_armed: false,
             events: VecDeque::new(),
+            seal: None,
         }
     }
 
@@ -382,13 +400,30 @@ impl Link {
         } else {
             (TYPE_TEXT, text.as_bytes().to_vec())
         };
+        self.enqueue(id, kind, bytes);
+        Ok(id)
+    }
+
+    /// From now on texts and file messages go sealed with this password.
+    pub fn set_seal(&mut self, seal: Seal) {
+        self.seal = Some(seal);
+    }
+
+    /// Queues a message, sealed when there is a password.
+    fn enqueue(&mut self, id: u32, kind: u8, bytes: Vec<u8>) {
+        let (kind, bytes) = match &mut self.seal {
+            Some(seal) => {
+                let inner = [&[kind][..], &bytes].concat();
+                (TYPE_SEALED, seal.seal(self.config.station, &inner))
+            }
+            None => (kind, bytes),
+        };
         self.queue.push_back(Outgoing {
             message: Some(id),
             kind,
             bytes,
             done: 0,
         });
-        Ok(id)
     }
 
     /// Queues a message of the file transfer (`files.rs`), which may be as
@@ -398,18 +433,19 @@ impl Link {
         debug_assert!(bytes.len() < MAX_PAYLOAD);
         let id = self.next_message;
         self.next_message += 1;
-        self.queue.push_back(Outgoing {
-            message: Some(id),
-            kind: TYPE_FILE,
-            bytes,
-            done: 0,
-        });
+        self.enqueue(id, TYPE_FILE, bytes);
         id
     }
 
-    /// The longest message that goes in one frame of the mode of the moment.
+    /// The longest message that goes in one frame of the mode of the
+    /// moment: a frame less its type, and less the seal when there is one.
     pub fn room(&self) -> usize {
-        frame_bytes(self.tx_mode) - 1
+        let seal = if self.seal.is_some() {
+            1 + SEAL_OVERHEAD
+        } else {
+            0
+        };
+        frame_bytes(self.tx_mode) - 1 - seal
     }
 
     /// From the end of a data frame to the start of the next one when the
@@ -456,7 +492,12 @@ impl Link {
 
     /// Queues a greeting: the name of this station and what it can do.
     pub fn hello(&mut self, now: u64) {
-        let mut bytes = CAPABILITIES.to_be_bytes().to_vec();
+        let capabilities = if self.seal.is_some() {
+            CAPABILITIES | CAPABILITY_SEALED
+        } else {
+            CAPABILITIES
+        };
+        let mut bytes = capabilities.to_be_bytes().to_vec();
         let mut end = self.config.name.len().min(MAX_NAME_BYTES);
         while !self.config.name.is_char_boundary(end) {
             end -= 1;
@@ -608,7 +649,7 @@ impl Link {
             (offset, body) = (usize::from(u16::from_be_bytes(at)), rest);
         }
         match first & TYPE_MASK {
-            kind @ (TYPE_TEXT | TYPE_PACKED_TEXT | TYPE_FILE) => {
+            kind @ (TYPE_TEXT | TYPE_PACKED_TEXT | TYPE_FILE | TYPE_SEALED) => {
                 if first & FLAG_FIRST != 0 {
                     peer.partial = Some(Vec::new());
                 }
@@ -627,17 +668,19 @@ impl Link {
                     && !cut
                     && let Some(bytes) = peer.partial.take()
                 {
-                    let event = match kind {
-                        TYPE_TEXT => Some(LinkEvent::Text {
-                            from,
-                            text: String::from_utf8_lossy(&bytes).into_owned(),
-                        }),
-                        // Its checksums were right: only a station with
-                        // another code sends what does not unpack.
-                        TYPE_PACKED_TEXT => {
-                            crate::text::unpack(&bytes).map(|text| LinkEvent::Text { from, text })
+                    let event = if kind == TYPE_SEALED {
+                        match self.seal.as_ref().and_then(|seal| seal.open(from, &bytes)) {
+                            // A sealed message holds no sealed one.
+                            Some(inner) => inner
+                                .split_first()
+                                .filter(|&(&kind, _)| kind != TYPE_SEALED)
+                                .and_then(|(&kind, bytes)| {
+                                    message(from, kind, bytes.to_vec(), true)
+                                }),
+                            None => Some(LinkEvent::Unopened { from }),
                         }
-                        _ => Some(LinkEvent::File { from, bytes }),
+                    } else {
+                        message(from, kind, bytes, false)
                     };
                     self.events.extend(event);
                 }
@@ -822,6 +865,7 @@ impl Link {
 mod tests {
     use super::*;
 
+    use crate::seal::{SEAL_OVERHEAD, Seal};
     use crate::tx::frame_len;
 
     /// Length of an acknowledgement and of an R1 data frame with `bytes` of payload, samples.
@@ -974,6 +1018,15 @@ mod tests {
         LinkEvent::Text {
             from,
             text: text.into(),
+            sealed: false,
+        }
+    }
+
+    fn sealed_text(from: u16, text: &str) -> LinkEvent {
+        LinkEvent::Text {
+            from,
+            text: text.into(),
+            sealed: true,
         }
     }
 
@@ -2119,5 +2172,110 @@ mod tests {
             longest[2] > BACKOFF.1 && longest[3] > 2 * BACKOFF.1,
             "{longest:?}"
         );
+    }
+
+    fn sealing(password: &str, station: u16) -> Link {
+        let mut link = Link::new(config(station), ACK_LEN);
+        link.set_seal(Seal::new(password, u64::from(station)));
+        link
+    }
+
+    /// A pair whose stations seal with these passwords, or not at all.
+    fn with_passwords(first: Option<&str>, second: Option<&str>) -> Air {
+        let mut air = Air::pair();
+        for (index, password) in [first, second].into_iter().enumerate() {
+            if let Some(password) = password {
+                air.links[index] = sealing(password, index as u16 + 1);
+            }
+        }
+        air
+    }
+
+    #[test]
+    fn a_text_goes_sealed_when_there_is_a_password() {
+        let mut air = with_passwords(Some("shared"), Some("shared"));
+        let id = air.links[0].send_text("meet at the bridge").unwrap();
+        air.run(ms(20_000));
+        assert_eq!(air.events[1], [sealed_text(1, "meet at the bridge")]);
+        assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
+        let (_, frame, _) = &air.log[0];
+        assert_eq!(frame.payload[0], TYPE_SEALED | FLAG_FIRST);
+        // the type of what is sealed, the packed text and the seal around them
+        let packed = crate::text::pack("meet at the bridge");
+        assert_eq!(frame.payload.len(), 1 + 1 + packed.len() + SEAL_OVERHEAD);
+        assert!(!frame.payload.windows(packed.len()).any(|w| w == packed));
+    }
+
+    #[test]
+    fn a_sealed_text_that_does_not_open_is_reported_and_acknowledged() {
+        for password in [None, Some("another")] {
+            let mut air = with_passwords(Some("shared"), password);
+            let id = air.links[0].send_text("meet at the bridge").unwrap();
+            air.run(ms(20_000));
+            assert_eq!(air.events[1], [LinkEvent::Unopened { from: 1 }]);
+            // it was received, just not read: no repeats
+            assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
+        }
+    }
+
+    #[test]
+    fn a_station_with_a_password_reads_what_comes_unsealed() {
+        let mut air = with_passwords(None, Some("shared"));
+        air.links[0].send_text("in the clear").unwrap();
+        air.run(ms(20_000));
+        assert_eq!(air.events[1], [text(1, "in the clear")]);
+    }
+
+    #[test]
+    fn a_long_sealed_text_goes_in_segments() {
+        let mut air = with_passwords(Some("shared"), Some("shared"));
+        let long = unpacked(300);
+        air.links[0].send_text(&long).unwrap();
+        air.run(ms(120_000));
+        assert_eq!(air.events[1], [sealed_text(1, &long)]);
+        // the seal goes round the whole message, then it is cut
+        let message = 1 + 300 + SEAL_OVERHEAD;
+        assert_eq!(data_frames(&air, 0).len(), 1 + (message - 63).div_ceil(61));
+    }
+
+    #[test]
+    fn file_messages_are_sealed_too() {
+        let mut air = with_passwords(Some("shared"), Some("shared"));
+        let bytes = content(40);
+        air.links[0].send_file(bytes.clone());
+        air.run(ms(20_000));
+        assert_eq!(air.events[1], [LinkEvent::File { from: 1, bytes }]);
+        assert_eq!(air.log[0].1.payload[0] & TYPE_MASK, TYPE_SEALED);
+    }
+
+    #[test]
+    fn the_seal_takes_room_in_every_frame() {
+        let link = sealing("shared", 1);
+        assert_eq!(link.room(), 63 - 1 - SEAL_OVERHEAD);
+    }
+
+    #[test]
+    fn the_greeting_goes_in_the_clear_and_says_the_station_seals() {
+        let mut air = with_passwords(Some("shared"), None);
+        air.links[0].hello(0);
+        air.run(ms(20_000));
+        assert_eq!(air.log[0].1.payload[0] & TYPE_MASK, TYPE_HELLO);
+        assert!(matches!(
+            air.events[1][0],
+            LinkEvent::Hello {
+                from: 1,
+                capabilities: CAPABILITY_SEALED,
+                ..
+            }
+        ));
+        // and the answer of a station without a password says it does not
+        assert!(matches!(
+            air.events[0][0],
+            LinkEvent::Hello {
+                from: 2,
+                capabilities: 0,
+                ..
+            }
+        ));
     }
 }

@@ -216,8 +216,8 @@ mode and debugging).
   transfer time at the current speed exceeds 10 minutes.
 - Text messages have priority and cut into a file transfer.
 - **Encryption** (stage 5): optional, by a shared password, off by default.
-  Password → key with a memory-hard KDF, AEAD over the payload (planned:
-  Argon2id + ChaCha20-Poly1305, pure Rust crates; confirmed at stage 5).
+  Password → key with a memory-hard KDF, AEAD over the payload
+  (Argon2id + ChaCha20-Poly1305, pure Rust crates, confirmed at stage 5).
   Headers stay in the clear so that a station without the password still sees
   that the channel is busy. The radio presets keep it off and the UI warns when
   it is switched on there: encryption is forbidden on amateur radio bands.
@@ -274,7 +274,8 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–4 are done (2026-11-11); stage 5 is under way. What they settled is in
+**Progress**: stages 0–4 are done (2026-11-11), stage 5 too (2026-11-15).
+What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
@@ -320,6 +321,11 @@ Open:
   and microphones pass 64 carriers at once as the simulated room does. The
   robust ones and the choice of mode have (2026-11-11): 125–250 bit/s next
   to each other, 62.5 bit/s at 8 m.
+- Nothing of stage 5 has been tried on real devices: files, long frames of
+  several blocks (8–12 s of carriers), packed texts, broadcast, sealed
+  messages, how long a phone takes to derive the key of a password. The
+  author left the field tests for the end of the project (2026-11-13) and
+  started with long frames (PR #10).
 - The modem has not been tried through a real phone call or on an iPhone.
 - iLBC loses whole frames (the preamble or the header); AMR-WB/EVS and
   everything a real call adds to the codec are untested.
@@ -327,14 +333,14 @@ Open:
   whose beginning was missed (36× real time natively).
 - The app icon is still the template's.
 
-Stage 5 so far (2026-11-13): files over the two-way link — offer, consent,
+Stage 5, first (2026-11-13): files over the two-way link — offer, consent,
 chunks, progress and the time left, cancelling on both sides, going on
 after a break, texts ahead of chunks ([protocol](../docs/protocol.md#files-filesrs)).
 It differs from section 7 in these places:
 
 - The "hash" of the offer is the CRC-32 of the content: it guards against
-  mistakes of the transfer, not against a forger, and so will the
-  authenticated encryption when it comes.
+  mistakes of the transfer, not against a forger; against a forger the seal
+  of a password does (below).
 - A file is a row of messages of one frame each, not one long message: the
   limit of 1000 bytes and the two-byte offset stayed as they were.
 - The warning about a long transfer is a note on the offered file (more
@@ -372,7 +378,30 @@ broadcast is at most 256 pieces (15 KB in R1, 1 MB in F2 and F3). The
 command-line tool writes a file broadcast into a recording and collects
 files from one: record and play back.
 
-Still to come in stage 5: encryption.
+Then (2026-11-15) encryption: a password seals every text and every message of the file
+transfer with ChaCha20-Poly1305 under a key from Argon2id (`seal.rs`); a
+station without it hears only that something was said, and is told so. As
+planned, with these decisions:
+
+- The salt is the same for every station: both must come to the key from
+  the password alone, with no exchange before. So the key costs more than
+  the least OWASP names (64 MiB and 3 passes, a tenth of a second), and a
+  password is as good as it is long.
+- The greeting stays in the clear, with the name of the station and a bit
+  that says it seals; so do frame headers and acknowledgements.
+- The password is not stored: it lives until the page is closed.
+- Every message is sealed whole (29 bytes more), file chunks included:
+  simpler than sealing a file once, and every chunk is checked on its own.
+  It costs most in R1, where a frame carries 28 bytes of a file instead
+  of 57.
+
+That completes stage 5. Stage 6 (presets) is next; it tunes each kind of
+channel from field measurements, so it waits for those.
+
+Left open by stage 5: a file is sealed chunk by chunk, which in R1 halves
+what a frame carries; nothing guards against a sealed message recorded and
+played again; the password is not stored (a bother after every reload, if
+it turns out so); the greeting, with the name, is never sealed.
 
 Where stage 5 started from:
 
@@ -412,7 +441,8 @@ only tens of bit/s — checked early, at stage 1, by running through codecs;
 (2) audio processing in browsers/OS that cannot be switched off (iOS above all)
 — checked at stage 2; (3) the size of stage 4 — it is the largest and is split
 into "M modes" and "F modes" if needed; (4) stage 5 grew with fountain codes
-and encryption — it is split into three PRs (files, broadcast, encryption).
+and encryption — it went in five pieces (files, blocks per frame,
+compression, broadcast, encryption).
 
 ## 12. Decisions
 

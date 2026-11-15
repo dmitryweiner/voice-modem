@@ -236,7 +236,7 @@ describe('microphone', () => {
   it('turns on: the audio device starts and its port goes to the modem', async () => {
     const { core, audio } = await listening();
     expect(audio.startAudio).toHaveBeenCalledTimes(1);
-    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false, oneWay: false, mode: null }]]);
+    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false, oneWay: false, password: '', mode: null }]]);
     expect(text('#state')).toBe('Listening');
     expect(text('#mic')).toBe('Turn off');
     expect(exists('#level') && exists('#spectrum') && exists('#draft')).toBe(true);
@@ -320,7 +320,14 @@ describe('input meter', () => {
   });
 });
 
-const received = (message: string, snrDb = 3): CoreEvent => ({ kind: 'message', text: message, station: 7, snrDb, freqOffsetHz: 0 });
+const received = (message: string, snrDb = 3, sealed = false): CoreEvent => ({
+  kind: 'message',
+  text: message,
+  station: 7,
+  snrDb,
+  freqOffsetHz: 0,
+  sealed,
+});
 
 describe('messages', () => {
   it('shows a received text with its quality', async () => {
@@ -683,12 +690,43 @@ async function oneWay() {
   return started;
 }
 
+describe('password', () => {
+  it('goes to the modem and is never stored', async () => {
+    const storage = new MemoryStorage();
+    const { core } = await start({ storage });
+    const field = $('#password', HTMLInputElement);
+    expect([field.type, field.getAttribute('aria-label')]).toEqual(['password', 'Password']);
+    expect(exists('#password-warning')).toBe(false);
+    fireEvent.change(field, { target: { value: 'correct horse' } });
+    expect(text('#password-warning')).toBe('Encryption is forbidden on amateur radio bands.');
+    await press(() => $('#mic', HTMLButtonElement).click());
+    expect(core.calls.started[0]?.[2]).toEqual({ name: '', manualPtt: false, oneWay: false, password: 'correct horse', mode: null });
+    expect(text('#sealing')).toBe('Sealed with the password');
+    // the name is kept, the password is not
+    fireEvent.click($('#mic', HTMLButtonElement));
+    fireEvent.change($('#name', HTMLInputElement), { target: { value: 'Alice' } });
+    expect([...storage.data.values()].join()).not.toContain('correct horse');
+    cleanup();
+    await start({ storage });
+    expect($('#password', HTMLInputElement).value).toBe('');
+  });
+
+  it('marks what came sealed, and says when something sealed did not open', async () => {
+    const { core } = await listening();
+    core.emit(received('meet at the bridge', 12, true));
+    expect(text('#feed .received small')).toBe('Received · sealed · signal +12 dB to noise');
+    core.emit({ kind: 'unopened', station: 7, snrDb: 5, freqOffsetHz: 0 });
+    expect(text('#feed .note')).toBe('A sealed message did not open: is the password the same?');
+    expect(exists('#sealing')).toBe(false);
+  });
+});
+
 describe('one way', () => {
   it('is remembered and given to the modem', async () => {
     const { storage, core } = await oneWay();
     expect($('#one-way', HTMLInputElement).closest('label')?.textContent).toBe('One-way');
     expect(loadSettings(storage).oneWay).toBe(true);
-    expect(core.calls.started[0]?.[2]).toEqual({ name: '', manualPtt: false, oneWay: true, mode: null });
+    expect(core.calls.started[0]?.[2]).toEqual({ name: '', manualPtt: false, oneWay: true, password: '', mode: null });
     cleanup();
     await start({ storage });
     expect($('#one-way', HTMLInputElement).checked).toBe(true);
@@ -755,7 +793,7 @@ describe('station', () => {
     fireEvent.change($('#mode', HTMLSelectElement), { target: { value: '2' } });
     expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true, oneWay: false, mode: 2 });
     await press(() => $('#mic', HTMLButtonElement).click());
-    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true, oneWay: false, mode: 2 });
+    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true, oneWay: false, password: '', mode: 2 });
     expect(text('#speed')).toBe('250 bit/s');
 
     cleanup();
