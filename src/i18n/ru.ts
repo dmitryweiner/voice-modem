@@ -15,6 +15,9 @@ export const ru: Messages = {
   speedLabel: 'Скорость',
   speedAuto: 'Скорость: по каналу',
   pttHint: 'Рация с тангентой, которую я нажимаю сам',
+  oneWayLabel: 'В одну сторону',
+  oneWayHint:
+    'Ответов нет: тексты уходят один раз, файлы — потоком для всех, кто слушает (рация только на передачу, запись). Скорость выберите сами: «по каналу» — самая низкая, судить не по чему.',
   micOn: 'Включить микрофон',
   micOff: 'Выключить',
   micStarting: 'Запуск…',
@@ -72,5 +75,6 @@ export const ru: Messages = {
     return `${value.toFixed(1).replace('.', ',')} ${unit}`;
   },
   timeLeft: (seconds: number) => (seconds < 90 ? `осталось около ${seconds} с` : `осталось около ${Math.round(seconds / 60)} мин`),
+  broadcasting: (percent: number) => `Передаётся всем… отправлено ${percent}%`,
   fileSlow: (seconds: number) => `около ${Math.round(seconds / 60)} мин на текущей скорости`,
 };

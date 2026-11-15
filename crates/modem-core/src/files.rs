@@ -6,12 +6,16 @@
 //! A chunk is a message of its own, cut to one frame of the mode of the
 //! moment, and is handed over only when the link has nothing else to send:
 //! a text typed meanwhile goes first. A file that deflates goes deflated.
-//! See `docs/protocol.md`.
+//!
+//! Over a one-way channel nobody can consent or acknowledge: the file is
+//! broadcast instead, as symbols of a fountain code (`fountain.rs`) until
+//! the sender stops, and whoever listens collects them. See `docs/protocol.md`.
 
 use std::collections::{HashSet, VecDeque};
 
 use crate::SAMPLE_RATE;
 use crate::crc::crc32;
+use crate::fountain::{Decoder, Encoder, symbols_for};
 
 /// The longest file name, bytes of UTF-8; a longer one is cut.
 pub const MAX_FILE_NAME_BYTES: usize = 255;
@@ -20,6 +24,18 @@ pub const MAX_FILE_BYTES: usize = u32::MAX as usize;
 /// Bytes of a message with a chunk before the content: the kind, the
 /// transfer, the offset.
 pub const CHUNK_HEADER: usize = 6;
+/// Bytes of a message with a symbol before the symbol: the kind, the
+/// transfer, the number of the symbol.
+pub const SYMBOL_HEADER: usize = 4;
+/// Bytes of an announce before the name.
+pub const ANNOUNCE_HEADER: usize = 17;
+/// The most pieces a broadcast file has: the work of solving for them grows
+/// as their square.
+pub const MAX_PIECES: usize = 256;
+/// An announce goes before every this many symbols, for those who tune in late.
+pub const ANNOUNCE_EVERY: u32 = 8;
+/// A broadcast stops by itself after this many times the pieces of its file.
+const CAST_TIMES: u32 = 10;
 
 /// The first byte of every message; the number of the transfer follows.
 const OP_OFFER: u8 = 0;
@@ -29,6 +45,10 @@ const OP_DATA: u8 = 2;
 const OP_ABORT: u8 = 3;
 /// The receiver declines the offer or gives the transfer up.
 const OP_REFUSE: u8 = 4;
+/// A broadcast file: what it is and how its symbols are cut.
+const OP_ANNOUNCE: u8 = 5;
+/// A symbol of a broadcast file.
+const OP_SYMBOL: u8 = 6;
 
 /// How the content goes on the air: the bytes of the file, or deflated
 /// (RFC 1951) when that is shorter.
@@ -72,6 +92,18 @@ pub enum FileEvent {
     Failed { id: u32 },
     /// The other side declined the file or gave the transfer up.
     Refused { id: u32 },
+    /// A station broadcasts a file: it is being collected.
+    Heard {
+        id: u32,
+        from: u16,
+        name: String,
+        size: u32,
+    },
+    /// So many symbols of the file being broadcast went; `needed` of them
+    /// make the file. Who has it, the sender never learns.
+    Cast { id: u32, symbols: u32, needed: u32 },
+    /// The broadcast ended by itself: ten times the file went.
+    Sent { id: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +212,71 @@ struct Download {
     pace: Pace,
 }
 
+/// A file this station broadcasts.
+struct Cast {
+    id: u32,
+    wire: u8,
+    name: String,
+    shape: Shape,
+    encoder: Encoder,
+    /// The number of the next symbol: so many went.
+    next: u32,
+    /// The symbols it stops after.
+    last: u32,
+    /// The announce before the current eight symbols went.
+    announced: bool,
+    /// The message of it the link has now, and whether it is a symbol.
+    flight: Option<(u32, bool)>,
+}
+
+impl Cast {
+    fn announce(&self) -> Vec<u8> {
+        let mut bytes = message(OP_ANNOUNCE, self.wire, self.shape.size);
+        bytes.extend(self.shape.crc.to_be_bytes());
+        bytes.push(self.shape.encoding);
+        bytes.extend((self.shape.sent as u32).to_be_bytes());
+        bytes.extend((self.encoder.symbol_bytes() as u16).to_be_bytes());
+        bytes.extend_from_slice(self.name.as_bytes());
+        bytes
+    }
+
+    fn symbol(&self) -> Vec<u8> {
+        let mut bytes = vec![OP_SYMBOL, self.wire];
+        bytes.extend((self.next as u16).to_be_bytes());
+        bytes.extend(self.encoder.symbol(self.next));
+        bytes
+    }
+}
+
+/// What an announce tells of a broadcast file.
+struct Announced {
+    name: String,
+    shape: Shape,
+    decoder: Decoder,
+    pace: Pace,
+}
+
+/// A broadcast file being collected.
+struct Catch {
+    id: u32,
+    from: u16,
+    wire: u8,
+    /// None until an announce is heard.
+    announced: Option<Announced>,
+    /// Symbols heard before the announce.
+    early: Vec<(u32, Vec<u8>)>,
+    /// The file is here, or the human gave it up: what comes is ignored.
+    over: bool,
+}
+
+/// What the link has from here that `sent_as` is to name.
+enum Polled {
+    /// A chunk that ends at this byte on the air.
+    Chunk(usize),
+    /// A message of the broadcast; true for a symbol.
+    Cast(bool),
+}
+
 fn message(op: u8, wire: u8, number: usize) -> Vec<u8> {
     let mut bytes = vec![op, wire];
     bytes.extend((number as u32).to_be_bytes());
@@ -198,10 +295,13 @@ pub struct Files {
     /// The first is the one being sent; the others wait.
     uploads: VecDeque<Upload>,
     downloads: Vec<Download>,
+    /// Broadcasts: the first goes now, the others wait.
+    casts: VecDeque<Cast>,
+    catches: Vec<Catch>,
     /// Answers and refusals waiting for the link.
     outbox: VecDeque<Vec<u8>>,
-    /// The end of the chunk `poll` has just returned, until `sent_as` names its token.
-    polled: Option<usize>,
+    /// What `poll` has just returned, until `sent_as` names its token.
+    polled: Option<Polled>,
     /// Tokens of the answers and refusals the link has.
     control: HashSet<u32>,
     /// Messages to take back from the link.
@@ -260,13 +360,68 @@ impl Files {
         Ok(id)
     }
 
+    /// Queues a file to broadcast in symbols of at most `symbol` bytes;
+    /// returns the id its fate is reported under. Nobody is asked: it goes
+    /// until it is cancelled or has gone ten times.
+    pub fn broadcast(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        symbol: usize,
+    ) -> Result<u32, FileError> {
+        let symbol = symbol.clamp(1, usize::from(u16::MAX));
+        let (size, crc) = (bytes.len(), crc32(&bytes));
+        let deflated = deflate(&bytes);
+        let (encoding, bytes) = if deflated.len() < size {
+            (DEFLATE, deflated)
+        } else {
+            (AS_IT_IS, bytes)
+        };
+        let pieces = symbols_for(bytes.len(), symbol);
+        if pieces > MAX_PIECES {
+            return Err(FileError::TooLarge {
+                max: MAX_PIECES * symbol,
+            });
+        }
+        // The announce goes in one frame: as much of the name as fits next to a symbol.
+        let mut end = name.len().min(symbol + SYMBOL_HEADER - ANNOUNCE_HEADER);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let id = self.id();
+        let wire = self.next_wire;
+        self.next_wire = wire.wrapping_add(1);
+        // As many pieces as frames take, as even as can be: no symbol is
+        // longer, nor its frame, than the file needs.
+        let encoder = Encoder::new(&bytes, bytes.len().div_ceil(pieces).max(1));
+        let pieces = encoder.pieces() as u32;
+        self.casts.push_back(Cast {
+            id,
+            wire,
+            name: name[..end].to_owned(),
+            shape: Shape {
+                size,
+                crc,
+                encoding,
+                sent: bytes.len(),
+            },
+            encoder,
+            next: 0,
+            last: (CAST_TIMES * pieces).min(1 << 16),
+            announced: false,
+            flight: None,
+        });
+        Ok(id)
+    }
+
     /// Bytes the file `id`, queued to be sent, goes on the air as: fewer
     /// than it has when it deflates.
     pub fn sent_bytes(&self, id: u32) -> Option<usize> {
-        self.uploads
-            .iter()
-            .find(|upload| upload.id == id)
+        let upload = self.uploads.iter().find(|upload| upload.id == id);
+        let cast = self.casts.iter().find(|cast| cast.id == id);
+        upload
             .map(|upload| upload.shape.sent)
+            .or(cast.map(|cast| cast.shape.sent))
     }
 
     /// Consents to an offered file; false when there is no such offer.
@@ -291,6 +446,22 @@ impl Files {
     /// the other side. Nothing more is reported about it. False when there
     /// is no such file any more.
     pub fn cancel(&mut self, id: u32) -> bool {
+        // A broadcast tells nobody: nobody would hear an answer.
+        if let Some(index) = self.casts.iter().position(|cast| cast.id == id) {
+            let flight = self.casts.remove(index).and_then(|cast| cast.flight);
+            self.take_back.extend(flight.map(|(token, _)| token));
+            return true;
+        }
+        if let Some(catch) = self
+            .catches
+            .iter_mut()
+            .find(|catch| catch.id == id && !catch.over)
+        {
+            catch.over = true;
+            catch.announced = None;
+            catch.early.clear();
+            return true;
+        }
         if let Some(index) = self.uploads.iter().position(|upload| upload.id == id) {
             let Some(upload) = self.uploads.remove(index) else {
                 return false;
@@ -317,11 +488,23 @@ impl Files {
         if let Some(bytes) = self.outbox.pop_front() {
             return Some(bytes);
         }
-        let upload = self.uploads.front_mut()?;
+        let Some(upload) = self.uploads.front_mut() else {
+            let cast = self
+                .casts
+                .front()
+                .filter(|cast| free && cast.flight.is_none())?;
+            let symbol = cast.announced;
+            self.polled = Some(Polled::Cast(symbol));
+            return Some(if symbol {
+                cast.symbol()
+            } else {
+                cast.announce()
+            });
+        };
         match upload.stage {
             Stage::Queued => {
                 upload.stage = Stage::Offering;
-                self.polled = Some(0);
+                self.polled = Some(Polled::Chunk(0));
                 let shape = upload.shape;
                 let mut bytes = message(OP_OFFER, upload.wire, shape.size);
                 bytes.extend(shape.crc.to_be_bytes());
@@ -333,7 +516,7 @@ impl Files {
             Stage::Sending if free && upload.flight.is_none() => {
                 let end = (upload.done + room.saturating_sub(CHUNK_HEADER).max(1))
                     .min(upload.bytes.len());
-                self.polled = Some(end);
+                self.polled = Some(Polled::Chunk(end));
                 let mut bytes = message(OP_DATA, upload.wire, upload.done);
                 bytes.extend_from_slice(&upload.bytes[upload.done..end]);
                 Some(bytes)
@@ -344,12 +527,22 @@ impl Files {
 
     /// The link knows the message `poll` has just returned under this token.
     pub fn sent_as(&mut self, token: u32) {
-        match (self.polled.take(), self.uploads.front_mut()) {
-            (Some(end), Some(upload)) => upload.flight = Some((token, end)),
+        match (
+            self.polled.take(),
+            self.uploads.front_mut(),
+            self.casts.front_mut(),
+        ) {
+            (Some(Polled::Chunk(end)), Some(upload), _) => upload.flight = Some((token, end)),
+            (Some(Polled::Cast(symbol)), _, Some(cast)) => cast.flight = Some((token, symbol)),
             _ => {
                 self.control.insert(token);
             }
         }
+    }
+
+    /// Nothing to send: no answer, no file offered, sent or broadcast.
+    pub fn is_idle(&self) -> bool {
+        self.outbox.is_empty() && self.uploads.is_empty() && self.casts.is_empty()
     }
 
     /// A message the link should take back: it is of no use any more.
@@ -368,11 +561,42 @@ impl Files {
                 .uploads
                 .front()
                 .is_some_and(|upload| upload.flight.is_some_and(|(flying, _)| flying == token))
+            || self
+                .casts
+                .front()
+                .is_some_and(|cast| cast.flight.is_some_and(|(flying, _)| flying == token))
+    }
+
+    /// A message of the broadcast went; false when it is not one from here.
+    fn on_cast(&mut self, token: u32) -> bool {
+        let Some(cast) = self.casts.front_mut() else {
+            return false;
+        };
+        let Some((_, symbol)) = cast.flight.take_if(|(flying, _)| *flying == token) else {
+            return false;
+        };
+        if !symbol {
+            cast.announced = true;
+            return true;
+        }
+        cast.next += 1;
+        cast.announced = !cast.next.is_multiple_of(ANNOUNCE_EVERY);
+        let (id, symbols) = (cast.id, cast.next);
+        self.events.push_back(FileEvent::Cast {
+            id,
+            symbols,
+            needed: cast.encoder.pieces() as u32,
+        });
+        if symbols >= cast.last {
+            self.casts.pop_front();
+            self.events.push_back(FileEvent::Sent { id });
+        }
+        true
     }
 
     /// The other side has the message; false when it is not one from here.
     pub fn on_delivered(&mut self, token: u32, now: u64) -> bool {
-        if self.control.remove(&token) {
+        if self.control.remove(&token) || self.on_cast(token) {
             return true;
         }
         let Some(upload) = self.uploads.front_mut() else {
@@ -463,6 +687,35 @@ impl Files {
                     self.events.push_back(FileEvent::Refused { id });
                 }
             }
+            OP_ANNOUNCE => {
+                if let Some((size, rest)) = number(rest)
+                    && let Some((crc, rest)) = rest.split_first_chunk::<4>()
+                    && let Some((&encoding, rest)) = rest.split_first()
+                    && let Some((sent, rest)) = number(rest)
+                    && let Some((symbol, name)) = rest.split_first_chunk::<2>()
+                {
+                    let shape = Shape {
+                        size,
+                        crc: u32::from_be_bytes(*crc),
+                        encoding,
+                        sent,
+                    };
+                    let name = String::from_utf8_lossy(name).into_owned();
+                    let symbol = usize::from(u16::from_be_bytes(*symbol));
+                    self.on_announce(from, wire, name, shape, symbol, now);
+                }
+            }
+            OP_SYMBOL => {
+                if let Some((number, bytes)) = rest.split_first_chunk::<2>() {
+                    self.on_symbol(
+                        from,
+                        wire,
+                        u32::from(u16::from_be_bytes(*number)),
+                        bytes,
+                        now,
+                    );
+                }
+            }
             OP_REFUSE => {
                 if let Some(upload) = self
                     .uploads
@@ -475,6 +728,130 @@ impl Files {
             // A message from a later version.
             _ => {}
         }
+    }
+
+    /// The broadcast `wire` of the station `from`, made when first heard of.
+    fn catch(&mut self, from: u16, wire: u8) -> &mut Catch {
+        if let Some(index) = self
+            .catches
+            .iter()
+            .position(|catch| (catch.from, catch.wire) == (from, wire))
+        {
+            return &mut self.catches[index];
+        }
+        if self.catches.len() >= MAX_DOWNLOADS {
+            let oldest = self.catches.remove(0);
+            if !oldest.over && oldest.announced.is_some() {
+                self.events.push_back(FileEvent::Failed { id: oldest.id });
+            }
+        }
+        let id = self.id();
+        self.catches.push(Catch {
+            id,
+            from,
+            wire,
+            announced: None,
+            early: Vec::new(),
+            over: false,
+        });
+        self.catches.last_mut().expect("just pushed")
+    }
+
+    fn on_announce(
+        &mut self,
+        from: u16,
+        wire: u8,
+        name: String,
+        shape: Shape,
+        symbol: usize,
+        now: u64,
+    ) {
+        let pieces = symbols_for(shape.sent, symbol.max(1));
+        if symbol == 0 || pieces > MAX_PIECES || !matches!(shape.encoding, AS_IT_IS | DEFLATE) {
+            return;
+        }
+        let catch = self.catch(from, wire);
+        if catch.over || catch.announced.is_some() {
+            return;
+        }
+        let mut decoder = Decoder::new(pieces, symbol);
+        for (number, bytes) in catch.early.drain(..) {
+            decoder.add(number, &bytes);
+        }
+        let (id, rank) = (catch.id, decoder.rank());
+        catch.announced = Some(Announced {
+            name: name.clone(),
+            shape,
+            decoder,
+            pace: Pace::start(now, rank),
+        });
+        self.events.push_back(FileEvent::Heard {
+            id,
+            from,
+            name,
+            size: shape.size as u32,
+        });
+        if rank > 0 {
+            self.events.push_back(FileEvent::Progress {
+                id,
+                done: shape.in_file((rank * symbol).min(shape.sent)),
+                seconds_left: None,
+            });
+        }
+        self.finish_catch(from, wire);
+    }
+
+    fn on_symbol(&mut self, from: u16, wire: u8, number: u32, bytes: &[u8], now: u64) {
+        let catch = self.catch(from, wire);
+        if catch.over {
+            return;
+        }
+        let id = catch.id;
+        let Some(announced) = &mut catch.announced else {
+            if catch.early.len() < MAX_PIECES {
+                catch.early.push((number, bytes.to_vec()));
+            }
+            return;
+        };
+        if !announced.decoder.add(number, bytes) {
+            return;
+        }
+        let (rank, shape) = (announced.decoder.rank(), announced.shape);
+        let pieces = symbols_for(shape.sent, bytes.len());
+        if rank < pieces {
+            let seconds_left = announced.pace.seconds_left(now, rank, pieces);
+            self.events.push_back(FileEvent::Progress {
+                id,
+                done: shape.in_file((rank * bytes.len()).min(shape.sent)),
+                seconds_left,
+            });
+        }
+        self.finish_catch(from, wire);
+    }
+
+    /// The broadcast file is there once every piece is known.
+    fn finish_catch(&mut self, from: u16, wire: u8) {
+        let Some(catch) = self
+            .catches
+            .iter_mut()
+            .find(|catch| (catch.from, catch.wire) == (from, wire))
+        else {
+            return;
+        };
+        let Some(announced) = &catch.announced else {
+            return;
+        };
+        let Some(mut bytes) = announced.decoder.decoded() else {
+            return;
+        };
+        let Announced { name, shape, .. } = catch.announced.take().expect("checked above");
+        catch.over = true;
+        bytes.truncate(shape.sent);
+        let id = catch.id;
+        self.events.push_back(match shape.decode(bytes) {
+            Some(bytes) => FileEvent::Received { id, name, bytes },
+            None => FileEvent::Failed { id },
+        });
     }
 
     fn download(&self, from: u16, wire: u8) -> Option<usize> {
@@ -628,6 +1005,8 @@ mod tests {
         next_token: u32,
         room: usize,
         lost: Lost,
+        /// One-way: the sender is told every message went, lost or not.
+        one_way: bool,
         /// Every message handed to the link: the side and the bytes.
         log: Vec<(usize, Vec<u8>)>,
         taken_back: Vec<(usize, u32)>,
@@ -642,6 +1021,7 @@ mod tests {
                 next_token: 100,
                 room: 106,
                 lost: Box::new(|_, _| false),
+                one_way: false,
                 log: Vec::new(),
                 taken_back: Vec::new(),
                 events: [Vec::new(), Vec::new()],
@@ -661,10 +1041,13 @@ mod tests {
                 assert!(self.files[side].owns(token));
                 self.now += SECOND;
                 self.log.push((side, bytes.clone()));
-                if (self.lost)(side, bytes) {
+                let lost = (self.lost)(side, bytes);
+                if !lost {
+                    self.files[1 - side].on_message(side as u16 + 1, bytes, self.now);
+                }
+                if lost && !self.one_way {
                     assert!(self.files[side].on_failed(token));
                 } else {
-                    self.files[1 - side].on_message(side as u16 + 1, bytes, self.now);
                     assert!(self.files[side].on_delivered(token, self.now));
                 }
                 assert!(!self.files[side].owns(token));
@@ -1307,5 +1690,292 @@ mod tests {
         }
         assert_eq!(files.poll_event(), None);
         assert_eq!(files.poll(106, true), None);
+    }
+
+    /// A pair on a one-way channel: side 0 broadcasts, side 1 listens.
+    fn one_way() -> Pair {
+        Pair {
+            one_way: true,
+            ..Pair::new()
+        }
+    }
+
+    /// Bytes of a symbol in a message as long as one frame of the pair takes.
+    const SYMBOL: usize = 106 - SYMBOL_HEADER;
+
+    /// Side 0 broadcasts until the listener has an event like this, or `limit` messages went.
+    fn broadcast_until(pair: &mut Pair, limit: usize, done: fn(&FileEvent) -> bool) {
+        for _ in 0..limit {
+            if pair.events[1].iter().any(done) {
+                return;
+            }
+            pair.step(0);
+        }
+    }
+
+    fn has_file(event: &FileEvent) -> bool {
+        matches!(event, FileEvent::Received { .. })
+    }
+
+    #[test]
+    fn a_broadcast_file_goes_without_an_offer_and_is_collected() {
+        let mut pair = one_way();
+        let up = pair.files[0]
+            .broadcast("notes.txt", content(1000), SYMBOL)
+            .unwrap();
+        pair.step(0);
+        let announce = pair.log[0].1.clone();
+        assert_eq!(announce[..2], [OP_ANNOUNCE, 0]);
+        assert_eq!(announce[2..6], 1000u32.to_be_bytes());
+        assert_eq!(announce[6..10], crc32(&content(1000)).to_be_bytes());
+        assert_eq!(announce[10], AS_IT_IS);
+        assert_eq!(announce[11..15], 1000u32.to_be_bytes());
+        // 1000 bytes take 10 symbols of at most 102: 10 pieces of 100
+        assert_eq!(announce[15..17], 100u16.to_be_bytes());
+        assert_eq!(&announce[17..], b"notes.txt");
+        assert_eq!(
+            pair.events[1],
+            [FileEvent::Heard {
+                id: 1,
+                from: 1,
+                name: "notes.txt".into(),
+                size: 1000
+            }]
+        );
+        broadcast_until(&mut pair, 100, has_file);
+        // the announce again after eight
+        let ops: Vec<u8> = pair.log.iter().map(|(_, bytes)| bytes[0]).collect();
+        let mut expected = vec![OP_ANNOUNCE];
+        expected.extend([OP_SYMBOL; 8]);
+        expected.extend([OP_ANNOUNCE, OP_SYMBOL, OP_SYMBOL]);
+        assert_eq!(ops, expected);
+        // the first symbols are the pieces of the file
+        let first = &pair.log[1].1;
+        assert_eq!(first[..4], [OP_SYMBOL, 0, 0, 0]);
+        assert_eq!(first[4..], content(1000)[..100]);
+        assert_eq!(pair.log[2].1[..4], [OP_SYMBOL, 0, 0, 1]);
+        // the listener follows the pieces it has
+        let done: Vec<u32> = pair.events[1]
+            .iter()
+            .filter_map(|e| match e {
+                FileEvent::Progress { done, .. } => Some(*done),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, (1..10).map(|pieces| pieces * 100).collect::<Vec<_>>());
+        assert_eq!(
+            pair.events[1].last(),
+            Some(&FileEvent::Received {
+                id: 1,
+                name: "notes.txt".into(),
+                bytes: content(1000)
+            })
+        );
+        // the sender says how much went; it never learns who has the file
+        assert_eq!(
+            pair.events[0].last(),
+            Some(&FileEvent::Cast {
+                id: up,
+                symbols: 10,
+                needed: 10
+            })
+        );
+        let heard = pair.events[1].len();
+        for _ in 0..20 {
+            pair.step(0);
+        }
+        assert_eq!(pair.events[1].len(), heard);
+        assert!(
+            pair.events[0]
+                .iter()
+                .all(|e| matches!(e, FileEvent::Cast { .. }))
+        );
+    }
+
+    #[test]
+    fn symbols_lost_on_the_way_are_made_up_by_later_ones() {
+        let mut pair = one_way();
+        let mut count = 0;
+        // every third message is lost, the announces among them
+        pair.lost = Box::new(move |_, _| {
+            count += 1;
+            count % 3 == 0
+        });
+        pair.files[0]
+            .broadcast("notes.txt", content(3000), SYMBOL)
+            .unwrap();
+        broadcast_until(&mut pair, 200, has_file);
+        assert_eq!(
+            pair.events[1].last(),
+            Some(&FileEvent::Received {
+                id: 1,
+                name: "notes.txt".into(),
+                bytes: content(3000)
+            })
+        );
+        // 30 pieces; a third lost: some 45 symbols, a few announces, a symbol or two more
+        let symbols = pair.sent(0, OP_SYMBOL).len();
+        assert!((45..=50).contains(&symbols), "{symbols}");
+    }
+
+    #[test]
+    fn a_listener_that_tunes_in_late_keeps_what_it_heard_before_the_announce() {
+        let mut pair = one_way();
+        let mut count = 0;
+        // the announce and three symbols go by before it listens
+        pair.lost = Box::new(move |_, _| {
+            count += 1;
+            count <= 4
+        });
+        pair.files[0]
+            .broadcast("notes.txt", content(2000), SYMBOL)
+            .unwrap();
+        for _ in 0..9 {
+            pair.step(0);
+        }
+        // five symbols heard, nothing known of the file yet
+        assert_eq!(pair.events[1], []);
+        pair.step(0);
+        assert_eq!(
+            pair.events[1][..2],
+            [
+                FileEvent::Heard {
+                    id: 1,
+                    from: 1,
+                    name: "notes.txt".into(),
+                    size: 2000
+                },
+                FileEvent::Progress {
+                    id: 1,
+                    done: 5 * 100,
+                    seconds_left: None
+                }
+            ]
+        );
+        broadcast_until(&mut pair, 100, has_file);
+        assert!(matches!(
+            pair.events[1].last(),
+            Some(FileEvent::Received { bytes, .. }) if *bytes == content(2000)
+        ));
+    }
+
+    #[test]
+    fn a_broadcast_is_stopped_by_its_sender_and_given_up_by_a_listener() {
+        let mut pair = one_way();
+        let up = pair.files[0]
+            .broadcast("notes.txt", content(3000), SYMBOL)
+            .unwrap();
+        for _ in 0..4 {
+            pair.step(0);
+        }
+        assert!(pair.files[1].cancel(1));
+        // the listener hears more, and says nothing: there is nobody to tell
+        for _ in 0..4 {
+            pair.step(0);
+        }
+        assert_eq!(pair.events[1].len(), 1 + 3);
+        assert_eq!(pair.files[1].poll(106, true), None);
+        // the next symbol is with the link when the sender stops
+        pair.files[0].poll(106, true).unwrap();
+        pair.files[0].sent_as(77);
+        assert!(pair.files[0].cancel(up));
+        assert!(!pair.files[0].cancel(up));
+        assert_eq!(pair.files[0].poll_take_back(), Some(77));
+        let sent = pair.log.len();
+        pair.run();
+        assert_eq!(pair.log.len(), sent);
+    }
+
+    #[test]
+    fn a_small_file_goes_in_symbols_no_longer_than_it() {
+        let mut files = Files::new();
+        files.broadcast("tiny", content(30), SYMBOL).unwrap();
+        let announce = files.poll(106, true).unwrap();
+        assert_eq!(announce[15..17], 30u16.to_be_bytes());
+        files.sent_as(1);
+        assert!(files.on_delivered(1, 0));
+        assert_eq!(files.poll(106, true).unwrap().len(), SYMBOL_HEADER + 30);
+        // pieces as even as can be: 205 bytes in three of 69, the last with a byte of padding
+        let mut files = Files::new();
+        files.broadcast("even", content(205), SYMBOL).unwrap();
+        assert_eq!(files.poll(106, true).unwrap()[15..17], 69u16.to_be_bytes());
+    }
+
+    #[test]
+    fn a_broadcast_ends_after_ten_times_the_file() {
+        let mut pair = one_way();
+        let up = pair.files[0]
+            .broadcast("tiny", content(50), SYMBOL)
+            .unwrap();
+        pair.run();
+        // one piece: ten symbols and an announce before every eight
+        assert_eq!(pair.sent(0, OP_SYMBOL).len(), 10);
+        assert_eq!(pair.sent(0, OP_ANNOUNCE).len(), 2);
+        assert_eq!(pair.events[0].last(), Some(&FileEvent::Sent { id: up }));
+        assert!(!pair.files[0].cancel(up));
+    }
+
+    #[test]
+    fn files_broadcast_one_after_another() {
+        let mut pair = one_way();
+        pair.files[0]
+            .broadcast("first", content(50), SYMBOL)
+            .unwrap();
+        pair.files[0].broadcast("second", log(20), SYMBOL).unwrap();
+        pair.run();
+        let names: Vec<&str> = pair.events[1]
+            .iter()
+            .filter_map(|e| match e {
+                FileEvent::Received { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+        // the second has its own number and goes deflated
+        let announces = pair.sent(0, OP_ANNOUNCE);
+        let second = announces.last().unwrap();
+        assert_eq!((second[1], second[10]), (1, DEFLATE));
+    }
+
+    #[test]
+    fn a_broadcast_takes_at_most_256_pieces() {
+        let mut files = Files::new();
+        assert_eq!(
+            files.broadcast("big", content(256 * SYMBOL + 1), SYMBOL),
+            Err(FileError::TooLarge { max: 256 * SYMBOL })
+        );
+        assert!(
+            files
+                .broadcast("fits", content(256 * SYMBOL), SYMBOL)
+                .is_ok()
+        );
+        // a long name is cut to what one frame takes
+        let mut files = Files::new();
+        files.broadcast(&"я".repeat(100), vec![1], SYMBOL).unwrap();
+        let announce = files.poll(106, true).unwrap();
+        assert_eq!(announce.len(), 17 + 88);
+    }
+
+    #[test]
+    fn broadcast_messages_that_make_no_sense_are_ignored() {
+        let mut files = Files::new();
+        let announce = |pieces_of: usize, symbol: u16| {
+            let mut bytes = message(OP_ANNOUNCE, 0, 10);
+            bytes.extend(0u32.to_be_bytes());
+            bytes.push(AS_IT_IS);
+            bytes.extend((pieces_of as u32).to_be_bytes());
+            bytes.extend(symbol.to_be_bytes());
+            bytes
+        };
+        for bytes in [
+            vec![OP_ANNOUNCE, 0, 1],
+            vec![OP_SYMBOL, 0, 0],
+            // symbols of no length, and too many pieces
+            announce(10, 0),
+            announce(257 * 4, 4),
+        ] {
+            files.on_message(2, &bytes, 0);
+        }
+        assert_eq!(files.poll_event(), None);
     }
 }

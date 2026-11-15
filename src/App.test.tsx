@@ -236,7 +236,7 @@ describe('microphone', () => {
   it('turns on: the audio device starts and its port goes to the modem', async () => {
     const { core, audio } = await listening();
     expect(audio.startAudio).toHaveBeenCalledTimes(1);
-    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false, mode: null }]]);
+    expect(core.calls.started).toEqual([[48_000, audio.port, { name: '', manualPtt: false, oneWay: false, mode: null }]]);
     expect(text('#state')).toBe('Listening');
     expect(text('#mic')).toBe('Turn off');
     expect(exists('#level') && exists('#spectrum') && exists('#draft')).toBe(true);
@@ -675,6 +675,77 @@ describe('files', () => {
   });
 });
 
+/** The app with the microphone turned on as a one-way station. */
+async function oneWay() {
+  const started = await start();
+  fireEvent.click($('#one-way', HTMLInputElement));
+  await press(() => $('#mic', HTMLButtonElement).click());
+  return started;
+}
+
+describe('one way', () => {
+  it('is remembered and given to the modem', async () => {
+    const { storage, core } = await oneWay();
+    expect($('#one-way', HTMLInputElement).closest('label')?.textContent).toBe('One-way');
+    expect(loadSettings(storage).oneWay).toBe(true);
+    expect(core.calls.started[0]?.[2]).toEqual({ name: '', manualPtt: false, oneWay: true, mode: null });
+    cleanup();
+    await start({ storage });
+    expect($('#one-way', HTMLInputElement).checked).toBe(true);
+  });
+
+  it('broadcasts a chosen file until it is stopped', async () => {
+    const { core } = await oneWay();
+    await choose('photo.jpg', new Uint8Array(2048));
+    expect(core.calls.files).toEqual([['photo.jpg', new Uint8Array(2048)]]);
+    // nobody is asked: it goes at once
+    expect(text('#feed .file small')).toBe('2.0 KB · Broadcasting… 0% sent');
+    expect($('#feed .file', HTMLElement).dataset.status).toBe('moving');
+    core.emit({ kind: 'fileCast', id: 1, symbols: 3, needed: 6 });
+    expect(text('#feed .file small')).toBe('2.0 KB · Broadcasting… 50% sent');
+    const bar = $('#feed progress', HTMLProgressElement);
+    expect([bar.value, bar.max]).toEqual([3, 6]);
+    // on and on: whoever listens has a better chance with every symbol
+    core.emit({ kind: 'fileCast', id: 1, symbols: 9, needed: 6 });
+    expect(text('#feed .file small')).toBe('2.0 KB · Broadcasting… 150% sent');
+    expect([bar.value, bar.max]).toEqual([6, 6]);
+    await press(() => $('#feed .cancel', HTMLButtonElement).click());
+    expect(core.calls.givenUp).toEqual([1]);
+    expect(text('#feed .file small')).toBe('2.0 KB · Cancelled');
+    // and again
+    await press(() => $('#feed .resend', HTMLButtonElement).click());
+    expect(text('#feed .file small')).toBe('2.0 KB · Broadcasting… 0% sent');
+  });
+
+  it('says when a broadcast ended by itself', async () => {
+    const { core } = await oneWay();
+    await choose('tiny', new Uint8Array(1));
+    core.emit({ kind: 'fileSent', id: 1 });
+    expect(text('#feed .file small')).toBe('1 byte · Sent');
+    expect(exists('#feed button')).toBe(false);
+  });
+
+  it('collects a file that a station broadcasts, without being asked', async () => {
+    const { core } = await listening();
+    core.emit({ kind: 'fileHeard', id: 4, name: 'photo.jpg', size: 1536, station: 9 });
+    expect(text('#feed .file.received small')).toBe('1.5 KB · Receiving… 0%');
+    expect(exists('#feed .accept')).toBe(false);
+    expect($('#feed .cancel', HTMLButtonElement).getAttribute('aria-label')).toBe('Cancel');
+    core.emit({ kind: 'fileProgress', id: 4, done: 768, secondsLeft: 20 });
+    expect(text('#feed .file small')).toBe('1.5 KB · Receiving… 50% · about 20 s left');
+    core.emit({ kind: 'fileReceived', id: 4, name: 'photo.jpg', bytes: new Uint8Array(1536).fill(2) });
+    expect($('#feed .save', HTMLAnchorElement).getAttribute('href')).toBe('blob:1536:2');
+  });
+
+  it('stops collecting at a press', async () => {
+    const { core } = await listening();
+    core.emit({ kind: 'fileHeard', id: 4, name: 'photo.jpg', size: 1536, station: 9 });
+    await press(() => $('#feed .cancel', HTMLButtonElement).click());
+    expect(core.calls.givenUp).toEqual([4]);
+    expect(text('#feed .file small')).toBe('1.5 KB · Cancelled');
+  });
+});
+
 describe('station', () => {
   it('remembers the name and the kind of radio, and gives them to the modem', async () => {
     const { storage, core } = await start();
@@ -682,9 +753,9 @@ describe('station', () => {
     expect($('#ptt-mode', HTMLInputElement).closest('label')?.textContent).toBe('Push-to-talk');
     fireEvent.click($('#ptt-mode', HTMLInputElement));
     fireEvent.change($('#mode', HTMLSelectElement), { target: { value: '2' } });
-    expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true, mode: 2 });
+    expect(loadSettings(storage)).toEqual({ locale: null, name: 'UB1XYZ', manualPtt: true, oneWay: false, mode: 2 });
     await press(() => $('#mic', HTMLButtonElement).click());
-    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true, mode: 2 });
+    expect(core.calls.started[0]?.[2]).toEqual({ name: 'UB1XYZ', manualPtt: true, oneWay: false, mode: 2 });
     expect(text('#speed')).toBe('250 bit/s');
 
     cleanup();

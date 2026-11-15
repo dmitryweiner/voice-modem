@@ -337,13 +337,15 @@ A file goes as messages of type 2 over the link layer, each acknowledged
 like a text. The first byte of such a message is its kind, the second the
 number of the transfer, which the sender counts from 0 (0 again after 255):
 
-| Kind     | From     | After the two bytes                                                                                                                        |
-| -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0 offer  | sender   | length of the file, 4 bytes; CRC-32 of its content, 4 bytes; encoding, 1 byte; length on the air, 4 bytes; its name, up to 255 bytes UTF-8 |
-| 1 accept | receiver | the offset on the air the content is wanted from, 4 bytes                                                                                  |
-| 2 data   | sender   | the offset of the chunk on the air, 4 bytes; the chunk                                                                                     |
-| 3 abort  | sender   | nothing: the sender gives the transfer up                                                                                                  |
-| 4 refuse | receiver | nothing: the receiver declines the offer or gives the transfer up                                                                          |
+| Kind       | From             | After the two bytes                                                                                                                                       |
+| ---------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0 offer    | sender           | length of the file, 4 bytes; CRC-32 of its content, 4 bytes; encoding, 1 byte; length on the air, 4 bytes; its name, up to 255 bytes UTF-8                |
+| 1 accept   | receiver         | the offset on the air the content is wanted from, 4 bytes                                                                                                 |
+| 2 data     | sender           | the offset of the chunk on the air, 4 bytes; the chunk                                                                                                    |
+| 3 abort    | sender           | nothing: the sender gives the transfer up                                                                                                                 |
+| 4 refuse   | receiver         | nothing: the receiver declines the offer or gives the transfer up                                                                                         |
+| 5 announce | sender (one way) | length of the file, 4 bytes; CRC-32, 4 bytes; encoding, 1 byte; length on the air, 4 bytes; bytes of a symbol, 2 bytes; its name, as much as fits a frame |
+| 6 symbol   | sender (one way) | the number of the symbol, 2 bytes; the symbol                                                                                                             |
 
 - **On the air** the content goes deflated (RFC 1951, level 9) when that is
   shorter (encoding 1), or as it is (encoding 0). Offsets and lengths of
@@ -382,8 +384,39 @@ number of the transfer, which the sender counts from 0 (0 again after 255):
   way.
 
 Frames have no destination, so a file, as a text, is for the one other
-station on the channel. A station that does not acknowledge (broadcast) has
-no way to consent: files need the two-way link.
+station on the channel.
+
+### Over a one-way channel (`fountain.rs`)
+
+A station that expects no answers (broadcast frames) cannot ask for consent
+nor learn what arrived. It broadcasts a file instead, for whoever listens:
+
+- **Pieces.** The bytes on the air (deflated when that is shorter, as
+  above) are cut into `k` pieces of `T` bytes, as few as frames take
+  (`k = ⌈L / (room − 4)⌉`, where `room` is what one frame of the mode takes
+  of a message) and as even as can be (`T = ⌈L / k⌉`); the last is padded
+  with zeros. At most 256 pieces: up to 15 KB in R1, 64 KB in R3, 1 MB in
+  F2 and F3.
+- **Symbols.** Symbol `n` for `n < k` is piece `n`. Every further symbol is
+  the sum over all pieces of piece `j` times the coefficient `c_j`, in
+  GF(256) with the polynomial x⁸ + x⁴ + x³ + x² + 1 (0x11D); the
+  coefficients are the bytes of splitmix64 seeded with `n`, the least
+  significant byte of each output first: `state += 0x9E3779B97F4A7C15`;
+  `z = state`; `z = (z ^ z >> 30) · 0xBF58476D1CE4E5B9`;
+  `z = (z ^ z >> 27) · 0x94D049BB133111EB`; `z ^= z >> 31`.
+- **What goes.** An announce, then the symbols from 0 on, one per frame,
+  with the announce again before every eighth: a station that tunes in late
+  learns what the file is. It goes until the sender stops it, or after
+  `10 · k` symbols (65 536 at most).
+- **What a listener does.** It keeps symbols heard before the announce (256
+  at most), then solves for the pieces as symbols come (Gaussian
+  elimination over GF(256)); any `k` independent symbols give the file:
+  nearly always the first `k` that arrive, one or two more now and then.
+  Then it takes the first `L` bytes, inflates them if need be and checks
+  the length and the CRC-32. What comes of that broadcast after is
+  ignored. A listener keeps at most 8 broadcasts at once; the oldest gives
+  way. A station that takes part in a two-way exchange collects broadcasts
+  too.
 
 ## What the receiver reports (`rx.rs`)
 
@@ -407,5 +440,4 @@ followed by an unreadable header, are reported as "heard but not read".
 
 More bits per carrier and bit loading by carrier, keeping blocks that
 arrive after a damaged one, tracking of the symbol clock inside a frame of tones,
-addressed sessions, files over a one-way channel and encryption: see
-[the plan](../plans/PLAN.md).
+addressed sessions and encryption: see [the plan](../plans/PLAN.md).

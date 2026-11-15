@@ -252,6 +252,33 @@ frame):
   both texts after five attempts. The wait before each further repeat now
   doubles: none of the 200 lose them.
 
+## Files over a one-way channel (2026-11-15)
+
+`cargo run --release -p modem-sim --example files`, the one-way columns: the
+time until every piece of 10 KB went once — what a listener on a clean
+channel needs — and the largest file a broadcast takes (256 pieces):
+
+| Mode | 10 KB, two-way | 10 KB, one way | Net speed, one way | Largest broadcast |
+| ---- | -------------- | -------------- | ------------------ | ----------------- |
+| R1   | 36 min         | 31 min         | 42 bit/s           | 15 KB             |
+| R3   | 8 min          | 7 min          | 196 bit/s          | 64 KB             |
+| F1   | 78 s           | 69 s           | 1159 bit/s         | 522 KB            |
+| F3   | 31 s           | 26 s           | 3077 bit/s         | 1 MB              |
+
+- Each piece once is faster than the two-way transfer, which waits for an
+  acknowledgement of every frame; on a channel that loses frames a listener
+  needs more symbols, as many more as were lost.
+- The fountain code: with a third of the symbols lost at random, in 1000
+  trials of 40 and of 256 pieces, 994 and 996 gave the file from exactly as
+  many symbols as it has pieces, the rest from one more (in theory 1 in
+  255 needs one more).
+- Solving for the largest file (256 pieces of 4 KB, a third of them lost)
+  takes 41 ms natively, spread over the transfer.
+- `tests/link.rs` in `modem-sim`: a file of 8 pieces in R3 broadcast through
+  interference that takes some four frames in ten arrives whole.
+
+Not measured: a broadcast between real devices.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through

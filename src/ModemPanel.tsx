@@ -22,7 +22,7 @@ export interface ModemPanelProps {
 type Link =
   | { status: 'off' }
   | { status: 'starting' }
-  | { status: 'on'; session: AudioSession; maxTextBytes: number; manualPtt: boolean }
+  | { status: 'on'; session: AudioSession; maxTextBytes: number; manualPtt: boolean; oneWay: boolean }
   | { status: 'error'; kind: AudioErrorKind };
 
 /**
@@ -62,6 +62,8 @@ type Item =
       /** Sent: the content, to offer it again; what it takes at the speed it was offered at, seconds. */
       bytes?: Uint8Array;
       seconds?: number;
+      /** Broadcast: the symbols that went, and how many make the file (0 until the first went). */
+      cast?: { symbols: number; needed: number };
       /** Received: where to save it from. */
       url?: string;
     }
@@ -122,17 +124,22 @@ type FileItem = Item & { kind: 'file' };
 const isLive = (item: FileItem) => item.status === 'offered' || item.status === 'moving';
 
 function fileNote(t: Messages, item: FileItem): string {
-  const { outgoing, status } = item;
+  const { outgoing, status, cast } = item;
+  const slow = item.seconds !== undefined && item.seconds > SLOW_FILE;
   const parts = [t.fileSize(item.size)];
   if (status === 'offered') {
     parts.push(outgoing ? t.fileWaiting : t.fileOffered);
-    if (item.seconds !== undefined && item.seconds > SLOW_FILE) parts.push(t.fileSlow(item.seconds));
+    if (slow) parts.push(t.fileSlow(item.seconds ?? 0));
+  } else if (status === 'moving' && cast) {
+    parts.push(t.broadcasting(cast.needed > 0 ? Math.floor((cast.symbols / cast.needed) * 100) : 0));
+    if (slow && cast.symbols === 0) parts.push(t.fileSlow(item.seconds ?? 0));
   } else if (status === 'moving') {
     const percent = item.size > 0 ? Math.floor((item.done / item.size) * 100) : 0;
     parts.push(`${outgoing ? t.sending : t.fileReceiving} ${percent}%`);
     if (item.secondsLeft !== null) parts.push(t.timeLeft(item.secondsLeft));
   } else if (status === 'done') {
-    parts.push(outgoing ? t.delivered : t.received);
+    // nobody tells a broadcast who has the file
+    parts.push(cast ? t.sent : outgoing ? t.delivered : t.received);
   } else if (status === 'failed') {
     parts.push(outgoing ? t.notDelivered : t.fileNotReceived);
   } else if (status === 'refused') {
@@ -157,7 +164,12 @@ function FileRow({ t, item, onAccept, onCancel, onResend }: FileRowProps) {
     <li className={item.outgoing ? 'file sent' : 'file received'} data-status={item.status}>
       <span className="text">{item.name}</span>
       <small>{fileNote(t, item)}</small>
-      {item.status === 'moving' && <progress value={item.done} max={item.size} aria-label={item.name} />}
+      {item.status === 'moving' &&
+        (item.cast ? (
+          <progress value={Math.min(item.cast.symbols, item.cast.needed)} max={Math.max(item.cast.needed, 1)} aria-label={item.name} />
+        ) : (
+          <progress value={item.done} max={item.size} aria-label={item.name} />
+        ))}
       {offer && (
         <button type="button" className="accept" aria-label={t.accept} title={t.accept} onClick={() => onAccept(item)}>
           ✓
@@ -269,8 +281,19 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
           add({ key, kind: 'file', run: run.current, id, outgoing: false, name, size, done: 0, secondsLeft: null, status: 'offered' });
           break;
         }
+        case 'fileHeard': {
+          const { id, name, size } = event;
+          add({ key, kind: 'file', run: run.current, id, outgoing: false, name, size, done: 0, secondsLeft: null, status: 'moving' });
+          break;
+        }
         case 'fileProgress':
           updateFile(event.id, { status: 'moving', done: event.done, secondsLeft: event.secondsLeft });
+          break;
+        case 'fileCast':
+          updateFile(event.id, { cast: { symbols: event.symbols, needed: event.needed } });
+          break;
+        case 'fileSent':
+          updateFile(event.id, { status: 'done' });
           break;
         case 'fileReceived': {
           const { id, name, bytes } = event;
@@ -364,7 +387,7 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
       running.current = session;
       run.current++;
       setBitRate(MODE_BIT_RATES[station.mode ?? 0] ?? MODE_BIT_RATES[0]);
-      setLink({ status: 'on', session, maxTextBytes, manualPtt: station.manualPtt });
+      setLink({ status: 'on', session, maxTextBytes, manualPtt: station.manualPtt, oneWay: station.oneWay });
     } catch (error) {
       session?.stop();
       // The audio device started but the modem did not: not the browser's fault.
@@ -405,9 +428,11 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
     }
   };
 
-  /** Offers a file to the other side and shows it. */
+  /** Offers a file to the other side, or broadcasts it, and shows it. */
   const offerFile = async (name: string, bytes: Uint8Array, replaces?: number) => {
     setSendFailed(null);
+    // nobody is asked on a one-way channel: the file goes at once
+    const broadcast = link.status === 'on' && link.oneWay;
     try {
       const { id, seconds } = await core.sendFile(name, bytes);
       const item: Item = {
@@ -420,9 +445,10 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
         size: bytes.length,
         done: 0,
         secondsLeft: null,
-        status: 'offered',
+        status: broadcast ? 'moving' : 'offered',
         bytes,
         seconds,
+        ...(broadcast && { cast: { symbols: 0, needed: 0 } }),
       };
       setItems((list) => [...list.filter((other) => other.key !== replaces), item]);
     } catch {
@@ -513,6 +539,15 @@ export function ModemPanel({ t, core, startAudio, fileUrl, coreReady, station, o
             onChange={(event) => onStationChange({ ...station, manualPtt: event.target.checked })}
           />
           {t.pttLabel}
+        </label>
+        <label title={t.oneWayHint}>
+          <input
+            id="one-way"
+            type="checkbox"
+            checked={station.oneWay}
+            onChange={(event) => onStationChange({ ...station, oneWay: event.target.checked })}
+          />
+          {t.oneWayLabel}
         </label>
         <select
           id="mode"
