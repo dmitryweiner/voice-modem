@@ -33,6 +33,10 @@ pub struct ModemEvent {
     /// "fileReceived": the file `id` arrived whole: `bytes`; `text` is its name.
     /// "fileDelivered", "fileFailed", "fileRefused": the fate of the file `id`
     /// (refused: the other side declined it or gave the transfer up).
+    /// "fileHeard": the station `station` broadcasts the file `id` of `size`
+    /// bytes, named `text`: it is being collected.
+    /// "fileCast": `symbols` symbols of the file `id` being broadcast went;
+    /// `needed` make the file. "fileSent": that broadcast ended by itself.
     /// "hello": a station greeted; `text` is its name.
     /// "sent", "delivered", "failed": the fate of the message `id`.
     /// "retry": no acknowledgement, the message `id` goes out for the `attempt`-th time.
@@ -53,6 +57,9 @@ pub struct ModemEvent {
     /// Seconds the rest of the file takes at the pace of the last chunks; 0 when unknown.
     #[wasm_bindgen(js_name = secondsLeft)]
     pub seconds_left: u32,
+    /// Symbols of a broadcast file that went, and how many make the file.
+    pub symbols: u32,
+    pub needed: u32,
     pub attempt: u8,
     /// 0 is the slowest mode, R1.
     pub mode: u8,
@@ -156,6 +163,32 @@ impl From<Event> for ModemEvent {
                 id,
                 ..Self::of("fileRefused")
             },
+            Event::FileHeard {
+                id,
+                from,
+                name,
+                size,
+            } => Self {
+                id,
+                station: from,
+                text: name,
+                size,
+                ..Self::of("fileHeard")
+            },
+            Event::FileCast {
+                id,
+                symbols,
+                needed,
+            } => Self {
+                id,
+                symbols,
+                needed,
+                ..Self::of("fileCast")
+            },
+            Event::FileSent { id } => Self {
+                id,
+                ..Self::of("fileSent")
+            },
             Event::FrameLost { stats } => Self::heard("frameLost", stats),
             Event::TxRequest => Self::of("txRequest"),
             Event::TxMode { mode } => Self {
@@ -173,6 +206,7 @@ fn new_modem(
     station: u16,
     name: String,
     manual_ptt: bool,
+    one_way: bool,
     seed: u32,
     mode: u8,
 ) -> Result<modem_core::Modem, String> {
@@ -181,6 +215,7 @@ fn new_modem(
         station,
         name,
         manual_ptt,
+        reliable: !one_way,
         seed: u64::from(seed),
         mode: Mode::from_id(mode),
         ..Config::default()
@@ -195,7 +230,6 @@ fn words(error: CommandError) -> String {
         CommandError::EmptyText => "the text is empty".to_owned(),
         CommandError::TextTooLong { max } => format!("the text is longer than {max} bytes"),
         CommandError::FileTooLarge { max } => format!("the file is larger than {max} bytes"),
-        CommandError::NoAnswers => "a file needs a channel that answers".to_owned(),
     }
 }
 
@@ -215,18 +249,21 @@ impl Modem {
     /// A modem for an audio device running at `sample_rate` Hz. `station` is
     /// the address of this station and `seed` feeds its random waits: both
     /// random numbers. With `manual_ptt` every transmission waits for `pttPressed`.
-    /// `mode` is the number of a mode to use for every data frame (0 = R1 … 3 =
-    /// R4, 4 = F1 … 6 = F3), or 255 to adapt to the channel.
+    /// With `one_way` nothing is acknowledged or expected back: texts go
+    /// once, files are broadcast. `mode` is the number of a mode to use for
+    /// every data frame (0 = R1 … 3 = R4, 4 = F1 … 6 = F3), or 255 to adapt
+    /// to the channel (one way: R1).
     #[wasm_bindgen(constructor)]
     pub fn new(
         sample_rate: u32,
         station: u16,
         name: String,
         manual_ptt: bool,
+        one_way: bool,
         seed: u32,
         mode: u8,
     ) -> Result<Modem, JsError> {
-        new_modem(sample_rate, station, name, manual_ptt, seed, mode)
+        new_modem(sample_rate, station, name, manual_ptt, one_way, seed, mode)
             .map(Modem)
             .map_err(|message| JsError::new(&message))
     }
@@ -326,6 +363,7 @@ mod tests {
                 station,
                 format!("station {station}"),
                 false,
+                false,
                 u32::from(station),
                 255,
             )
@@ -359,7 +397,7 @@ mod tests {
     #[test]
     fn errors_are_put_into_words() {
         assert_eq!(
-            new_modem(100, 1, String::new(), false, 1, 255).err(),
+            new_modem(100, 1, String::new(), false, false, 1, 255).err(),
             Some("unsupported sample rate: 100 Hz".to_string())
         );
         let mut modem = modem(1);
@@ -400,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_fixed_mode_is_set_by_its_number() {
-        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, 1, 3).unwrap());
+        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, false, 1, 3).unwrap());
         let mut bob = modem(2);
         send_text(&mut alice.0, "at 500 bit/s from the first frame").unwrap();
         run(&mut alice, &mut bob, 5);
@@ -416,7 +454,7 @@ mod tests {
 
     #[test]
     fn the_fast_modes_have_numbers_too() {
-        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, 1, 6).unwrap());
+        let mut alice = Modem(new_modem(48_000, 1, String::new(), false, false, 1, 6).unwrap());
         let mut bob = modem(2);
         let long = "at 4200 bit/s from the first frame. ".repeat(25);
         send_text(&mut alice.0, &long).unwrap();
@@ -430,7 +468,7 @@ mod tests {
 
     #[test]
     fn greetings_and_push_to_talk_reach_the_application() {
-        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, 1, 255).unwrap());
+        let mut alice = Modem(new_modem(48_000, 1, "Alice".into(), true, false, 1, 255).unwrap());
         let mut bob = modem(2);
         alice.hello();
         run(&mut alice, &mut bob, 1);
@@ -527,5 +565,37 @@ mod tests {
         let failed = std::iter::from_fn(|| alone.poll_event()).last().unwrap();
         assert_eq!((failed.kind.as_str(), failed.id), ("fileFailed", up));
         assert!(nobody.poll_event().is_none());
+    }
+
+    #[test]
+    fn a_one_way_modem_broadcasts_its_files() {
+        let one_way =
+            |station| Modem(new_modem(48_000, station, String::new(), false, true, 1, 0).unwrap());
+        let (mut alice, mut bob) = (one_way(1), one_way(2));
+        let content: Vec<u8> = (0..100u32).map(|i| ((i * 7919) >> 3) as u8).collect();
+        let up = send_file(&mut alice.0, "a.bin", content.clone()).unwrap();
+        // symbols of 59 bytes in R1: two pieces
+        run(&mut alice, &mut bob, 40);
+        let at_bob: Vec<ModemEvent> = std::iter::from_fn(|| bob.poll_event()).collect();
+        let heard = &at_bob[0];
+        assert_eq!(
+            (
+                heard.kind.as_str(),
+                heard.text.as_str(),
+                heard.size,
+                heard.station
+            ),
+            ("fileHeard", "a.bin", 100, 1)
+        );
+        let received = at_bob.last().unwrap();
+        assert_eq!(
+            (received.kind.as_str(), received.id),
+            ("fileReceived", heard.id)
+        );
+        assert_eq!(received.bytes, content);
+        let cast = std::iter::from_fn(|| alice.poll_event())
+            .find(|e| e.kind == "fileCast" && e.symbols == 2)
+            .unwrap();
+        assert_eq!((cast.id, cast.needed), (up, 2));
     }
 }

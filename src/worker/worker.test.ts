@@ -103,6 +103,8 @@ const coreEvent = (fields: Partial<CoreModemEvent> & { kind: string }): CoreMode
   size: 0,
   done: 0,
   secondsLeft: 0,
+  symbols: 0,
+  needed: 0,
   ...fields,
 });
 
@@ -127,7 +129,7 @@ function counter() {
   return () => next++;
 }
 
-const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false, mode: null } as const;
+const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false, oneWay: false, mode: null } as const;
 
 /** A session on a fake core, started at 48 kHz. */
 async function startedSession() {
@@ -172,6 +174,7 @@ describe('protocol', () => {
       { ...start, sampleRate: '48000' },
       { ...start, name: undefined },
       { ...start, manualPtt: 'no' },
+      { ...start, oneWay: undefined },
       { ...start, mode: 'fast' },
       { ...start, mode: undefined },
       { type: 'sendText', jobId: 1 },
@@ -212,6 +215,9 @@ describe('protocol', () => {
       { type: 'event', event: { kind: 'fileDelivered', id: 1 } },
       { type: 'event', event: { kind: 'fileFailed', id: 1 } },
       { type: 'event', event: { kind: 'fileRefused', id: 1 } },
+      { type: 'event', event: { kind: 'fileHeard', id: 1, name: 'a.txt', size: 5, station: 7 } },
+      { type: 'event', event: { kind: 'fileCast', id: 1, symbols: 3, needed: 2 } },
+      { type: 'event', event: { kind: 'fileSent', id: 1 } },
     ];
     for (const reply of good) expect({ reply, ok: isWorkerOut(reply) }).toEqual({ reply, ok: true });
     const bad = [
@@ -226,6 +232,8 @@ describe('protocol', () => {
       { type: 'event', event: { kind: 'fileProgress', id: 1, done: 3 } },
       { type: 'event', event: { kind: 'fileReceived', id: 1, name: 'a.txt', bytes: [1] } },
       { type: 'event', event: { kind: 'fileDelivered' } },
+      { type: 'event', event: { kind: 'fileHeard', id: 1, name: 'a.txt', size: 5 } },
+      { type: 'event', event: { kind: 'fileCast', id: 1, symbols: 3 } },
       { type: 'event', event: { kind: 'unknown' } },
       { type: 'event' },
       'version',
@@ -250,7 +258,15 @@ describe('session', () => {
   it('starts a modem for the device, with a random address and seed', async () => {
     const { out, modem } = await startedSession();
     expect(out).toEqual([{ type: 'started', jobId: 1, maxTextBytes: 5 }]);
-    expect(modem.options).toEqual({ sampleRate: 48_000, name: 'Alice', manualPtt: false, mode: null, station: 0x5678, seed: 0x12345679 });
+    expect(modem.options).toEqual({
+      sampleRate: 48_000,
+      name: 'Alice',
+      manualPtt: false,
+      oneWay: false,
+      mode: null,
+      station: 0x5678,
+      seed: 0x12345679,
+    });
   });
 
   it('reports a sample rate the core refuses', async () => {
@@ -394,6 +410,9 @@ describe('session', () => {
       coreEvent({ kind: 'fileDelivered', id: 2 }),
       coreEvent({ kind: 'fileFailed', id: 3 }),
       coreEvent({ kind: 'fileRefused', id: 4 }),
+      coreEvent({ kind: 'fileHeard', id: 5, text: 'b.bin', size: 9, station: 3 }),
+      coreEvent({ kind: 'fileCast', id: 6, symbols: 4, needed: 3 }),
+      coreEvent({ kind: 'fileSent', id: 6 }),
     ];
     audio.hear(new Float32Array(128));
     expect(events(out)).toEqual([
@@ -405,6 +424,9 @@ describe('session', () => {
       { kind: 'fileDelivered', id: 2 },
       { kind: 'fileFailed', id: 3 },
       { kind: 'fileRefused', id: 4 },
+      { kind: 'fileHeard', id: 5, name: 'b.bin', size: 9, station: 3 },
+      { kind: 'fileCast', id: 6, symbols: 4, needed: 3 },
+      { kind: 'fileSent', id: 6 },
     ]);
   });
 
@@ -533,8 +555,10 @@ describe('coreClient', () => {
   it('hands the audio port over to the worker on start', async () => {
     const { client, workers } = setup();
     const { port1, port2 } = new MessageChannel();
-    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true, mode: 2 });
-    expect(workers[0]?.sent).toEqual([{ type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true, mode: 2 }]);
+    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true, oneWay: true, mode: 2 });
+    expect(workers[0]?.sent).toEqual([
+      { type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true, oneWay: true, mode: 2 },
+    ]);
     expect(workers[0]?.transfers).toEqual([[port1]]);
     workers[0]?.reply({ type: 'started', jobId: 1, maxTextBytes: 1000 });
     expect(await started).toEqual({ maxTextBytes: 1000 });
@@ -592,11 +616,12 @@ describe('coreClient', () => {
 const realCore: Core = {
   version,
   maxTextBytes,
-  createModem: ({ sampleRate, station, name, manualPtt, seed, mode }) => new Modem(sampleRate, station, name, manualPtt, seed, mode ?? 255),
+  createModem: ({ sampleRate, station, name, manualPtt, oneWay, seed, mode }) =>
+    new Modem(sampleRate, station, name, manualPtt, oneWay, seed, mode ?? 255),
 };
 
 /** A session on the real core, started at 48 kHz. */
-async function realSession(name: string, first: number) {
+async function realSession(name: string, first: number, oneWay = false) {
   const out: WorkerOut[] = [];
   const audio = new FakeAudioPort();
   let next = first;
@@ -605,7 +630,7 @@ async function realSession(name: string, first: number) {
     (reply) => out.push(reply),
     () => next++,
   );
-  await handle({ ...START, jobId: 0, name, port: audio.port });
+  await handle({ ...START, jobId: 0, name, oneWay, port: audio.port });
   return { handle, out, audio, incoming: [] as Float32Array[] };
 }
 type RealSession = Awaited<ReturnType<typeof realSession>>;
@@ -639,6 +664,9 @@ function converse(a: RealSession, b: RealSession, seconds: number) {
     }
   }
 }
+
+/** The events of a session about files. */
+const files = (side: RealSession) => events(side.out).filter((event) => event.kind.startsWith('file'));
 
 describe('the WASM core', () => {
   beforeAll(async () => {
@@ -697,7 +725,6 @@ describe('the WASM core', () => {
     await bob.handle({ type: 'acceptFile', jobId: 4, id: 1 });
     converse(alice, bob, 45);
 
-    const files = (side: RealSession) => events(side.out).filter((event) => event.kind.startsWith('file'));
     expect(files(bob).at(-1)).toEqual({ kind: 'fileReceived', id: 1, name: 'байты.bin', bytes });
     expect(files(alice)).toEqual([
       { kind: 'fileProgress', id: 1, done: 0, secondsLeft: null },
@@ -705,6 +732,17 @@ describe('the WASM core', () => {
       { kind: 'fileProgress', id: 1, done: 288, secondsLeft: expect.any(Number) },
       { kind: 'fileDelivered', id: 1 },
     ]);
+  });
+
+  it('broadcasts a file from a one-way session to whoever listens', async () => {
+    const [alice, bob] = [await realSession('Alice', 100, true), await realSession('Bob', 200, true)];
+    const bytes = Uint8Array.from({ length: 100 }, (_, index) => (index * 7919) >> 3);
+    await alice.handle({ type: 'sendFile', jobId: 3, name: 'a.bin', bytes });
+    converse(alice, bob, 40);
+    expect(files(bob)[0]).toEqual({ kind: 'fileHeard', id: 1, name: 'a.bin', size: 100, station: 100 });
+    expect(files(bob).at(-1)).toEqual({ kind: 'fileReceived', id: 1, name: 'a.bin', bytes });
+    // symbols of 59 bytes in the slowest mode: two make the file, and more keep coming
+    expect(files(alice)).toContainEqual({ kind: 'fileCast', id: 1, symbols: 2, needed: 2 });
   });
 
   it('refuses texts the core cannot send', async () => {

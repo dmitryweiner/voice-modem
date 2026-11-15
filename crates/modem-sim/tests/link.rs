@@ -586,3 +586,59 @@ fn two_modems_lose_to_a_burst_of_noise_only_what_it_hits() {
     };
     assert!(*bytes == content);
 }
+
+#[test]
+fn a_broadcast_file_gets_through_a_channel_that_loses_frames() {
+    let one_way = |station: u16| {
+        Modem::new(Config {
+            station,
+            seed: u64::from(station),
+            reliable: false,
+            mode: Some(Mode::R3),
+            ..Config::default()
+        })
+        .unwrap()
+    };
+    let (mut alice, mut bob) = (one_way(1), one_way(2));
+    let mut noise = [Awgn::new(0.05, 1), Awgn::new(0.05, 2)];
+    // 2000 bytes in symbols of 250 bytes: 8 pieces
+    let content = photo(2000);
+    let up = alice.send_file("photo.jpg", content.clone()).unwrap();
+    let (mut at_alice, mut at_bob) = (Vec::new(), Vec::new());
+    // interference over 3 s of every 30: a frame lasts nearly 10 s, so some
+    // four in ten meet it
+    talk(
+        &mut alice,
+        &mut bob,
+        &mut noise,
+        400.0,
+        |alice, bob, time| {
+            at_alice.extend(events(alice));
+            at_bob.extend(events(bob));
+            time % 30.0 > 27.0
+        },
+    );
+    let Some(Event::FileReceived { name, bytes, .. }) = at_bob
+        .iter()
+        .find(|e| matches!(e, Event::FileReceived { .. }))
+    else {
+        panic!("not received: {at_bob:?}");
+    };
+    assert_eq!(name, "photo.jpg");
+    assert!(*bytes == content);
+    // more than the 8 pieces had to go: some were lost
+    let went = at_bob
+        .iter()
+        .position(|e| matches!(e, Event::FileReceived { .. }));
+    let lost = at_bob
+        .iter()
+        .take(went.unwrap_or(0))
+        .filter(|e| matches!(e, Event::FrameLost { .. }))
+        .count();
+    assert!(lost > 0, "{at_bob:?}");
+    assert!(
+        at_alice
+            .iter()
+            .all(|e| matches!(e, Event::FileCast { id, .. } if *id == up))
+    );
+}

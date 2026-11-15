@@ -34,6 +34,12 @@ export type CoreEvent =
    * the content arrived damaged) / declined the file or gave it up.
    */
   | { kind: 'fileDelivered' | 'fileFailed' | 'fileRefused'; id: number }
+  /** A station broadcasts a file: it is being collected; progress and the file follow under this id. */
+  | { kind: 'fileHeard'; id: number; name: string; size: number; station: number }
+  /** So many symbols of the file being broadcast went; `needed` of them make the file. */
+  | { kind: 'fileCast'; id: number; symbols: number; needed: number }
+  /** The broadcast ended by itself: ten times the file went. */
+  | { kind: 'fileSent'; id: number }
   /** Sound of this length has gone to the speaker. */
   | { kind: 'txStart'; seconds: number }
   /** The last sample has been played. */
@@ -44,6 +50,8 @@ export interface StationOptions {
   name: string;
   /** Every transmission waits for the `ptt` request. */
   manualPtt: boolean;
+  /** Nothing comes back: texts go once, files are broadcast. */
+  oneWay: boolean;
   /** The number of the mode of every data frame (0 is the slowest), or null to adapt to the channel. */
   mode: number | null;
 }
@@ -110,6 +118,7 @@ export function isWorkerIn(value: unknown): value is WorkerIn {
         value.port instanceof MessagePort &&
         typeof value.name === 'string' &&
         typeof value.manualPtt === 'boolean' &&
+        typeof value.oneWay === 'boolean' &&
         (value.mode === null || isNumber(value.mode))
       );
     case 'sendText':
@@ -154,7 +163,12 @@ function isCoreEvent(value: unknown): value is CoreEvent {
     case 'fileDelivered':
     case 'fileFailed':
     case 'fileRefused':
+    case 'fileSent':
       return isNumber(value.id);
+    case 'fileHeard':
+      return isNumber(value.id) && typeof value.name === 'string' && isNumber(value.size) && isNumber(value.station);
+    case 'fileCast':
+      return isNumber(value.id) && isNumber(value.symbols) && isNumber(value.needed);
     case 'txRequest':
     case 'txEnd':
       return true;

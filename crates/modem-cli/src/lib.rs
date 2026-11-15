@@ -5,25 +5,33 @@ pub mod wav;
 use std::fmt::Write as _;
 use std::fs;
 
+use modem_core::files::{FileEvent, Files};
 use modem_core::link::{Heard, Link, LinkConfig, LinkEvent};
 use modem_core::rx::seconds;
-use modem_core::{Config, Mode, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig, VERSION};
+use modem_core::{
+    CommandError, Config, Event, Mode, Modem, Receiver, RxEvent, RxStats, SAMPLE_RATE, TxConfig,
+    VERSION,
+};
 use modem_sim::{Awgn, BandPass, Chain, Channel, Clip, ClockOffset, FreqShift, rms};
 
 pub const USAGE: &str = "\
 modem-cli — the Voice Modem core from the command line
 
-  modem-cli encode <text>... -o out.wav [--mode r1..r4|f1..f3] [--lead-in MS]
-                                       [--amplitude 0..1] [--pause S]
+  modem-cli encode [<text>...] [--file PATH [--times X]] -o out.wav
+                   [--mode r1..r4|f1..f3] [--lead-in MS] [--amplitude 0..1] [--pause S]
       The texts (up to 1000 bytes of UTF-8 each) as one-way frames, sent once
       and not acknowledged, into a 16 kHz WAV file, with S seconds of silence
-      at the end. The mode: r1 (62.5 bit/s, the default) to r4 (500 bit/s)
-      are tones; f1 to f3 (1400, 2800 and 4200 bit/s) are carriers.
+      at the end. A file is broadcast after them: its pieces (deflated when
+      that is shorter) and symbols of a fountain code, X times the pieces in
+      all (1.5 by default); a listener needs about as many as there are
+      pieces, whichever. The mode: r1 (62.5 bit/s, the default) to r4
+      (500 bit/s) are tones; f1 to f3 (1400, 2800 and 4200 bit/s) are carriers.
 
-  modem-cli decode in.wav
+  modem-cli decode in.wav [--save DIR]
       Prints every message heard in a 16 kHz WAV file with the time, the
-      signal-to-noise ratio (8 kHz band) and the frequency offset.
-      Fails when there is none.
+      signal-to-noise ratio (8 kHz band) and the frequency offset, and every
+      file collected; with --save the files go into DIR under their names.
+      Fails when there is nothing.
 
   modem-cli channel in.wav -o out.wav [--telephone] [--shift HZ] [--ppm N]
                                       [--clip LEVEL] [--snr DB] [--seed N]
@@ -38,6 +46,9 @@ modem-cli — the Voice Modem core from the command line
 pub enum Cli {
     Encode {
         texts: Vec<String>,
+        /// A file to broadcast after the texts, and how many times its pieces to send.
+        file: Option<String>,
+        times: f32,
         output: String,
         lead_in_ms: u32,
         pause_s: f32,
@@ -46,6 +57,8 @@ pub enum Cli {
     },
     Decode {
         input: String,
+        /// Where to write the files collected.
+        save: Option<String>,
     },
     Channel {
         input: String,
@@ -90,7 +103,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     }
 
     let mut positional = Vec::new();
-    let mut output = None;
+    let (mut output, mut file, mut times, mut save) = (None, None, 1.5f32, None);
     let (mut lead_in_ms, mut amplitude, mut pause_s) = (0, TxConfig::default().amplitude, 0.0);
     let mut mode = Mode::R1;
     let (mut telephone, mut shift_hz, mut ppm, mut clip, mut snr_db, mut seed) =
@@ -98,7 +111,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     while let Some(arg) = args.next() {
         let commands: &[&str] = match arg.as_str() {
             "-o" | "--output" => &["encode", "channel"],
-            "--lead-in" | "--amplitude" | "--pause" | "--mode" => &["encode"],
+            "--lead-in" | "--amplitude" | "--pause" | "--mode" | "--file" | "--times" => {
+                &["encode"]
+            }
+            "--save" => &["decode"],
             "--telephone" | "--shift" | "--ppm" | "--clip" | "--snr" | "--seed" => &["channel"],
             // A text may not start with "--"; a negative number is the value of an option.
             option if option.starts_with("--") => return Err(format!("unknown option {option}")),
@@ -113,6 +129,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         match arg.as_str() {
             "-o" | "--output" => output = Some(value::<String>(&arg, &mut args)?),
             "--lead-in" => lead_in_ms = value(&arg, &mut args)?,
+            "--file" => file = Some(value::<String>(&arg, &mut args)?),
+            "--times" => times = value(&arg, &mut args)?,
+            "--save" => save = Some(value::<String>(&arg, &mut args)?),
             "--pause" => pause_s = value(&arg, &mut args)?,
             "--mode" => {
                 let name: String = value(&arg, &mut args)?;
@@ -136,14 +155,21 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let output = output.ok_or("need -o <file.wav>".to_string());
     Ok(match command.as_str() {
         "encode" => {
-            if positional.is_empty() {
-                return Err("need at least one text".into());
+            if positional.is_empty() && file.is_none() {
+                return Err("need at least one text or a --file".into());
+            }
+            if times.is_nan() || times < 1.0 {
+                return Err(
+                    "--times must be at least 1: fewer symbols than the file has pieces".into(),
+                );
             }
             if !(amplitude > 0.0 && amplitude <= 1.0) {
                 return Err("--amplitude must be above 0 and at most 1".into());
             }
             Cli::Encode {
                 texts: positional,
+                file,
+                times,
                 output: output?,
                 lead_in_ms,
                 pause_s,
@@ -153,6 +179,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         }
         "decode" => Cli::Decode {
             input: one("input file", positional)?,
+            save,
         },
         _ => Cli::Channel {
             input: one("input file", positional)?,
@@ -167,8 +194,33 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     })
 }
 
+/// A file to broadcast: its name and bytes, and how many times its pieces
+/// the symbols that go are to be.
+pub struct FileToSend {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub times: f32,
+}
+
+/// What `transmit` made: the samples and, with a file, the symbols that went
+/// and the pieces of the file.
+pub struct Transmitted {
+    pub samples: Vec<f32>,
+    pub symbols: Option<(u32, u32)>,
+}
+
 /// The samples of the given texts, sent one way: nothing is expected back.
 pub fn encode(texts: &[String], tx: TxConfig, mode: Mode) -> Result<Vec<f32>, String> {
+    transmit(texts, None, tx, mode).map(|transmitted| transmitted.samples)
+}
+
+/// The samples of the given texts and then of a file broadcast, sent one way.
+pub fn transmit(
+    texts: &[String],
+    file: Option<FileToSend>,
+    tx: TxConfig,
+    mode: Mode,
+) -> Result<Transmitted, String> {
     let config = Config {
         tx,
         reliable: false,
@@ -185,20 +237,67 @@ pub fn encode(texts: &[String], tx: TxConfig, mode: Mode) -> Result<Vec<f32>, St
             )
         })?;
     }
+    let cast = match file {
+        Some(FileToSend { name, bytes, times }) => {
+            let id = modem.send_file(&name, bytes).map_err(|error| match error {
+                CommandError::FileTooLarge { max } => {
+                    format!("{name}: a broadcast in this mode takes at most {max} bytes")
+                }
+                other => format!("{name}: {other:?}"),
+            })?;
+            Some((id, times))
+        }
+        None => None,
+    };
     // The modem transmits as its clock runs: give it silence to listen to.
     let mut samples = Vec::new();
     let mut block = [0.0; 512];
+    let mut symbols = None;
     while !modem.is_idle() {
         modem.push_rx(&[0.0; 512]);
         modem.pull_tx(&mut block);
         samples.extend(block);
+        while let Some(event) = modem.poll_event() {
+            if let (
+                Event::FileCast {
+                    id,
+                    symbols: went,
+                    needed,
+                },
+                Some((cast, times)),
+            ) = (event, cast)
+                && id == cast
+            {
+                symbols = Some((went, needed));
+                // A symbol is reported as it starts: the next one is not with the link yet.
+                if went as f32 >= times * needed as f32 {
+                    modem.cancel_file(id);
+                }
+            }
+        }
     }
-    Ok(samples)
+    Ok(Transmitted { samples, symbols })
 }
 
-/// A report of what is heard in the samples, a line per message or unreadable frame,
-/// and the number of messages.
-pub fn decode(samples: &[f32]) -> (String, usize) {
+/// What `decode` heard.
+pub struct Decoded {
+    /// A line per message, file or unreadable frame.
+    pub report: String,
+    pub messages: usize,
+    /// The files collected: names and contents.
+    pub files: Vec<(String, Vec<u8>)>,
+}
+
+/// The name a received file is saved under: no directories, nothing hidden above.
+pub fn file_name(name: &str) -> String {
+    match name.rsplit(['/', '\\']).next() {
+        Some(last) if !matches!(last, "" | "." | "..") => last.to_owned(),
+        _ => "received".to_owned(),
+    }
+}
+
+/// What is heard in the samples: the messages and the files broadcast.
+pub fn decode(samples: &[f32]) -> Decoded {
     // Only listens: the link layer puts the segments together and is never asked to answer.
     let mut receiver = Receiver::new();
     let mut link = Link::new(
@@ -212,8 +311,9 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
         },
         0,
     );
+    let mut files = Files::new();
     receiver.push(samples);
-    let (mut report, mut messages) = (String::new(), 0);
+    let (mut report, mut messages, mut collected) = (String::new(), 0, Vec::new());
     let mut line = |stats: RxStats, text: &str| {
         let time = seconds(stats.start as usize);
         writeln!(
@@ -241,9 +341,28 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
                 }
                 link.on_frame(&frame, heard, stats.start);
                 while let Some(event) = link.poll_event() {
-                    if let LinkEvent::Text { text, .. } = event {
-                        messages += 1;
-                        line(stats, &text);
+                    match event {
+                        LinkEvent::Text { text, .. } => {
+                            messages += 1;
+                            line(stats, &text);
+                        }
+                        LinkEvent::File { from, bytes } => {
+                            files.on_message(from, &bytes, stats.start)
+                        }
+                        _ => {}
+                    }
+                }
+                while let Some(event) = files.poll_event() {
+                    match event {
+                        FileEvent::Heard { name, size, .. } => {
+                            line(stats, &format!("(a file broadcast: {name}, {size} bytes)"));
+                        }
+                        FileEvent::Received { name, bytes, .. } => {
+                            line(stats, &format!("{name}, {} bytes", bytes.len()));
+                            collected.push((name, bytes));
+                        }
+                        FileEvent::Failed { .. } => line(stats, "(a file arrived damaged)"),
+                        _ => {}
                     }
                 }
             }
@@ -252,7 +371,11 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
             }
         }
     }
-    (report, messages)
+    Decoded {
+        report,
+        messages,
+        files: collected,
+    }
 }
 
 fn read(path: &str) -> Result<Vec<f32>, String> {
@@ -271,35 +394,67 @@ pub fn run(cli: Cli) -> Result<String, String> {
         Cli::Version => Ok(format!("modem-core {VERSION}\n")),
         Cli::Encode {
             texts,
+            file,
+            times,
             output,
             lead_in_ms,
             amplitude,
             pause_s,
             mode,
         } => {
-            let mut samples = encode(
-                &texts,
-                TxConfig {
-                    amplitude,
-                    lead_in_ms,
-                },
-                mode,
-            )?;
+            let file = match file {
+                Some(path) => Some(FileToSend {
+                    name: file_name(&path),
+                    bytes: fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
+                    times,
+                }),
+                None => None,
+            };
+            let name = file.as_ref().map(|file| file.name.clone());
+            let tx = TxConfig {
+                amplitude,
+                lead_in_ms,
+            };
+            let Transmitted {
+                mut samples,
+                symbols,
+            } = transmit(&texts, file, tx, mode)?;
             samples.resize(
                 samples.len() + (pause_s.clamp(0.0, 3600.0) * SAMPLE_RATE as f32) as usize,
                 0.0,
             );
             write(&output, &samples)?;
+            let file = match (name, symbols) {
+                (Some(name), Some((went, pieces))) => {
+                    format!("{name} in {went} symbols of {pieces} pieces, ")
+                }
+                _ => String::new(),
+            };
             Ok(format!(
-                "{output}: {} message(s), {:.1} s\n",
+                "{output}: {} message(s), {file}{:.1} s\n",
                 texts.len(),
                 seconds(samples.len())
             ))
         }
-        Cli::Decode { input } => match decode(&read(&input)?) {
-            (report, 0) => Err(format!("{report}{input}: no messages")),
-            (report, _) => Ok(report),
-        },
+        Cli::Decode { input, save } => {
+            let Decoded {
+                mut report,
+                messages,
+                files,
+            } = decode(&read(&input)?);
+            if messages == 0 && files.is_empty() {
+                return Err(format!("{report}{input}: no messages"));
+            }
+            if let Some(directory) = save {
+                fs::create_dir_all(&directory).map_err(|e| format!("{directory}: {e}"))?;
+                for (name, bytes) in files {
+                    let path = std::path::Path::new(&directory).join(file_name(&name));
+                    fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                    writeln!(report, "saved to {}", path.display()).expect("writing to a string");
+                }
+            }
+            Ok(report)
+        }
         Cli::Channel {
             input,
             output,
@@ -368,12 +523,27 @@ mod tests {
             cli,
             Cli::Encode {
                 texts: vec!["hello there".into(), "second".into()],
+                file: None,
+                times: 1.5,
                 output: "a.wav".into(),
                 lead_in_ms: 300,
                 pause_s: 0.0,
                 mode: Mode::R1,
                 amplitude: 0.5
             }
+        );
+        assert_eq!(
+            parse(args("encode --file photo.jpg --times 3 -o a.wav --mode f2")),
+            Ok(Cli::Encode {
+                texts: vec![],
+                file: Some("photo.jpg".into()),
+                times: 3.0,
+                output: "a.wav".into(),
+                lead_in_ms: 0,
+                pause_s: 0.0,
+                mode: Mode::F2,
+                amplitude: 0.5
+            })
         );
     }
 
@@ -382,7 +552,15 @@ mod tests {
         assert_eq!(
             parse(args("decode in.wav")),
             Ok(Cli::Decode {
-                input: "in.wav".into()
+                input: "in.wav".into(),
+                save: None
+            })
+        );
+        assert_eq!(
+            parse(args("decode in.wav --save files")),
+            Ok(Cli::Decode {
+                input: "in.wav".into(),
+                save: Some("files".into())
             })
         );
         assert_eq!(
@@ -431,7 +609,12 @@ mod tests {
     fn explains_wrong_arguments() {
         for (line, message) in [
             ("transmit x", "unknown command \"transmit\""),
-            ("encode -o a.wav", "need at least one text"),
+            ("encode -o a.wav", "need at least one text or a --file"),
+            (
+                "encode --file a.jpg --times 0.9 -o a.wav",
+                "--times must be at least 1: fewer symbols than the file has pieces",
+            ),
+            ("decode a.wav --times 2", "decode has no option --times"),
             ("encode hi", "need -o <file.wav>"),
             ("encode hi -o", "-o needs a value"),
             (
@@ -453,11 +636,93 @@ mod tests {
     }
 
     #[test]
+    fn a_file_goes_through_a_recording_and_a_noisy_line() {
+        let (photo, clean, noisy, saved) = (
+            temp("photo.jpg"),
+            temp("broadcast.wav"),
+            temp("broadcast-noisy.wav"),
+            temp("saved"),
+        );
+        let mut seed = 3u32;
+        let content: Vec<u8> = (0..600)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        fs::write(&photo, &content).unwrap();
+        let printed = run(parse(args(&format!(
+            "encode hello --file {photo} --times 2 -o {clean} --mode r3"
+        )))
+        .unwrap())
+        .unwrap();
+        // 600 bytes in symbols of 250: 3 pieces, 6 symbols, an announce
+        let name = std::path::Path::new(&photo)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            printed.starts_with(&format!(
+                "{clean}: 1 message(s), {name} in 6 symbols of 3 pieces, "
+            )),
+            "{printed}"
+        );
+        run(parse(args(&format!(
+            "channel {clean} -o {noisy} --telephone --snr 6"
+        )))
+        .unwrap())
+        .unwrap();
+        let report = run(parse(args(&format!("decode {noisy} --save {saved}"))).unwrap()).unwrap();
+        assert!(report.contains("  hello\n"), "{report}");
+        let path = std::path::Path::new(&saved).join(&name);
+        assert!(
+            report.contains(&format!("  {name}, 600 bytes\n")),
+            "{report}"
+        );
+        assert!(
+            report.ends_with(&format!("saved to {}\n", path.display())),
+            "{report}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), content);
+        for path in [photo, clean, noisy] {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(saved).unwrap();
+    }
+
+    #[test]
+    fn a_file_alone_is_broadcast_too() {
+        let file = FileToSend {
+            name: "a.bin".into(),
+            bytes: vec![7; 100],
+            times: 1.0,
+        };
+        let Transmitted { samples, symbols } =
+            transmit(&[], Some(file), TxConfig::default(), Mode::R3).unwrap();
+        assert_eq!(symbols, Some((1, 1)));
+        assert_eq!(
+            decode(&samples).files,
+            [("a.bin".to_string(), vec![7; 100])]
+        );
+    }
+
+    #[test]
+    fn a_received_file_is_saved_under_its_name_only() {
+        assert_eq!(file_name("../../etc/passwd"), "passwd");
+        assert_eq!(file_name("C:\\photos\\cat.jpg"), "cat.jpg");
+        assert_eq!(file_name(".."), "received");
+        assert_eq!(file_name(""), "received");
+    }
+
+    #[test]
     fn text_goes_through_a_file_and_a_channel() {
         let (clean, noisy) = (temp("clean.wav"), temp("noisy.wav"));
         let texts = vec!["Привет!".to_string(), "over a noisy line".to_string()];
         let printed = run(Cli::Encode {
             texts,
+            file: None,
+            times: 1.5,
             output: clean.clone(),
             lead_in_ms: 200,
             pause_s: 0.0,
@@ -481,6 +746,7 @@ mod tests {
         .unwrap();
         let report = run(Cli::Decode {
             input: noisy.clone(),
+            save: None,
         })
         .unwrap();
         let lines: Vec<&str> = report.lines().collect();
@@ -501,7 +767,9 @@ mod tests {
     fn a_long_text_is_cut_into_frames_and_put_together() {
         let long = "Съешь же ещё этих мягких французских булок, да выпей чаю. ".repeat(3);
         let samples = encode(std::slice::from_ref(&long), TxConfig::default(), Mode::R1).unwrap();
-        let (report, messages) = decode(&samples);
+        let Decoded {
+            report, messages, ..
+        } = decode(&samples);
         assert_eq!(messages, 1);
         assert!(report.trim_end().ends_with(long.trim_end()), "{report}");
         // the first frame is ruined: the message cannot be put together
@@ -509,7 +777,9 @@ mod tests {
         for (n, x) in damaged[60_000..110_000].iter_mut().enumerate() {
             *x = (n as f32 * 0.4).sin() * 0.5;
         }
-        let (report, messages) = decode(&damaged);
+        let Decoded {
+            report, messages, ..
+        } = decode(&damaged);
         assert_eq!(messages, 0, "{report}");
         assert!(report.contains("(unreadable frame)"), "{report}");
     }
@@ -526,7 +796,9 @@ mod tests {
                 unreachable!()
             };
             let samples = encode(&text, TxConfig::default(), mode).unwrap();
-            let (report, messages) = decode(&samples);
+            let Decoded {
+                report, messages, ..
+            } = decode(&samples);
             assert_eq!(messages, 1, "{name}: {report}");
             assert!(report.trim_end().ends_with(text[0].trim_end()), "{name}");
             lengths.push((samples.len() as f32 / 16_000.0).round());
@@ -555,14 +827,16 @@ mod tests {
         fs::write(&silent, wav::encode(&[0.0; 32_000])).unwrap();
         assert_eq!(
             run(Cli::Decode {
-                input: silent.clone()
+                input: silent.clone(),
+                save: None
             }),
             Err(format!("{silent}: no messages"))
         );
         fs::remove_file(silent).unwrap();
         assert!(
             run(Cli::Decode {
-                input: "/nonexistent/x.wav".into()
+                input: "/nonexistent/x.wav".into(),
+                save: None
             })
             .unwrap_err()
             .starts_with("/nonexistent/x.wav: ")

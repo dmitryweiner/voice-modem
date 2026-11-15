@@ -8,6 +8,8 @@ export interface Settings {
   name: string;
   /** A radio with a push-to-talk button the user presses for every transmission. */
   manualPtt: boolean;
+  /** Nothing comes back: texts go once, files are broadcast. */
+  oneWay: boolean;
   /** The number of the mode every text is sent in, or null to adapt to the channel. */
   mode: number | null;
 }
@@ -20,7 +22,7 @@ export type KeyValueStorage = Pick<Storage, 'getItem' | 'setItem'>;
 export const STORAGE_KEY = __APP_ID__;
 const VERSION = 1;
 
-export const DEFAULT_SETTINGS: Settings = { locale: null, name: '', manualPtt: false, mode: null };
+export const DEFAULT_SETTINGS: Settings = { locale: null, name: '', manualPtt: false, oneWay: false, mode: null };
 
 const isMode = (value: unknown): value is number => Number.isInteger(value) && Number(value) >= 0 && Number(value) < MODE_BIT_RATES.length;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -32,11 +34,12 @@ export function loadSettings(storage: KeyValueStorage | null): Settings {
     if (!raw) return { ...DEFAULT_SETTINGS };
     const data: unknown = JSON.parse(raw);
     if (!isRecord(data) || data.version !== VERSION || !isRecord(data.settings)) return { ...DEFAULT_SETTINGS };
-    const { locale, name, manualPtt, mode } = data.settings;
+    const { locale, name, manualPtt, oneWay, mode } = data.settings;
     return {
       locale: isLocale(locale) ? locale : DEFAULT_SETTINGS.locale,
       name: typeof name === 'string' && name.length <= MAX_NAME_LENGTH ? name : DEFAULT_SETTINGS.name,
       manualPtt: typeof manualPtt === 'boolean' ? manualPtt : DEFAULT_SETTINGS.manualPtt,
+      oneWay: typeof oneWay === 'boolean' ? oneWay : DEFAULT_SETTINGS.oneWay,
       mode: isMode(mode) ? mode : DEFAULT_SETTINGS.mode,
     };
   } catch {

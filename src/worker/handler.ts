@@ -40,6 +40,8 @@ export interface CoreModemEvent {
   done: number;
   /** 0 when unknown. */
   secondsLeft: number;
+  symbols: number;
+  needed: number;
   free?: () => void;
 }
 
@@ -63,7 +65,7 @@ function toEvent(event: CoreModemEvent): CoreEvent | null {
   const { kind, text, id, attempt, mode, bitRate, station, snrDb, freqOffsetHz } = event;
   // Each read of `bytes` copies the file out of the WASM memory: only when it is one.
   const bytes = kind === 'fileReceived' ? event.bytes : null;
-  const { size, done, secondsLeft } = event;
+  const { size, done, secondsLeft, symbols, needed } = event;
   event.free?.();
   switch (kind) {
     case 'message':
@@ -91,7 +93,12 @@ function toEvent(event: CoreModemEvent): CoreEvent | null {
     case 'fileDelivered':
     case 'fileFailed':
     case 'fileRefused':
+    case 'fileSent':
       return { kind, id };
+    case 'fileHeard':
+      return { kind, id, name: text, size, station };
+    case 'fileCast':
+      return { kind, id, symbols, needed };
     default:
       return null;
   }
@@ -158,12 +165,13 @@ export function createSession(
         return { type: 'version', jobId, version: loaded.version() };
       case 'start': {
         stop();
-        const { name, manualPtt, mode } = message;
+        const { name, manualPtt, oneWay, mode } = message;
         // An address of zero is as good as any other; the seed must not be zero for some generators.
         modem = loaded.createModem({
           sampleRate: message.sampleRate,
           name,
           manualPtt,
+          oneWay,
           mode,
           station: random() & 0xffff,
           seed: random() | 1,

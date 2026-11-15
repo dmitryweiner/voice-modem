@@ -21,9 +21,9 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   mode by the advice in acknowledgements) are done. Stage 5 (files,
   broadcast, encryption) is under way: file transfer over the two-way link
   (offer, consent, chunks, cancelling, going on after a break), several
-  blocks per frame under one acknowledgement and compression (packed texts,
-  deflated files) are done; broadcast with fountain codes and encryption
-  are next.
+  blocks per frame under one acknowledgement, compression (packed texts,
+  deflated files) and broadcast (one-way stations, files in a fountain
+  code) are done; encryption is next.
 
 ## Commands
 
@@ -51,8 +51,8 @@ login shell may put an older one first). Rust — stable with the
 - `npm run format` — prettier and `cargo fmt`.
 - `npm run icons` — render the PWA PNG icons from `public/icon.svg`.
 - `cargo run --release -p modem-cli -- help` — the native tool: `encode`
-  texts into a WAV file, `decode` a WAV file, pass one through a simulated
-  `channel`.
+  texts and a file broadcast into a WAV file, `decode` a WAV file (and save
+  the files in it), pass one through a simulated `channel`.
 
 ## Scripts
 
@@ -67,7 +67,8 @@ login shell may put an older one first). Rust — stable with the
   between the header and the payload would give in a room.
 - `cargo run --release -p modem-sim --example files` — what a file costs in
   each mode: the time for 10 and 100 KB and the net speed against the speed
-  of the mode. Source of the file table in `docs/measurements.md`.
+  of the mode, two-way and broadcast. Source of the file tables in
+  `docs/measurements.md`.
 - `cargo run --release -p modem-sim --example packing` — chat texts in UTF-8
   and packed, with their frames in R1; files as they are and deflated.
   Source of the packing tables in `docs/measurements.md`.
@@ -128,8 +129,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   of modes and the advice, the blocks a frame takes and which of them
   arrived); `files.rs` — file transfer, pure logic on
   messages and a clock (offers, consent, chunks, deflate, the checksum,
-  going on after a break, the time left); `text.rs` — texts packed in a
-  fixed Huffman code; `tx.rs` / `rx.rs` — a frame to samples
+  going on after a break, the time left; broadcast files over a one-way
+  channel); `fountain.rs` — the fountain code of broadcast files;
+  `text.rs` — texts packed in a fixed Huffman code; `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;

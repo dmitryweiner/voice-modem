@@ -18,7 +18,9 @@ to press it. A file is offered first and sent once the other side accepts it,
 with the progress and the time left on both screens; a transfer that broke
 off goes on from where it stopped when the file is sent again. Texts go
 packed (a Russian one in about 40% of its bytes), files deflated when that
-helps.
+helps. A one-way station (a radio that only transmits, a recording) sends
+texts once and broadcasts files in a fountain code: whoever listens collects
+any of the symbols, as many as the file has pieces.
 
 Seven modes from 62.5 to 4200 bit/s, chosen by the modem itself from how well
 the other side hears it: tones for noise, distance and phone codecs, and
@@ -36,6 +38,10 @@ The same modem from the command line:
 cargo run --release -p modem-cli -- encode "Hello over the air" -o hello.wav
 cargo run --release -p modem-cli -- channel hello.wav -o noisy.wav --telephone --snr -10
 cargo run --release -p modem-cli -- decode noisy.wav
+
+# a file broadcast into a recording, and collected from it
+cargo run --release -p modem-cli -- encode --file photo.jpg --times 2 --mode f1 -o photo.wav
+cargo run --release -p modem-cli -- decode photo.wav --save received/
 ```
 
 ## Development

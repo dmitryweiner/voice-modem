@@ -1,7 +1,7 @@
 // Browser smoke of the real app: language detection and memory, the modem
-// core loaded through the worker, a message received from the microphone and
-// one transmitted, a file offered, no horizontal scroll on a phone, no
-// console errors. With
+// core loaded through the worker, a message and a broadcast file received
+// from the microphone, a text transmitted, a file offered, no horizontal
+// scroll on a phone, no console errors. With
 // --preview it runs against a fresh production build and also checks that
 // the service worker makes the app (WASM core included) work offline and
 // that a new deploy reaches a page that is already open (phones suspend
@@ -29,14 +29,38 @@ const flags = parseArgs(process.argv.slice(2));
 const preview = flags.has('preview');
 const shots = flags.has('shots');
 
-// The recording ends with silence long enough for the page to get a word in: it
+// The recording, in R3 to keep it short: a text, then a small file broadcast
+// in one symbol, then silence long enough for the page to get a word in: it
 // transmits only when the channel is quiet.
 const HEARD = 'Hello from the fake microphone';
+const BROADCAST = 'field-notes.txt';
 const temp = mkdtempSync(join(tmpdir(), 'voice-modem-smoke-'));
 const microphone = join(temp, 'microphone.wav');
-execFileSync('cargo', ['run', '--release', '--quiet', '-p', 'modem-cli', '--', 'encode', HEARD, '-o', microphone, '--pause', '6'], {
-  stdio: ['ignore', 'ignore', 'inherit'],
-});
+writeFileSync(join(temp, BROADCAST), 'Heard over the air, saved from a broadcast.\n');
+execFileSync(
+  'cargo',
+  [
+    'run',
+    '--release',
+    '--quiet',
+    '-p',
+    'modem-cli',
+    '--',
+    'encode',
+    HEARD,
+    '--file',
+    join(temp, BROADCAST),
+    '--times',
+    '1',
+    '--mode',
+    'r3',
+    '-o',
+    microphone,
+    '--pause',
+    '6',
+  ],
+  { stdio: ['ignore', 'ignore', 'inherit'] },
+);
 
 const app = await launch({
   preview,
@@ -86,7 +110,7 @@ try {
       .waitFor({ timeout: 10_000 })
       .catch(() => check(false, 'the microphone did not turn on'));
     // the recording loops: the first pass may have started before the worklet was ready
-    const received = page.locator('#feed .received .text').first();
+    const received = page.locator('#feed .received:not(.file) .text').first();
     await received.waitFor({ timeout: 30_000 }).catch(() => check(false, 'nothing was received'));
     check((await received.textContent()) === HEARD, `received ${JSON.stringify(await received.textContent())}`);
     const bars = await page
@@ -99,6 +123,19 @@ try {
     const box = await page.locator('.feed-box').boundingBox();
     check(box !== null && box.height >= 150, `the message box is ${box?.height}px tall`);
     if (shots) await page.screenshot({ path: 'shots/phone-receiving.png', fullPage: true });
+    await context.close();
+  });
+
+  await step('a file broadcast into the microphone is collected and can be saved', async () => {
+    const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
+    await coreReady(page);
+    await page.click('#mic');
+    const save = page.locator('#feed .file.received .save');
+    await save.waitFor({ timeout: 40_000 }).catch(() => check(false, 'the broadcast file was not collected'));
+    check((await page.locator('#feed .file.received .text').textContent()) === BROADCAST, 'the name of the file is wrong');
+    check((await save.getAttribute('download')) === BROADCAST, 'the file is not saved under its name');
+    check((await save.getAttribute('href'))?.startsWith('blob:') === true, 'the file has no address to save it from');
+    if (shots) await page.screenshot({ path: 'shots/phone-broadcast.png', fullPage: true });
     await context.close();
   });
 

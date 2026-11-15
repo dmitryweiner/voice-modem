@@ -12,6 +12,7 @@ pub mod coding;
 pub mod conv;
 pub mod crc;
 pub mod files;
+pub mod fountain;
 pub mod frame;
 pub mod ldpc;
 pub mod link;

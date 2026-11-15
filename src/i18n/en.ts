@@ -16,6 +16,9 @@ export const en = {
   speedLabel: 'Speed',
   speedAuto: 'Speed: by the channel',
   pttHint: 'A radio with a push-to-talk button that I press myself',
+  oneWayLabel: 'One-way',
+  oneWayHint:
+    'Nothing comes back: texts go once, files go as a stream for anyone listening (a radio that only transmits, a recording). Choose the speed: by the channel is the slowest, with no answers to judge by.',
   micOn: 'Turn the microphone on',
   micOff: 'Turn off',
   micStarting: 'Starting…',
@@ -71,6 +74,7 @@ export const en = {
     return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   },
   timeLeft: (seconds: number) => (seconds < 90 ? `about ${seconds} s left` : `about ${Math.round(seconds / 60)} min left`),
+  broadcasting: (percent: number) => `Broadcasting… ${percent}% sent`,
   fileSlow: (seconds: number) => `about ${Math.round(seconds / 60)} min at the current speed`,
 };
 

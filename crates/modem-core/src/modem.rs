@@ -11,7 +11,10 @@
 use std::collections::VecDeque;
 
 use crate::SAMPLE_RATE;
-use crate::files::{CHUNK_HEADER, FileError, FileEvent, Files};
+use crate::files::{
+    ANNOUNCE_EVERY, ANNOUNCE_HEADER, CHUNK_HEADER, FileError, FileEvent, Files, SYMBOL_HEADER,
+};
+use crate::fountain::symbols_for;
 use crate::frame::{Kind, Mode};
 use crate::link::{GAP, Heard, Link, LinkConfig, LinkEvent, SendError};
 use crate::resample::Resampler;
@@ -68,12 +71,10 @@ pub enum CommandError {
     TextTooLong {
         max: usize,
     },
-    /// `max` is the limit in bytes.
+    /// `max` is the limit in bytes (of the file deflated, when it deflates).
     FileTooLarge {
         max: usize,
     },
-    /// A file needs the consent of its receiver; this modem expects no answers.
-    NoAnswers,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +125,19 @@ pub enum Event {
     FileFailed { id: u32 },
     /// The other side declined the file or gave the transfer up.
     FileRefused { id: u32 },
+    /// A station broadcasts a file: it is being collected, `FileProgress`
+    /// and `FileReceived` follow under this id.
+    FileHeard {
+        id: u32,
+        from: u16,
+        name: String,
+        size: u32,
+    },
+    /// So many symbols of the file being broadcast went; `needed` of them
+    /// make the file.
+    FileCast { id: u32, symbols: u32, needed: u32 },
+    /// The broadcast ended by itself: ten times the file went.
+    FileSent { id: u32 },
     /// Something was transmitted nearby but could not be read.
     FrameLost { stats: RxStats },
     /// Push-to-talk: press the button and call `ptt_pressed`.
@@ -214,14 +228,17 @@ impl Modem {
 
     /// Offers a file to the other side; its fate is reported in events under
     /// the returned id (files and texts are numbered apart). Nothing of the
-    /// content is sent before the offer is accepted there.
+    /// content is sent before the offer is accepted there. A modem that
+    /// expects no answers broadcasts the file instead, in symbols that fill
+    /// a frame each, until it is cancelled or ten times the file went.
     pub fn send_file(&mut self, name: &str, bytes: Vec<u8>) -> Result<u32, CommandError> {
-        if !self.reliable {
-            return Err(CommandError::NoAnswers);
-        }
-        self.files
-            .send(name, bytes)
-            .map_err(|FileError::TooLarge { max }| CommandError::FileTooLarge { max })
+        let queued = if self.reliable {
+            self.files.send(name, bytes)
+        } else {
+            let symbol = self.link.room() - SYMBOL_HEADER;
+            self.files.broadcast(name, bytes, symbol)
+        };
+        queued.map_err(|FileError::TooLarge { max }| CommandError::FileTooLarge { max })
     }
 
     /// Consents to an offered file; false when there is no such offer.
@@ -243,22 +260,39 @@ impl Modem {
         self.files.sent_bytes(id)
     }
 
-    /// Seconds a file of `size` bytes takes at the speed of the moment, once
-    /// it is accepted and if no frame is lost.
+    /// Seconds a file of `size` bytes on the air takes at the speed of the
+    /// moment, once it is accepted and if no frame is lost. Broadcast: until
+    /// every piece went once, which a listener on a clean channel needs.
     pub fn file_seconds(&self, size: usize) -> u32 {
         let mode = self.link.tx_mode();
-        let chunk = self.link.room() - CHUNK_HEADER;
-        // A frame with so many bytes of the file, its acknowledgement and the pause.
-        let exchange = |bytes: usize| {
-            let message = 1 + CHUNK_HEADER + bytes;
-            self.lead_in + frame_len(Kind::Data, mode, message) as u64 + self.link.answer_len()
+        let room = self.link.room();
+        let samples = if self.reliable {
+            let chunk = room - CHUNK_HEADER;
+            // A frame with so many bytes of the file, its acknowledgement and the pause.
+            let exchange = |bytes: usize| {
+                let message = 1 + CHUNK_HEADER + bytes;
+                self.lead_in + frame_len(Kind::Data, mode, message) as u64 + self.link.answer_len()
+            };
+            let whole = (size / chunk) as u64 * exchange(chunk);
+            let rest = match size % chunk {
+                0 => 0,
+                bytes => exchange(bytes),
+            };
+            whole + rest
+        } else {
+            // A frame with a message and the pauses after it; nothing is awaited.
+            let frame = |message: usize| {
+                self.lead_in + frame_len(Kind::Broadcast, mode, 1 + message) as u64 + 2 * GAP
+            };
+            // A symbol is a piece of the file in a frame of its own; an
+            // announce with a name of some sixteen bytes goes before every eight.
+            let pieces = symbols_for(size, room - SYMBOL_HEADER);
+            let symbol = size.div_ceil(pieces).max(1);
+            let pieces = pieces as u64;
+            pieces * frame(SYMBOL_HEADER + symbol)
+                + pieces.div_ceil(u64::from(ANNOUNCE_EVERY)) * frame(ANNOUNCE_HEADER + 16)
         };
-        let whole = (size / chunk) as u64 * exchange(chunk);
-        let rest = match size % chunk {
-            0 => 0,
-            bytes => exchange(bytes),
-        };
-        (whole + rest).div_ceil(u64::from(SAMPLE_RATE)) as u32
+        samples.div_ceil(u64::from(SAMPLE_RATE)) as u32
     }
 
     /// Queues a greeting with the name of this station; stations that hear it answer with theirs.
@@ -339,6 +373,27 @@ impl Modem {
                 FileEvent::Delivered { id } => Event::FileDelivered { id },
                 FileEvent::Failed { id } => Event::FileFailed { id },
                 FileEvent::Refused { id } => Event::FileRefused { id },
+                FileEvent::Heard {
+                    id,
+                    from,
+                    name,
+                    size,
+                } => Event::FileHeard {
+                    id,
+                    from,
+                    name,
+                    size,
+                },
+                FileEvent::Cast {
+                    id,
+                    symbols,
+                    needed,
+                } => Event::FileCast {
+                    id,
+                    symbols,
+                    needed,
+                },
+                FileEvent::Sent { id } => Event::FileSent { id },
             });
         }
     }
@@ -403,7 +458,10 @@ impl Modem {
                     self.files.on_message(*from, bytes, self.clock);
                     true
                 }
-                LinkEvent::Delivered { id } => self.files.on_delivered(*id, self.clock),
+                // Over a one-way channel "sent" is all a broadcast learns.
+                LinkEvent::Delivered { id } | LinkEvent::Sent { id } => {
+                    self.files.on_delivered(*id, self.clock)
+                }
                 LinkEvent::Failed { id } => self.files.on_failed(*id),
                 LinkEvent::Retry { id, .. } => self.files.owns(*id),
                 _ => false,
@@ -446,7 +504,7 @@ impl Modem {
 
     /// Nothing queued, nothing awaited, nothing left to play.
     pub fn is_idle(&self) -> bool {
-        self.link.is_idle(self.clock) && self.tx.is_empty()
+        self.link.is_idle(self.clock) && self.files.is_idle() && self.tx.is_empty()
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -1002,16 +1060,109 @@ mod tests {
         }
     }
 
-    #[test]
-    fn files_need_a_channel_that_answers() {
-        let mut one_way = Modem::new(Config {
+    fn one_way(station: u16, mode: Mode) -> Modem {
+        Modem::new(Config {
+            station,
+            seed: u64::from(station),
             reliable: false,
+            mode: Some(mode),
             ..Config::default()
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn a_file_is_broadcast_to_whoever_listens() {
+        let (mut alice, mut bob) = (one_way(1, Mode::R1), one_way(2, Mode::R1));
+        let content = file(300);
+        let up = alice.send_file("notes.txt", content.clone()).unwrap();
+        run(&mut [&mut alice, &mut bob], 120.0);
+        let at_bob = events(&mut bob);
         assert_eq!(
-            one_way.send_file("notes.txt", file(10)),
-            Err(CommandError::NoAnswers)
+            at_bob[0],
+            Event::FileHeard {
+                id: 1,
+                from: 1,
+                name: "notes.txt".into(),
+                size: 300
+            }
+        );
+        assert!(
+            at_bob.contains(&Event::FileReceived {
+                id: 1,
+                name: "notes.txt".into(),
+                bytes: content
+            }),
+            "{at_bob:?}"
+        );
+        // symbols of 59 bytes in R1: six make the file, and more keep coming
+        let at_alice = events(&mut alice);
+        assert!(at_alice.contains(&Event::FileCast {
+            id: up,
+            symbols: 6,
+            needed: 6
+        }));
+        assert!(
+            at_alice
+                .iter()
+                .all(|e| matches!(e, Event::FileCast { id, .. } if *id == up)),
+            "{at_alice:?}"
+        );
+        assert!(alice.cancel_file(up));
+        run(&mut [&mut alice, &mut bob], 20.0);
+        assert!(alice.is_idle());
+    }
+
+    #[test]
+    fn the_time_a_broadcast_takes_is_known_beforehand() {
+        for (mode, len) in [(Mode::R1, 300), (Mode::F3, 30_000)] {
+            let (mut alice, mut bob) = (one_way(1, mode), one_way(2, mode));
+            let estimate = alice.file_seconds(len) as f32;
+            let up = alice.send_file("photo.jpg", file(len)).unwrap();
+            assert_eq!(alice.file_sent_bytes(up), Some(len));
+            // from the start until a listener on a clean channel has the file
+            let mut cable = Cable::default();
+            let (mut time, mut took) = (0.0, None);
+            while took.is_none() && time < 2.0 * estimate + 20.0 {
+                cable.run(&mut [&mut alice, &mut bob], 0.5);
+                time += 0.5;
+                if events(&mut bob)
+                    .iter()
+                    .any(|e| matches!(e, Event::FileReceived { .. }))
+                {
+                    took = Some(time);
+                }
+            }
+            let took = took.expect("received");
+            assert!(
+                (estimate / took - 1.0).abs() < 0.1,
+                "{mode:?}: {estimate} s expected, took {took} s"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_waiting_to_go_keeps_the_modem_busy() {
+        let mut alice = one_way(1, Mode::R1);
+        let up = alice.send_file("notes.txt", file(10)).unwrap();
+        assert!(!alice.is_idle());
+        assert!(alice.cancel_file(up));
+        assert!(alice.is_idle());
+        // and an offer waits for its answer
+        let mut bob = modem(2);
+        let offered = bob.send_file("notes.txt", file(10)).unwrap();
+        assert!(!bob.is_idle());
+        assert!(bob.cancel_file(offered));
+        run(&mut [&mut bob], 30.0);
+        assert!(bob.is_idle());
+    }
+
+    #[test]
+    fn a_broadcast_file_takes_at_most_256_pieces() {
+        let mut alice = one_way(1, Mode::R1);
+        assert_eq!(
+            alice.send_file("big", file(256 * 59 + 1)),
+            Err(CommandError::FileTooLarge { max: 256 * 59 })
         );
     }
 

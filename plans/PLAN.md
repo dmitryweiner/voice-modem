@@ -361,8 +361,18 @@ one in 62–68%; a file goes deflated when that is shorter. Section 7 had
 compression of short messages without saying how; deflate needs repetition
 that a short text does not have.
 
-Still to come in stage 5, each a PR: broadcast with fountain codes;
-encryption.
+Then (2026-11-15) broadcast: a station switched to one way sends texts once
+and broadcasts files in symbols of a fountain code until it is stopped, and
+any station collects them, from any `k` of them nearly always. The code
+chosen: systematic random linear over GF(256), not the LT/RaptorQ family of
+section 5. It needs no more symbols than the file has pieces in 99.6% of
+cases, where LT codes need a fifth to a half more for files of tens of
+pieces, and is a few lines to specify. Its decoding grows as k², so a
+broadcast is at most 256 pieces (15 KB in R1, 1 MB in F2 and F3). The
+command-line tool writes a file broadcast into a recording and collects
+files from one: record and play back.
+
+Still to come in stage 5: encryption.
 
 Where stage 5 started from:
 
