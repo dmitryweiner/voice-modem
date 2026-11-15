@@ -8,11 +8,11 @@ use crate::ofdm::OfdmParams;
 /// Version of the wire format, the two highest bits of the first header byte.
 pub const PROTOCOL_VERSION: u8 = 0;
 
-/// The largest payload of one frame, bytes (the length is ten bits of the header).
-pub const MAX_PAYLOAD: usize = 1023;
+/// The largest payload of one frame, bytes (the length is twelve bits of the header).
+pub const MAX_PAYLOAD: usize = 4095;
 
-/// Frame numbers count up to this and start again (six bits of the header).
-pub const SEQ_MODULUS: u8 = 64;
+/// Frame numbers count up to this and start again (four bits of the header).
+pub const SEQ_MODULUS: u8 = 16;
 
 /// Bytes of the header on the wire, CRC included.
 pub const HEADER_BYTES: usize = 7;
@@ -112,6 +112,19 @@ impl Mode {
         }
     }
 
+    /// The largest block of a payload in this mode, bytes. A payload goes
+    /// in blocks, each coded and checked on its own: a block that arrives
+    /// damaged costs only itself and the blocks after it. The blocks of the
+    /// tones last up to nine seconds; one of the carriers, two to six.
+    pub const fn block_bytes(self) -> usize {
+        match self {
+            Mode::R1 => 64,
+            Mode::R2 => 128,
+            Mode::R3 | Mode::R4 => 255,
+            Mode::F1 | Mode::F2 | Mode::F3 => 1023,
+        }
+    }
+
     /// Bits of payload per second, before the overhead of the frame.
     pub fn bit_rate(self) -> f32 {
         match self.scheme() {
@@ -133,7 +146,9 @@ pub enum Kind {
     /// Acknowledges a data frame; the header alone, no payload. `advice` is
     /// the fastest mode its sender expects to receive from the station it
     /// answers, judged by how well the acknowledged frame was heard.
-    Ack { advice: Mode },
+    /// `missing`: the blocks at the end of its payload that did not arrive
+    /// whole, or came after one that did not; 0 when all of it arrived.
+    Ack { advice: Mode, missing: u8 },
     /// Carries a payload and expects no answer.
     Broadcast,
 }
@@ -150,7 +165,10 @@ impl Kind {
     const fn from_id(id: u8) -> Option<Kind> {
         match id {
             0 => Some(Kind::Data),
-            1 => Some(Kind::Ack { advice: Mode::R1 }),
+            1 => Some(Kind::Ack {
+                advice: Mode::R1,
+                missing: 0,
+            }),
             2 => Some(Kind::Broadcast),
             _ => None,
         }
@@ -160,6 +178,16 @@ impl Kind {
     pub const fn has_payload(self) -> bool {
         !matches!(self, Kind::Ack { .. })
     }
+}
+
+/// The lengths of the blocks of a payload of `len` bytes in a mode: all but
+/// the last as long as the mode allows. An empty payload is one empty block.
+pub fn blocks(mode: Mode, len: usize) -> Vec<usize> {
+    let size = mode.block_bytes();
+    let count = len.div_ceil(size).max(1);
+    (0..count)
+        .map(|block| (len - block * size).min(size))
+        .collect()
 }
 
 /// One frame as the link layer sees it.
@@ -192,14 +220,15 @@ impl Header {
         debug_assert!(self.seq < SEQ_MODULUS && usize::from(self.len) <= MAX_PAYLOAD);
         let [station_high, station_low] = self.station.to_be_bytes();
         let first = (PROTOCOL_VERSION << 6) | (self.kind.id() << 4) | self.mode.id();
-        // An acknowledgement has no payload to measure: the length is its advice.
-        let len = if let Kind::Ack { advice } = self.kind {
-            u16::from(advice.id())
+        // An acknowledgement has no payload to measure: the length is its
+        // advice and the blocks it misses.
+        let len = if let Kind::Ack { advice, missing } = self.kind {
+            u16::from(missing) << 4 | u16::from(advice.id())
         } else {
             self.len
         };
         let [len_high, len_low] = len.to_be_bytes();
-        let numbers = (self.seq % SEQ_MODULUS) << 2 | (len_high & 0x03);
+        let numbers = (self.seq % SEQ_MODULUS) << 4 | (len_high & 0x0F);
         let body = [first, station_high, station_low, numbers, len_low];
         let [crc_high, crc_low] = crc16(&body).to_be_bytes();
         [
@@ -226,10 +255,11 @@ impl Header {
         {
             return None;
         }
-        let len = u16::from_be_bytes([numbers & 0x03, len_low]);
+        let len = u16::from_be_bytes([numbers & 0x0F, len_low]);
         let kind = match Kind::from_id((first >> 4) & 0x03)? {
             Kind::Ack { .. } => Kind::Ack {
-                advice: Mode::from_id(u8::try_from(len).ok()?)?,
+                advice: Mode::from_id((len & 0x0F) as u8)?,
+                missing: (len >> 4) as u8,
             },
             kind => kind,
         };
@@ -237,7 +267,7 @@ impl Header {
             kind,
             mode: Mode::from_id(first & 0x0F)?,
             station: u16::from_be_bytes([station_high, station_low]),
-            seq: numbers >> 2,
+            seq: numbers >> 4,
             len: if kind.has_payload() { len } else { 0 },
         })
     }
@@ -254,7 +284,7 @@ mod tests {
         kind: Kind::Broadcast,
         mode: Mode::R1,
         station: 0xBEEF,
-        seq: 50,
+        seq: 5,
         len: 17,
     };
 
@@ -267,7 +297,7 @@ mod tests {
     #[test]
     fn round_trip() {
         for kind in [Kind::Data, Kind::Broadcast] {
-            for (seq, len) in [(50, 17), (0, 0), (63, 1023), (1, 256)] {
+            for (seq, len) in [(5, 17), (0, 0), (15, 4095), (1, 256)] {
                 let header = Header {
                     kind,
                     seq,
@@ -277,28 +307,30 @@ mod tests {
                 assert_eq!(Header::from_bytes(&header.to_bytes()), Some(header));
             }
         }
-        let ack = Header {
-            kind: Kind::Ack { advice: Mode::F2 },
-            len: 0,
-            ..HEADER
-        };
-        assert_eq!(Header::from_bytes(&ack.to_bytes()), Some(ack));
+        for (advice, missing) in [(Mode::F2, 0), (Mode::R1, 3), (Mode::F3, 255)] {
+            let ack = Header {
+                kind: Kind::Ack { advice, missing },
+                len: 0,
+                ..HEADER
+            };
+            assert_eq!(Header::from_bytes(&ack.to_bytes()), Some(ack));
+        }
     }
 
     #[test]
     fn layout() {
         let bytes = HEADER.to_bytes();
-        // version 0, kind 2 (broadcast), mode 0; frame number 50 above two bits of the length
-        assert_eq!(bytes[..5], [0b00_10_0000, 0xBE, 0xEF, 50 << 2, 17]);
+        // version 0, kind 2 (broadcast), mode 0; frame number 5 above four bits of the length
+        assert_eq!(bytes[..5], [0b00_10_0000, 0xBE, 0xEF, 5 << 4, 17]);
         assert_eq!(u16::from_be_bytes([bytes[5], bytes[6]]), crc16(&bytes[..5]));
         let long = Header {
-            len: 0x2A5,
+            len: 0xA5C,
             mode: Mode::F1,
             ..HEADER
         };
         assert_eq!(
             long.to_bytes()[..5],
-            [0b00_10_0100, 0xBE, 0xEF, (50 << 2) | 2, 0xA5]
+            [0b00_10_0100, 0xBE, 0xEF, (5 << 4) | 0xA, 0x5C]
         );
     }
 
@@ -321,20 +353,43 @@ mod tests {
     }
 
     #[test]
-    fn an_acknowledgement_carries_advice_instead_of_a_length() {
+    fn an_acknowledgement_carries_advice_and_the_blocks_missing_instead_of_a_length() {
+        const WHOLE: Kind = Kind::Ack {
+            advice: Mode::R1,
+            missing: 0,
+        };
         assert_eq!(
-            with_body([0b00_01_0000, 0, 1, 2 << 2, 0]).map(|h| (h.kind, h.seq, h.len)),
-            Some((Kind::Ack { advice: Mode::R1 }, 2, 0))
+            with_body([0b00_01_0000, 0, 1, 2 << 4, 0]).map(|h| (h.kind, h.seq, h.len)),
+            Some((WHOLE, 2, 0))
         );
+        // the advice in the four lowest bits, the blocks missing in the eight above
         assert_eq!(
-            with_body([0b00_01_0000, 0, 1, 2 << 2, 6]).map(|h| (h.kind, h.len)),
-            Some((Kind::Ack { advice: Mode::F3 }, 0))
+            with_body([0b00_01_0000, 0, 1, (2 << 4) | 0x1, 0x36]).map(|h| (h.kind, h.len)),
+            Some((
+                Kind::Ack {
+                    advice: Mode::F3,
+                    missing: 0x13
+                },
+                0
+            ))
         );
         // not a mode
-        assert_eq!(with_body([0b00_01_0000, 0, 1, 2 << 2, 7]), None);
-        assert_eq!(with_body([0b00_01_0000, 0, 1, (2 << 2) | 1, 0]), None);
-        let ack = Kind::Ack { advice: Mode::R1 };
-        assert!(!ack.has_payload() && Kind::Data.has_payload() && Kind::Broadcast.has_payload());
+        assert_eq!(with_body([0b00_01_0000, 0, 1, 2 << 4, 7]), None);
+        assert_eq!(with_body([0b00_01_0000, 0, 1, 2 << 4, 0x0F]), None);
+        assert!(!WHOLE.has_payload() && Kind::Data.has_payload() && Kind::Broadcast.has_payload());
+    }
+
+    #[test]
+    fn a_payload_goes_in_blocks_of_the_mode() {
+        assert_eq!(
+            Mode::ALL.map(Mode::block_bytes),
+            [64, 128, 255, 255, 1023, 1023, 1023]
+        );
+        assert_eq!(blocks(Mode::R1, 0), [0]);
+        assert_eq!(blocks(Mode::R1, 64), [64]);
+        assert_eq!(blocks(Mode::R1, 65), [64, 1]);
+        assert_eq!(blocks(Mode::R3, 600), [255, 255, 90]);
+        assert_eq!(blocks(Mode::F3, MAX_PAYLOAD), [1023, 1023, 1023, 1023, 3]);
     }
 
     #[test]

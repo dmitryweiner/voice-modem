@@ -1,6 +1,7 @@
 //! The modem through simulated channels. The limits here are regression
 //! guards with a margin of about 3 dB to what `examples/sweep.rs` measures.
 
+use modem_core::link::frame_bytes;
 use modem_core::{
     Config, Event, Frame, Kind, Mode, Modem, Receiver, RxEvent, RxStats, TxConfig, encode_frame,
 };
@@ -169,37 +170,44 @@ fn frame_in(mode: Mode, payload: &[u8]) -> (Vec<f32>, f32) {
     (samples, level)
 }
 
+/// A short frame and the longest one, and how many times each is tried.
+fn short_and_full(mode: Mode) -> [(Vec<u8>, u64); 2] {
+    [(payload(200), 12), (payload(frame_bytes(mode)), 3)]
+}
+
 #[test]
 fn fast_modes_in_white_noise() {
-    let payload = payload(200);
     // 3 dB above where each stops (`examples/modes.rs`)
     for (mode, snr) in [(Mode::F1, 6.0), (Mode::F2, 12.0), (Mode::F3, 15.0)] {
-        let (frame, level) = frame_in(mode, &payload);
-        for seed in 0..12 {
-            let heard = padded()
-                .then(Awgn::with_snr(level, snr, seed))
-                .process(&frame);
-            let stats = stats_of(&receive(&heard), &payload);
-            // the carriers have the level of the header tone over the same noise
-            let carriers = stats.carriers_snr_db.unwrap();
-            assert!((carriers - snr).abs() < 2.5, "{mode:?}: {carriers} dB");
+        for (payload, seeds) in short_and_full(mode) {
+            let (frame, level) = frame_in(mode, &payload);
+            for seed in 0..seeds {
+                let heard = padded()
+                    .then(Awgn::with_snr(level, snr, seed))
+                    .process(&frame);
+                let stats = stats_of(&receive(&heard), &payload);
+                // the carriers have the level of the header tone over the same noise
+                let carriers = stats.carriers_snr_db.unwrap();
+                assert!((carriers - snr).abs() < 2.5, "{mode:?}: {carriers} dB");
+            }
         }
     }
 }
 
 #[test]
 fn fast_modes_near_the_speaker_in_a_room() {
-    let payload = payload(200);
     // The direct sound over all reflections, 3 dB above where each stops:
     // 6 dB is within a metre or two of a small speaker.
     for (mode, direct) in [(Mode::F1, 6.0), (Mode::F2, 9.0), (Mode::F3, 15.0)] {
-        let (frame, level) = frame_in(mode, &payload);
-        for seed in 0..12 {
-            let heard = padded()
-                .then(Reverb::new(0.5, direct, 100 + seed))
-                .then(Awgn::with_snr(level, 30.0, seed))
-                .process(&frame);
-            stats_of(&receive(&heard), &payload);
+        for (payload, seeds) in short_and_full(mode) {
+            let (frame, level) = frame_in(mode, &payload);
+            for seed in 0..seeds {
+                let heard = padded()
+                    .then(Reverb::new(0.5, direct, 100 + seed))
+                    .then(Awgn::with_snr(level, 30.0, seed))
+                    .process(&frame);
+                stats_of(&receive(&heard), &payload);
+            }
         }
     }
 }
@@ -229,9 +237,9 @@ fn many_tones_at_once_across_a_room() {
 
 #[test]
 fn fast_modes_with_a_frequency_offset_and_drifting_clocks() {
-    // The longest frame of each: 6 s, 3 s and 2 s.
-    let payload = payload(1023);
+    // The longest frame of each: 12 s, 12 s and 8 s of carriers.
     for mode in [Mode::F1, Mode::F2, Mode::F3] {
+        let payload = payload(frame_bytes(mode));
         let (frame, level) = frame_in(mode, &payload);
         for (seed, shift) in [-200.0f32, -31.0, 77.7].into_iter().enumerate() {
             let heard = padded()
@@ -240,7 +248,7 @@ fn fast_modes_with_a_frequency_offset_and_drifting_clocks() {
                 .process(&frame);
             stats_of(&receive(&heard), &payload);
         }
-        // at 200 ppm the end of a 6 s frame is 20 samples off
+        // at 200 ppm the end of a 12 s frame is 40 samples off
         for ppm in [-200.0, 200.0] {
             let heard = padded()
                 .then(ClockOffset { ppm })
@@ -483,5 +491,87 @@ fn a_file_broken_off_by_interference_goes_on_from_where_it_stopped() {
         panic!("not received: {:?}", at_bob.len());
     };
     assert_eq!(name, "photo.jpg");
+    assert!(*bytes == content);
+}
+
+#[test]
+fn a_burst_of_noise_in_a_long_frame_costs_the_blocks_from_where_it_hits() {
+    let payload = payload(frame_bytes(Mode::F3));
+    let (frame, level) = frame_in(Mode::F3, &payload);
+    // 0.3 s, 20 dB above the signal, in the middle of the third of four blocks
+    let third = 4096 + 31 * 512 + 1024 + (2 * 640) as usize + (2.5 * 1.96 * 16_000.0) as usize;
+    let mut heard = padded()
+        .then(Awgn::with_snr(level, 20.0, 1))
+        .process(&frame);
+    let burst = 5000 + third - 2400..5000 + third + 2400;
+    let loud = Awgn::with_snr(level, -20.0, 2).process(&heard[burst.clone()]);
+    heard[burst].copy_from_slice(&loud);
+    let events = receive(&heard);
+    let [
+        RxEvent::Frame {
+            frame,
+            missing: 2,
+            stats,
+            ..
+        },
+    ] = &events[..]
+    else {
+        panic!("{events:?}");
+    };
+    assert!(frame.payload == payload[..2046]);
+    // How well the carriers were heard is judged by the blocks that arrived:
+    // a moment of noise is no reason to advise a slower mode.
+    let carriers = stats.carriers_snr_db.unwrap();
+    assert!((carriers - 20.0).abs() < 2.5, "{carriers} dB");
+}
+
+#[test]
+fn two_modems_lose_to_a_burst_of_noise_only_what_it_hits() {
+    let fast = |station: u16| {
+        Modem::new(Config {
+            station,
+            seed: u64::from(station) * 31,
+            mode: Some(Mode::F3),
+            ..Config::default()
+        })
+        .unwrap()
+    };
+    let (mut alice, mut bob) = (fast(1), fast(2));
+    let mut noise = [Awgn::new(0.02, 1), Awgn::new(0.02, 2)];
+    let content: Vec<u8> = (0..8000u32).map(|i| (i * 31 + i / 256) as u8).collect();
+    alice.send_file("photo.jpg", content.clone()).unwrap();
+    let (mut at_alice, mut at_bob) = (Vec::new(), Vec::new());
+    // The first frame of more than eight seconds is the first chunk: the
+    // noise comes 6.2 s into it, in its third block.
+    let mut long_frame_at = None;
+    talk(
+        &mut alice,
+        &mut bob,
+        &mut noise,
+        60.0,
+        |alice, bob, time| {
+            if long_frame_at.is_none() && alice.tx_pending() > 8 * 16_000 {
+                long_frame_at = Some(time);
+            }
+            for event in events(bob) {
+                if let Event::FileOffered { id, .. } = event {
+                    assert!(bob.accept_file(id));
+                }
+                at_bob.push(event);
+            }
+            at_alice.extend(events(alice));
+            long_frame_at.is_some_and(|at| (at + 6.2..at + 6.5).contains(&time))
+        },
+    );
+    assert!(long_frame_at.is_some());
+    // nothing timed out: the acknowledgement asked for the end of the frame again
+    assert!(
+        !at_alice.iter().any(|e| matches!(e, Event::Retry { .. })),
+        "{at_alice:?}"
+    );
+    assert!(at_alice.contains(&Event::FileDelivered { id: 1 }));
+    let Some(Event::FileReceived { bytes, .. }) = at_bob.last() else {
+        panic!("not received: {} events", at_bob.len());
+    };
     assert!(*bytes == content);
 }

@@ -283,9 +283,10 @@ these places:
 - The robust modes keep the convolutional code; LDPC (the 648-bit codes of
   802.11n, rates 1/2 and 3/4) is the code of the fast modes.
 - The link layer is stop-and-wait, one frame per acknowledgement. Instead of
-  a burst of frames with a selective acknowledgement, a frame of a fast
-  mode is large: up to 1023 bytes, a whole text. Bursts wait for files
-  (stage 5), if they are needed at all.
+  a burst of frames with a selective acknowledgement, a frame carries its
+  payload in several blocks after one preamble and header, each block with
+  its own checksum, and the acknowledgement says how many blocks at the end
+  were damaged (stage 5, below).
 - **The medium group of modes is not OFDM.** Over the air the limit turned
   out to be the echo of the room, not noise, and what beat it was tones that
   avoid the frequencies still ringing: R2, R3, R4 at 125, 250 and 500 bit/s
@@ -340,10 +341,20 @@ It differs from section 7 in these places:
 - A transfer goes on after a break when the human sends the file again;
   the modem does not retry by itself.
 
-Still to come in stage 5, each a PR: several frames per acknowledgement
-(a full frame of F3 is 2 s of data in 5.8 s of exchange: a third of the
-speed of the mode, see [measurements](../docs/measurements.md)); compression;
-broadcast with fountain codes; encryption.
+Then (2026-11-15) several blocks per acknowledgement: a frame of F2 and F3
+takes four blocks of 1023 bytes, of F1 and R4 two, each with its own
+checksum; the acknowledgement says how many blocks at its end were damaged,
+and only those go again. A file in F3 went from 1406 to 2787 bit/s, in F2
+from 1192 to 2067 ([measurements](../docs/measurements.md)). Section 5
+planned a burst of frames under a selective acknowledgement instead. Blocks
+after one preamble and header pay for the preamble and the header once,
+and the receiver knows from the header when the frame ends and its answer
+is due; a burst would need a way to tell where it ends. The price: a block
+that arrives after a damaged one is dropped too (go-back, not selective),
+and a frame whose header is lost loses all its blocks.
+
+Still to come in stage 5, each a PR: compression; broadcast with fountain
+codes; encryption.
 
 Where stage 5 started from:
 
