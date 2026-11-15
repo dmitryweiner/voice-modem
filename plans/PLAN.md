@@ -216,8 +216,8 @@ mode and debugging).
   transfer time at the current speed exceeds 10 minutes.
 - Text messages have priority and cut into a file transfer.
 - **Encryption** (stage 5): optional, by a shared password, off by default.
-  Password → key with a memory-hard KDF, AEAD over the payload (planned:
-  Argon2id + ChaCha20-Poly1305, pure Rust crates; confirmed at stage 5).
+  Password → key with a memory-hard KDF, AEAD over the payload
+  (Argon2id + ChaCha20-Poly1305, pure Rust crates, confirmed at stage 5).
   Headers stay in the clear so that a station without the password still sees
   that the channel is busy. The radio presets keep it off and the UI warns when
   it is switched on there: encryption is forbidden on amateur radio bands.
@@ -274,7 +274,7 @@ A preset is a set of starting parameters and limits; adaptation works inside it.
 
 ## 11. Stages
 
-**Progress**: stages 0–4 are done (2026-11-11); stage 5 is under way. What they settled is in
+**Progress**: stages 0–4 are done (2026-11-11), stage 5 in four PRs (2026-11-15). What they settled is in
 [docs/protocol.md](../docs/protocol.md),
 [docs/measurements.md](../docs/measurements.md) and
 [docs/web-audio.md](../docs/web-audio.md). They differ from the text above in
@@ -372,7 +372,24 @@ broadcast is at most 256 pieces (15 KB in R1, 1 MB in F2 and F3). The
 command-line tool writes a file broadcast into a recording and collects
 files from one: record and play back.
 
-Still to come in stage 5: encryption.
+Then encryption: a password seals every text and every message of the file
+transfer with ChaCha20-Poly1305 under a key from Argon2id (`seal.rs`); a
+station without it hears only that something was said, and is told so. As
+planned, with these decisions:
+
+- The salt is the same for every station: both must come to the key from
+  the password alone, with no exchange before. So the key costs more than
+  the least OWASP names (64 MiB and 3 passes, a tenth of a second), and a
+  password is as good as it is long.
+- The greeting stays in the clear, with the name of the station and a bit
+  that says it seals; so do frame headers and acknowledgements.
+- The password is not stored: it lives until the page is closed.
+- Every message is sealed whole (29 bytes more), file chunks included:
+  simpler than sealing a file once, and every chunk is checked on its own.
+  It costs most in R1, where a frame carries 28 bytes of a file instead
+  of 57.
+
+That completes stage 5. Stage 6 (presets) is next.
 
 Where stage 5 started from:
 

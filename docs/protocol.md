@@ -217,12 +217,13 @@ segment of a message, bit 7 — more segments follow. In every segment but the
 first, two bytes follow with the offset of the segment in the message. An
 empty payload and unknown types are acknowledged and otherwise ignored.
 
-| Type    | Content of the message                                                                                          |
-| ------- | --------------------------------------------------------------------------------------------------------------- |
-| 0 text  | UTF-8 text, cut into segments anywhere, also inside a character; at most 1000 bytes                             |
-| 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment |
-| 2 file  | a message of the file transfer ([below](#files-filesrs)), at most 4091 bytes                                    |
-| 3 text  | a text packed ([below](#packed-text-textrs)): sent when that is shorter than its UTF-8                          |
+| Type     | Content of the message                                                                                                                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0 text   | UTF-8 text, cut into segments anywhere, also inside a character; at most 1000 bytes                                                              |
+| 1 hello  | capabilities, 2 bytes (bit 0: the station seals what it sends), then the name of the station, up to 32 bytes of UTF-8; one segment; never sealed |
+| 2 file   | a message of the file transfer ([below](#files-filesrs)), at most 4091 bytes                                                                     |
+| 3 text   | a text packed ([below](#packed-text-textrs)): sent when that is shorter than its UTF-8                                                           |
+| 4 sealed | a message of type 0, 2 or 3 sealed by a password ([below](#sealed-messages-sealrs))                                                              |
 
 A receiver starts a message at a segment with the "first" flag and delivers
 it at the one without "more". A segment adds the bytes from its offset on
@@ -253,6 +254,36 @@ any other character keeps the code of the letter before it.
   the code of each character, the end, zero bits up to a whole byte.
 
 A packed text that does not unpack is acknowledged and dropped.
+
+### Sealed messages (`seal.rs`)
+
+A station given a password seals every text and every message of the file
+transfer it sends; the greeting goes in the clear. A message is sealed
+whole, before it is cut into segments, so a long one pays for the seal once.
+
+- **Key**: Argon2id (version 0x13) of the password, the salt the 23 bytes
+  `voice-modem/password/v0`, 64 MiB, 3 passes, 1 lane, 32 bytes. The salt
+  is the same everywhere: both stations come to the key from the password
+  alone, with no exchange before. A guess costs a tenth of a second here
+  and the same for everyone, so a password is as good as it is long.
+- **Seal**: ChaCha20-Poly1305 (RFC 8439). The plaintext is the type of the
+  message (one byte) and its content; the associated data is the address of
+  the sending station, 2 bytes. On the air: the nonce (12 bytes), the
+  ciphertext, the tag (16 bytes) — 29 bytes more than the message, the type
+  included.
+- **Nonce**: 8 random bytes the application gives at the start, then a
+  counter of the messages sealed, 4 bytes; after 2³² messages the 8 bytes
+  become splitmix64 of themselves.
+- A station opens a sealed message with its own password. One that does
+  not open — no password, another one, or changed on the way — is
+  acknowledged (it arrived) and reported as unopened. A station with a
+  password reads unsealed messages too, and says which came sealed.
+
+What stays in the clear: frame headers (who sends, how long, when — anyone
+hears that the channel is busy), the greeting with the name of the
+station, acknowledgements. A recorded sealed message played again is
+accepted again, as an unsealed one would be. Encryption is forbidden on
+amateur radio bands; the app says so next to the password.
 
 ### Acknowledgement and repeats
 

@@ -25,6 +25,8 @@ function coreText(t: Messages, core: CoreState): string {
 
 export function App({ storage, languages, core, startAudio, fileUrl }: AppProps) {
   const [settings, setSettings] = useState<Settings>(() => loadSettings(storage));
+  /** Never stored: it lives until the page is closed. */
+  const [password, setPassword] = useState('');
   const [coreState, setCoreState] = useState<CoreState>({ status: 'loading' });
   const locale = detectLocale(settings.locale, languages);
   const t = messages[locale];
@@ -81,8 +83,11 @@ export function App({ storage, languages, core, startAudio, fileUrl }: AppProps)
           startAudio={startAudio}
           fileUrl={fileUrl}
           coreReady={coreState.status === 'ready'}
-          station={{ name: settings.name, manualPtt: settings.manualPtt, oneWay: settings.oneWay, mode: settings.mode }}
-          onStationChange={(station) => update({ ...settings, ...station })}
+          station={{ name: settings.name, manualPtt: settings.manualPtt, oneWay: settings.oneWay, password, mode: settings.mode }}
+          onStationChange={({ password: typed, ...station }) => {
+            setPassword(typed);
+            update({ ...settings, ...station });
+          }}
         />
       </main>
       <footer>

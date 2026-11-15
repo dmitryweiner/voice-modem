@@ -8,8 +8,8 @@ const core: Promise<Core> = init().then(() => ({
   version,
   maxTextBytes,
   // 255 is no mode: the core adapts
-  createModem: ({ sampleRate, station, name, manualPtt, oneWay, seed, mode }) =>
-    new Modem(sampleRate, station, name, manualPtt, oneWay, seed, mode ?? 255),
+  createModem: ({ sampleRate, station, name, manualPtt, oneWay, seed, mode, password, entropy }) =>
+    new Modem(sampleRate, station, name, manualPtt, oneWay, seed, mode ?? 255, password, entropy),
 }));
 // A failed load is reported in the reply to each request.
 core.catch(() => {});

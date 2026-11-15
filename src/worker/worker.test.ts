@@ -105,6 +105,7 @@ const coreEvent = (fields: Partial<CoreModemEvent> & { kind: string }): CoreMode
   secondsLeft: 0,
   symbols: 0,
   needed: 0,
+  sealed: false,
   ...fields,
 });
 
@@ -129,7 +130,7 @@ function counter() {
   return () => next++;
 }
 
-const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false, oneWay: false, mode: null } as const;
+const START = { type: 'start', sampleRate: 48_000, name: 'Alice', manualPtt: false, oneWay: false, password: '', mode: null } as const;
 
 /** A session on a fake core, started at 48 kHz. */
 async function startedSession() {
@@ -175,6 +176,7 @@ describe('protocol', () => {
       { ...start, name: undefined },
       { ...start, manualPtt: 'no' },
       { ...start, oneWay: undefined },
+      { ...start, password: undefined },
       { ...start, mode: 'fast' },
       { ...start, mode: undefined },
       { type: 'sendText', jobId: 1 },
@@ -197,7 +199,8 @@ describe('protocol', () => {
       { type: 'fileQueued', jobId: 1, id: 3, seconds: 40 },
       { type: 'done', jobId: 1 },
       { type: 'error', jobId: 1, message: 'x' },
-      { type: 'event', event: { kind: 'message', text: 'hi', station: 7, snrDb: 10, freqOffsetHz: 0 } },
+      { type: 'event', event: { kind: 'message', text: 'hi', station: 7, snrDb: 10, freqOffsetHz: 0, sealed: true } },
+      { type: 'event', event: { kind: 'unopened', station: 7, snrDb: 10, freqOffsetHz: 0 } },
       { type: 'event', event: { kind: 'hello', name: '', station: 7 } },
       { type: 'event', event: { kind: 'delivered', id: 1 } },
       { type: 'event', event: { kind: 'failed', id: 1 } },
@@ -225,6 +228,8 @@ describe('protocol', () => {
       { type: 'error', message: 'x' },
       { type: 'queued', jobId: 1, id: Number.NaN },
       { type: 'event', event: { kind: 'message', text: 'hi', snrDb: 10, freqOffsetHz: 0 } },
+      { type: 'event', event: { kind: 'message', text: 'hi', station: 7, snrDb: 10, freqOffsetHz: 0 } },
+      { type: 'event', event: { kind: 'unopened', snrDb: 10, freqOffsetHz: 0 } },
       { type: 'event', event: { kind: 'retry', id: 1 } },
       { type: 'event', event: { kind: 'txStart' } },
       { type: 'fileQueued', jobId: 1, id: 3 },
@@ -255,7 +260,7 @@ describe('session', () => {
     expect(out).toEqual([{ type: 'error', jobId: 7, message: 'no wasm' }]);
   });
 
-  it('starts a modem for the device, with a random address and seed', async () => {
+  it('starts a modem for the device, with a random address, seed and entropy for the seal', async () => {
     const { out, modem } = await startedSession();
     expect(out).toEqual([{ type: 'started', jobId: 1, maxTextBytes: 5 }]);
     expect(modem.options).toEqual({
@@ -263,9 +268,11 @@ describe('session', () => {
       name: 'Alice',
       manualPtt: false,
       oneWay: false,
+      password: '',
       mode: null,
       station: 0x5678,
       seed: 0x12345679,
+      entropy: Uint8Array.from([0x12, 0x34, 0x56, 0x7a, 0x12, 0x34, 0x56, 0x7b]),
     });
   });
 
@@ -284,7 +291,8 @@ describe('session', () => {
     expect(out).toEqual([]);
 
     modem.events.push(
-      coreEvent({ kind: 'message', text: 'hi', station: 9, snrDb: 12, freqOffsetHz: -1 }),
+      coreEvent({ kind: 'message', text: 'hi', station: 9, snrDb: 12, freqOffsetHz: -1, sealed: true }),
+      coreEvent({ kind: 'unopened', station: 8, snrDb: 11, freqOffsetHz: 2 }),
       coreEvent({ kind: 'hello', text: 'Bob', station: 9 }),
       coreEvent({ kind: 'delivered', id: 4 }),
       coreEvent({ kind: 'failed', id: 5 }),
@@ -296,7 +304,8 @@ describe('session', () => {
     );
     audio.hear(block);
     expect(events(out)).toEqual([
-      { kind: 'message', text: 'hi', station: 9, snrDb: 12, freqOffsetHz: -1 },
+      { kind: 'message', text: 'hi', station: 9, snrDb: 12, freqOffsetHz: -1, sealed: true },
+      { kind: 'unopened', station: 8, snrDb: 11, freqOffsetHz: 2 },
       { kind: 'hello', name: 'Bob', station: 9 },
       { kind: 'delivered', id: 4 },
       { kind: 'failed', id: 5 },
@@ -555,9 +564,9 @@ describe('coreClient', () => {
   it('hands the audio port over to the worker on start', async () => {
     const { client, workers } = setup();
     const { port1, port2 } = new MessageChannel();
-    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true, oneWay: true, mode: 2 });
+    const started = client.start(44_100, port1, { name: 'Bob', manualPtt: true, oneWay: true, password: 'pw', mode: 2 });
     expect(workers[0]?.sent).toEqual([
-      { type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true, oneWay: true, mode: 2 },
+      { type: 'start', jobId: 1, sampleRate: 44_100, port: port1, name: 'Bob', manualPtt: true, oneWay: true, password: 'pw', mode: 2 },
     ]);
     expect(workers[0]?.transfers).toEqual([[port1]]);
     workers[0]?.reply({ type: 'started', jobId: 1, maxTextBytes: 1000 });
@@ -616,12 +625,12 @@ describe('coreClient', () => {
 const realCore: Core = {
   version,
   maxTextBytes,
-  createModem: ({ sampleRate, station, name, manualPtt, oneWay, seed, mode }) =>
-    new Modem(sampleRate, station, name, manualPtt, oneWay, seed, mode ?? 255),
+  createModem: ({ sampleRate, station, name, manualPtt, oneWay, seed, mode, password, entropy }) =>
+    new Modem(sampleRate, station, name, manualPtt, oneWay, seed, mode ?? 255, password, entropy),
 };
 
 /** A session on the real core, started at 48 kHz. */
-async function realSession(name: string, first: number, oneWay = false) {
+async function realSession(name: string, first: number, oneWay = false, password = '') {
   const out: WorkerOut[] = [];
   const audio = new FakeAudioPort();
   let next = first;
@@ -630,7 +639,7 @@ async function realSession(name: string, first: number, oneWay = false) {
     (reply) => out.push(reply),
     () => next++,
   );
-  await handle({ ...START, jobId: 0, name, oneWay, port: audio.port });
+  await handle({ ...START, jobId: 0, name, oneWay, password, port: audio.port });
   return { handle, out, audio, incoming: [] as Float32Array[] };
 }
 type RealSession = Awaited<ReturnType<typeof realSession>>;
@@ -689,7 +698,14 @@ describe('the WASM core', () => {
     converse(alice, bob, 9);
 
     expect(events(bob.out)).toEqual([
-      { kind: 'message', text: 'Привет из браузера', station: 100, snrDb: expect.any(Number), freqOffsetHz: expect.any(Number) },
+      {
+        kind: 'message',
+        text: 'Привет из браузера',
+        station: 100,
+        snrDb: expect.any(Number),
+        freqOffsetHz: expect.any(Number),
+        sealed: false,
+      },
       { kind: 'txStart', seconds: expect.closeTo(1.35, 1) },
     ]);
     expect(events(alice.out)).toEqual([
@@ -743,6 +759,24 @@ describe('the WASM core', () => {
     expect(files(bob).at(-1)).toEqual({ kind: 'fileReceived', id: 1, name: 'a.bin', bytes });
     // symbols of 59 bytes in the slowest mode: two make the file, and more keep coming
     expect(files(alice)).toContainEqual({ kind: 'fileCast', id: 1, symbols: 2, needed: 2 });
+  });
+
+  it('seals a text with a password: the same password opens it, another does not', async () => {
+    const [alice, bob] = [await realSession('Alice', 100, false, 'shared'), await realSession('Bob', 200, false, 'shared')];
+    await alice.handle({ type: 'sendText', jobId: 3, text: 'meet at the bridge' });
+    converse(alice, bob, 9);
+    expect(events(bob.out)[0]).toEqual({
+      kind: 'message',
+      text: 'meet at the bridge',
+      station: 100,
+      snrDb: expect.any(Number),
+      freqOffsetHz: expect.any(Number),
+      sealed: true,
+    });
+    const [carol, dave] = [await realSession('Carol', 300, false, 'shared'), await realSession('Dave', 400, false, 'other')];
+    await carol.handle({ type: 'sendText', jobId: 3, text: 'meet at the bridge' });
+    converse(carol, dave, 9);
+    expect(events(dave.out)[0]).toEqual({ kind: 'unopened', station: 300, snrDb: expect.any(Number), freqOffsetHz: expect.any(Number) });
   });
 
   it('refuses texts the core cannot send', async () => {

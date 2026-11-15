@@ -18,12 +18,11 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   in the browser) and 3 (link layer: acknowledgements and repeats, taking
   turns, greetings, push-to-talk) and 4 (fast modes and adaptation: tone
   modes R2–R4, coherent OFDM modes F1–F3 under an LDPC code, the choice of
-  mode by the advice in acknowledgements) are done. Stage 5 (files,
-  broadcast, encryption) is under way: file transfer over the two-way link
-  (offer, consent, chunks, cancelling, going on after a break), several
-  blocks per frame under one acknowledgement, compression (packed texts,
-  deflated files) and broadcast (one-way stations, files in a fountain
-  code) are done; encryption is next.
+  mode by the advice in acknowledgements) and 5 (file transfer over the
+  two-way link with offer, consent, cancelling and going on after a break;
+  several blocks per frame under one acknowledgement; packed texts and
+  deflated files; broadcast in a fountain code for one-way stations;
+  sealing by a shared password) are done. Stage 6 (presets) is next.
 
 ## Commands
 
@@ -92,6 +91,7 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | the modes example               | ~2 min                                             |
 | the pause example               | ~1.5 min                                           |
 | `node scripts/codecs.mjs`       | ~10 s per mode                                     |
+| the key of a password           | ~0.1 s, native and as WASM                         |
 | receiver, searching in noise    | 131× real time native; 95× as WASM at 48 kHz       |
 | receiver, amid modem tones      | 36× real time native (a frame with a missed start) |
 
@@ -130,7 +130,8 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   arrived); `files.rs` — file transfer, pure logic on
   messages and a clock (offers, consent, chunks, deflate, the checksum,
   going on after a break, the time left; broadcast files over a one-way
-  channel); `fountain.rs` — the fountain code of broadcast files;
+  channel); `fountain.rs` — the fountain code of broadcast files; `seal.rs` — the
+  key of a password and the seal of a message;
   `text.rs` — texts packed in a fixed Huffman code; `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
