@@ -50,8 +50,9 @@ login shell may put an older one first). Rust — stable with the
 - `npm run format` — prettier and `cargo fmt`.
 - `npm run icons` — render the PWA PNG icons from `public/icon.svg`.
 - `cargo run --release -p modem-cli -- help` — the native tool: `encode`
-  texts and a file broadcast into a WAV file, `decode` a WAV file (and save
-  the files in it), pass one through a simulated `channel`.
+  texts and a file broadcast into a WAV file (sealed with `--password`),
+  `decode` a WAV file (and save the files in it), pass one through a
+  simulated `channel`.
 
 ## Scripts
 
@@ -84,9 +85,9 @@ push and PR; a push to `main` publishes `dist/` to GitHub Pages.
 | ------------------------------- | -------------------------------------------------- |
 | `npm run wasm`, nothing changed | 0.3 s                                              |
 | `npm run wasm`, clean           | ~40 s (first run also installs `wasm-bindgen-cli`) |
-| `npm run check`, warm           | ~8 s                                               |
-| `npm run smoke -- --preview`    | ~30 s                                              |
-| `cargo test --workspace`, warm  | ~5 s (the link and file tests take most of it)     |
+| `npm run check`, warm           | ~11 s                                              |
+| `npm run smoke -- --preview`    | ~36 s                                              |
+| `cargo test --workspace`, warm  | ~6 s (the link and file tests take most of it)     |
 | the sweep example               | ~50 s                                              |
 | the modes example               | ~2 min                                             |
 | the pause example               | ~1.5 min                                           |
@@ -123,17 +124,17 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `Cargo.toml` — the Rust workspace (the dev profile is optimised: signal
   processing in tests is too slow otherwise).
 - `crates/modem-core` — the modem. `modem.rs` — what the application sees
-  (texts, events, samples); `link.rs` — the link layer, pure logic on frames
+  (texts, files, events, samples; the password, one way or two); `link.rs` — the link layer, pure logic on frames
   and a clock (acknowledgements, repeats, turns, segments and cutting them
   again for a slower mode, greetings, push-to-talk, cancelling, the ladder
   of modes and the advice, the blocks a frame takes and which of them
   arrived); `files.rs` — file transfer, pure logic on
   messages and a clock (offers, consent, chunks, deflate, the checksum,
   going on after a break, the time left; broadcast files over a one-way
-  channel); `fountain.rs` — the fountain code of broadcast files; `seal.rs` — the
-  key of a password and the seal of a message;
-  `text.rs` — texts packed in a fixed Huffman code; `tx.rs` / `rx.rs` — a frame to samples
-  and a stream of samples to frames; `sync.rs` — the chirp preamble;
+  channel); `fountain.rs` — the fountain code of broadcast files;
+  `seal.rs` — the key of a password and the seal of a message; `text.rs` —
+  texts packed in a fixed Huffman code; `tx.rs` / `rx.rs` — a frame to
+  samples and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
   `ldpc.rs` — the code of the fast modes; `frame.rs` — the modes R1–R4 and
@@ -151,11 +152,13 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   `ModemEvent`, `version`, `maxTextBytes`, `maxNameBytes`.
 - `src/main.tsx` — entry: renders the app with browser storage, languages and
   the worker client; registers the service worker in production.
-- `src/App.tsx` — the shell: language, core status. `src/ModemPanel.tsx` —
-  the modem on the page: station settings (name, push-to-talk, speed),
-  microphone switch, state and speed, input meter, the scrolling box of
-  messages and files with their statuses, cancel, resend and clear, the
-  text and the file to send, the offer of a file to accept or decline.
+- `src/App.tsx` — the shell: language, core status, the password (in
+  memory only). `src/ModemPanel.tsx` — the modem on the page: station
+  settings (name, push-to-talk, one way, password, speed), microphone
+  switch, state and speed, input meter, the scrolling box of messages and
+  files with their statuses (sealed or not, broadcast as the share sent),
+  cancel, resend and clear, the text and the file to send, the offer of a
+  file to accept or decline.
 - `src/audio/` — `engine.ts` (AudioContext, microphone, wiring; browser
   glue), `modem-io.worklet.js` (the AudioWorklet: plain JS, no imports),
   `meter.ts` (peak and spectrum bars). Design: `docs/web-audio.md`.
@@ -169,7 +172,7 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   `index.ts` — locales, detection, text direction; `plural.ts` —
   `Intl.PluralRules` helper, signed numbers.
 - `src/storage.ts` — versioned, validated settings in localStorage: language,
-  name, push-to-talk, speed.
+  name, push-to-talk, one way, speed. Never the password.
 - `src/sw-plugin.ts` — Vite plugin emitting `sw.js` that precaches the build;
   `src/pwa.ts` — its registration, an update check on every return to the
   page and a reload when a new version takes control (`_conventions/pwa.md`).
@@ -184,9 +187,12 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 ## Architectural invariants
 
 - The core (`modem-core`) knows nothing about the platform: samples and
-  commands in, samples and events out; no threads, timers or system time —
-  time is the number of processed samples. Pure Rust dependencies only (it
-  must build for wasm32 and Android). `unsafe` is forbidden workspace-wide.
+  commands in, samples and events out; no threads, timers, system time or
+  system randomness — time is the number of processed samples, and the
+  application gives the seeds and the entropy of the seal (`Config`). Pure
+  Rust dependencies only (it must build for wasm32 and Android), without
+  default features that reach for the system (`getrandom`). `unsafe` is
+  forbidden in our crates.
 - The main thread never imports WASM: only `src/worker/modem.worker.ts` does.
   CI greps the main chunk for `WebAssembly`.
 - No SharedArrayBuffer (GitHub Pages sends no COOP/COEP headers): the page,
@@ -207,8 +213,12 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   `link.rs` knows no sound and `rx.rs`/`tx.rs` know no link rules; only
   `modem.rs` joins them. `files.rs` knows neither frames nor the link:
   messages and their fates pass through `modem.rs` as well.
-- Nothing of a file's content is transmitted before its receiver consents,
-  and the receiver never delivers a file whose CRC-32 failed.
+- Over the two-way link nothing of a file's content is transmitted before
+  its receiver consents; a one-way station broadcasts without asking, as
+  nobody can answer. No file is delivered whose length or CRC-32 is wrong.
+- A station with a password seals every text and file message; only the
+  greeting, frame headers and acknowledgements go in the clear. The
+  password is never stored (a test in `App.test.tsx` checks localStorage).
 - `modem-wasm` and the worker file stay thin adapters; logic lives where it is
   unit-tested (`modem-core`, `handler.ts`).
 
@@ -229,12 +239,12 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   language yet, but `<html dir>` follows `direction(locale)` and CSS uses
   logical properties only.
 - A new stored field gets a default and a test that data saved before it
-  still loads (as `name`, `manualPtt`, `mode` did). Changing the meaning or
+  still loads (as `name`, `manualPtt`, `mode`, `oneWay` did). Changing the meaning or
   the type of an existing field needs a bump of `VERSION` in
   `src/storage.ts` and a test for the reset or migration.
 - No `as` casts in app code; a disabled lint rule carries its reason.
 - A helper script that may be needed again goes to `scripts/` (Rust
   experiments: `crates/modem-sim/examples/`) with a header comment and a line
-  in this file. Experiments are kept, not deleted after one use. A new browser check is a step or a flag in
-  `scripts/smoke.mjs`, not a new file.
+  in this file. Experiments are kept, not deleted after one use. A new
+  browser check is a step or a flag in `scripts/smoke.mjs`, not a new file.
 - Each feature gets its own branch and a pull request.

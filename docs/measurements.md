@@ -185,7 +185,8 @@ to):
   is 2 s of data in 5.8 s of exchange.
 - That is the room for several frames per acknowledgement, which the plan
   postponed twice: in F3 it would bring up to three times the speed, in the
-  robust modes a third to a half more.
+  robust modes a third to a half more. (Done as several blocks per frame:
+  twice the speed in F3, see below.)
 - A file through noise, with the link broken for 100 s in the middle and the
   transfer going on from where it stopped: `tests/link.rs` in `modem-sim`.
 

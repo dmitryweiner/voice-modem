@@ -44,6 +44,9 @@ speaker, and why it is built this way.
   start at that moment and to last as long as its samples; the real sound
   lags by the latency of the device, which the 0.3 s of deafness after a
   transmission and the 0.5 s before an acknowledgement allow for.
+- **A password is turned into a key when the modem starts**, in the worker:
+  a fraction of a second (more on a phone) during which the microphone
+  blocks wait in the channel to the worklet; none is lost.
 - **The page learns about sound from two sides**: `txStart` from the worker
   when samples go to the worklet, `txEnd` when the worklet answers `'idle'`
   — the last sample has gone to the device.
@@ -59,10 +62,11 @@ with the real WASM core (two sessions, sound passed from one to the other in
 Node), the worklet, the meter, the panel with a stand-in audio device.
 
 The whole chain runs in `npm run smoke`: Chromium gets a WAV file made by
-`modem-cli` as its microphone (`--use-file-for-fake-audio-capture`), and the
-text must appear on the page. Then a text is sent: the page must wait for the
-recording to fall silent, transmit, and — nobody answers a fake microphone —
-transmit again.
+`modem-cli` as its microphone (`--use-file-for-fake-audio-capture`) — a text
+and a small file broadcast after it — and the text must appear on the page,
+the file must be collected and offered for saving. Then a text is sent: the
+page must wait for the recording to fall silent, transmit, and — nobody
+answers a fake microphone — transmit again; a file is offered and given up.
 
 What only real devices can tell — speakers, microphones, rooms, what phones
 do to the audio path — goes to [measurements.md](measurements.md).

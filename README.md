@@ -8,7 +8,8 @@ as sound in the voice band; speed and modulation adapt to the channel.
 No server: a static, offline-capable web app (PWA). The signal-processing core
 is written in Rust and runs in the browser as WebAssembly inside a Web Worker.
 
-**Status: stage 5 of 7 done.** Two devices exchange texts and files through the air: open
+**Status: stage 5 of 7 done.** Two devices exchange texts and files through
+the air: open
 [the app](https://dmitryweiner.github.io/voice-modem/) on both, next to each
 other, turn on the microphone and write. Every text is acknowledged by the
 other side and repeated until it is, up to five times; the sender sees
@@ -44,6 +45,10 @@ cargo run --release -p modem-cli -- decode noisy.wav
 # a file broadcast into a recording, and collected from it
 cargo run --release -p modem-cli -- encode --file photo.jpg --times 2 --mode f1 -o photo.wav
 cargo run --release -p modem-cli -- decode photo.wav --save received/
+
+# sealed: only the password opens it
+cargo run --release -p modem-cli -- encode "Meet at the bridge" --password s3cret -o sealed.wav
+cargo run --release -p modem-cli -- decode sealed.wav --password s3cret
 ```
 
 ## Development

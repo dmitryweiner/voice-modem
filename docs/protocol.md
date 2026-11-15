@@ -1,8 +1,8 @@
 # Protocol
 
 The sound on the wire and the rules of the exchange, as implemented in
-`crates/modem-core`. Version 0: it changes freely until the first release. Every number here has a test in the
-module named next to it.
+`crates/modem-core`. Version 0: it changes freely until the first release.
+Every number here has a test in the module named next to it.
 
 All processing runs at **16 kHz**; the core converts from and to the sample
 rate of the audio device (`resample.rs`). Bits are sent most significant first;
@@ -21,8 +21,9 @@ each of the many tones or carriers of such a payload (`rx.rs`,
 `PAYLOAD_PAUSE`).
 
 A data or broadcast frame carries 0–4095 bytes of payload in blocks; an
-acknowledgement ends after the header. The frame fades in and out over 32 samples, except
-that a payload of carriers ends as its last symbol does (`tx.rs`).
+acknowledgement ends after the header. The frame fades in and out over 32
+samples, except that a payload of carriers ends as its last symbol does
+(`tx.rs`).
 
 ### Lead-in tone
 
@@ -250,8 +251,8 @@ any other character keeps the code of the letter before it.
   of the symbols. The weights are part of the protocol.
 - On the air, most significant bit first: one bit for the code of the start
   (1: that of the Cyrillic letters; the code of the first letter of the text,
-  Latin when there is none),
-  the code of each character, the end, zero bits up to a whole byte.
+  Latin when there is none), the code of each character, the end, zero bits
+  up to a whole byte.
 
 A packed text that does not unpack is acknowledged and dropped.
 
@@ -336,10 +337,10 @@ amateur radio bands; the app says so next to the password.
   above where the mode stops in white noise and in a simulated room.
 - A station starts in R1. On an acknowledgement it moves to the advised mode
   if that is slower, and one mode faster if the advice is faster and the
-  frame arrived whole. When a frame
-  is not acknowledged it is repeated one mode slower, and the mode that failed
-  is not used again for a minute, whatever the advice. After two minutes
-  without an acknowledgement it starts from R1 again.
+  frame arrived whole. When a frame is not acknowledged it is repeated one
+  mode slower, and the mode that failed is not used again for a minute,
+  whatever the advice. After two minutes without an acknowledgement it
+  starts from R1 again.
 - Each direction has its own mode. A station can instead be fixed to one
   mode; broadcast frames always are.
 
@@ -365,7 +366,7 @@ station's frame that starts meanwhile.
 ## Files (`files.rs`)
 
 A file goes as messages of type 2 over the link layer, each acknowledged
-like a text. The first byte of such a message is its kind, the second the
+like a text (over a one-way channel: [below](#over-a-one-way-channel-fountainrs)). The first byte of such a message is its kind, the second the
 number of the transfer, which the sender counts from 0 (0 again after 255):
 
 | Kind       | From             | After the two bytes                                                                                                                                       |
@@ -389,7 +390,8 @@ number of the transfer, which the sender counts from 0 (0 again after 255):
 - Chunks go in order, one at a time, each acknowledged before the next
   (stop and wait, as everything on the link). A chunk is as long as one
   frame of the mode of the moment takes: 57 bytes of the file in R1, 2039
-  in F1, 4085 in F2 and F3. If that frame is repeated in a slower mode, or
+  in F1, 4085 in F2 and F3, and 29 bytes less with a password (the seal of
+  each message). If that frame is repeated in a slower mode, or
   arrives in part, the link layer sends the rest as further segments, as it
   does with a text.
 - A chunk is handed to the link layer only when nothing else waits there:
@@ -402,15 +404,15 @@ number of the transfer, which the sender counts from 0 (0 again after 255):
 - When it has as many bytes on the air as the offer said, the receiver
   inflates them if they are deflated (never past the length of the file),
   checks the length and the CRC-32 and delivers the file, or drops it if
-  either is wrong. The
-  sender takes the file for delivered when its last chunk is acknowledged.
+  either is wrong. The sender takes the file for delivered when its last
+  chunk is acknowledged.
 - **Going on after a break.** When a message of the transfer is not
   acknowledged after every attempt, the transfer has failed at the sender;
   the receiver keeps what it has. An offer with the same name, length,
   checksum, encoding and length on the air as a file the receiver has in
-  part — from any station, under any
-  number — continues that file: if it was accepted before, the accept goes
-  out at once, with the offset of the first byte that is missing.
+  part — from any station, under any number — continues that file: if it
+  was accepted before, the accept goes out at once, with the offset of the
+  first byte that is missing.
 - A receiver keeps at most 8 files offered or unfinished; the oldest gives
   way.
 
@@ -463,12 +465,13 @@ white noise the two agree.
 
 For a frame whose payload arrived in part: the blocks before the first
 damaged one and how many blocks are missing. A frame whose first block is
-damaged, and a preamble that is unmistakable
-(both chirps make up a quarter of the energy of their windows or more) but is
-followed by an unreadable header, are reported as "heard but not read".
+damaged, and a preamble that is unmistakable (both chirps make up a quarter
+of the energy of their windows or more) but is followed by an unreadable
+header, are reported as "heard but not read".
 
 ## Not there yet
 
 More bits per carrier and bit loading by carrier, keeping blocks that
-arrive after a damaged one, tracking of the symbol clock inside a frame of tones,
-addressed sessions and encryption: see [the plan](../plans/PLAN.md).
+arrive after a damaged one, tracking of the symbol clock inside a frame of
+tones, addressed sessions, protection against a recording played again,
+presets for the kinds of channel: see [the plan](../plans/PLAN.md).
