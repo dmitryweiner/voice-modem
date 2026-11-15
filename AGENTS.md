@@ -20,9 +20,9 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   modes R2–R4, coherent OFDM modes F1–F3 under an LDPC code, the choice of
   mode by the advice in acknowledgements) are done. Stage 5 (files,
   broadcast, encryption) is under way: file transfer over the two-way link
-  is done (offer, consent, chunks, cancelling, going on after a break);
-  several frames per acknowledgement, compression, broadcast with fountain
-  codes and encryption are next.
+  (offer, consent, chunks, cancelling, going on after a break) and several
+  blocks per frame under one acknowledgement are done; compression,
+  broadcast with fountain codes and encryption are next.
 
 ## Commands
 
@@ -121,14 +121,15 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   (texts, events, samples); `link.rs` — the link layer, pure logic on frames
   and a clock (acknowledgements, repeats, turns, segments and cutting them
   again for a slower mode, greetings, push-to-talk, cancelling, the ladder
-  of modes and the advice); `files.rs` — file transfer, pure logic on
+  of modes and the advice, the blocks a frame takes and which of them
+  arrived); `files.rs` — file transfer, pure logic on
   messages and a clock (offers, consent, chunks, the checksum, going on
   after a break, the time left); `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
   `ldpc.rs` — the code of the fast modes; `frame.rs` — the modes R1–R4 and
-  F1–F3, frame kinds and the header;
+  F1–F3, the blocks of a payload, frame kinds and the header;
   `resample.rs` — device rate ⇄ 16 kHz; `coding.rs` — interleaver, scrambler;
   `conv.rs` — convolutional code and Viterbi; `crc.rs`, `bits.rs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room
@@ -190,7 +191,8 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   different PRs do not talk to each other, so both devices are updated
   together. Limits claimed in `docs/measurements.md` are
   guarded by `crates/modem-sim/tests/link.rs` with a margin.
-- The receiver never delivers a payload whose CRC-32 failed.
+- The receiver never delivers a block of a payload whose CRC-32 failed, nor
+  one that came after it.
 - The core's clock is the count of received samples: the host must keep
   calling `push_rx` (silence too) and play what `pull_tx` gives at once.
   `link.rs` knows no sound and `rx.rs`/`tx.rs` know no link rules; only

@@ -11,8 +11,8 @@ multi-byte numbers are big-endian.
 ## Frame
 
 ```
-[lead-in tone] [preamble: up-chirp, down-chirp] [header] [payload + CRC-32]
-   optional              256 ms                  992 ms    mode R1: 64 ms per byte + 608 ms
+[lead-in tone] [preamble: up-chirp, down-chirp] [header] [block + CRC-32] [block + CRC-32] …
+   optional              256 ms                  992 ms    mode R1: 128 ms per byte + 608 ms per block
 ```
 
 Between the header and a payload in any mode but R1 there are 64 ms of
@@ -20,8 +20,8 @@ silence: in a room the last tones of the header ring on, far louder than
 each of the many tones or carriers of such a payload (`rx.rs`,
 `PAYLOAD_PAUSE`).
 
-A data or broadcast frame carries 0–1023 bytes of payload; an acknowledgement
-ends after the header. The frame fades in and out over 32 samples, except
+A data or broadcast frame carries 0–4095 bytes of payload in blocks; an
+acknowledgement ends after the header. The frame fades in and out over 32 samples, except
 that a payload of carriers ends as its last symbol does (`tx.rs`).
 
 ### Lead-in tone
@@ -52,23 +52,32 @@ Seven bytes, always in mode R1:
 | ---- | ------------------------------------------------------------------------------------------ |
 | 0    | bits 7–6: protocol version (0); bits 5–4: kind of the frame; bits 3–0: mode of the payload |
 | 1–2  | station address                                                                            |
-| 3    | bits 7–2: frame number (0–63); bits 1–0: the two highest bits of the payload length        |
+| 3    | bits 7–4: frame number (0–15); bits 3–0: the four highest bits of the payload length       |
 | 4    | the eight lowest bits of the payload length in bytes                                       |
 | 5–6  | CRC-16/CCITT-FALSE of bytes 0–4 (polynomial 0x1021, initial value 0xFFFF)                  |
 
-| Kind | Name            | Address and number                                    | Payload                                                                      |
-| ---- | --------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 0    | data            | of the sender; it counts its frames, 0 again after 63 | yes; asks for an acknowledgement                                             |
-| 1    | acknowledgement | those of the data frame it answers                    | none: the frame ends with the header; the length is the advised mode (below) |
-| 2    | broadcast       | of the sender                                         | yes; expects no answer                                                       |
+| Kind | Name            | Address and number                                    | Payload                                                           |
+| ---- | --------------- | ----------------------------------------------------- | ----------------------------------------------------------------- |
+| 0    | data            | of the sender; it counts its frames, 0 again after 15 | yes; asks for an acknowledgement                                  |
+| 1    | acknowledgement | those of the data frame it answers                    | none: the frame ends with the header; the length field: see below |
+| 2    | broadcast       | of the sender                                         | yes; expects no answer                                            |
 
 A receiver that does not know the version, the kind or the mode drops the
 frame.
 
+In an acknowledgement the length field holds, in bits 3–0, the advised mode
+([below](#choosing-the-mode)) and in bits 11–4 the number of blocks at the end
+of the acknowledged payload that did not arrive whole or came after one that
+did not; 0 when all of it arrived ([below](#acknowledgement-and-repeats)).
+
 ### Payload
 
-The payload bytes followed by their CRC-32 (IEEE 802.3, the one of zip and
-PNG), in the mode named by the header.
+The payload goes in blocks, in the mode named by the header: all but the last
+as long as the mode allows (64 bytes in R1, 128 in R2, 255 in R3 and R4, 1023
+in F1–F3), the last with the rest; an empty payload is one empty block. Each
+block is followed by its CRC-32 (IEEE 802.3, the one of zip and PNG) and is
+coded on its own, so that a block damaged on the way costs only itself and
+what comes after it.
 
 ## Modes
 
@@ -99,9 +108,9 @@ Symbols of 512 samples (32 ms), no gaps between them.
 
 A symbol is `G` tones sounding at once, one from each of `G` groups; a tone is
 one of `M` and carries log₂ M bits. The groups lie side by side on the grid,
-and the grid is shared by `S` sets that take turns: in symbol number `n` of a
-block (the header and the payload are blocks of their own, each counted from
-0), tone `t` of group `g` has the frequency
+and the grid is shared by `S` sets that take turns: in symbol number `n` of
+the header or of the payload (each counted from 0, on through all the blocks
+of a payload), tone `t` of group `g` has the frequency
 
     750 + 31.25 · ((g · M + t) · S + n mod S) Hz.
 
@@ -124,8 +133,8 @@ that has it set.
 
 ### Block coding (`coding.rs`, `conv.rs`)
 
-The header, and the payload (with its CRC) of a robust mode, are each coded
-as a block on their own:
+The header, and each block of the payload (with its CRC) of a robust mode,
+are coded as blocks on their own, one after another:
 
 1. **Convolutional code**, constraint length 7, rate 1/2. The register takes
    each bit into its lowest position; the two output bits are the parities of
@@ -145,8 +154,8 @@ algorithm.
 
 ## Fast modes
 
-The payload block (the payload and its CRC-32) is coded, then carried by
-OFDM symbols after two training symbols:
+The blocks of the payload (each with its CRC-32) are coded one after another,
+then carried by OFDM symbols after two training symbols:
 
 ```
 [training] [training] [data symbol 0] [data symbol 1] …
@@ -167,8 +176,8 @@ to each and one more to the first `8B mod W`. The information bits a word has
 no use for are zeros and are not sent (shortening); every word is sent with
 all its parity bits. On the air: word after word, the bits of the block and
 then the parity bits of each, all XORed with the scrambler sequence of the
-robust modes (started once per block), then more of that sequence up to a
-whole number of symbols.
+robust modes (started once per block); the blocks one after another, then
+more of the sequence of the last one up to a whole number of symbols.
 
 The receiver decodes each word from soft values (layered min-sum).
 
@@ -184,7 +193,7 @@ exceeds it is cut off.
 - **Training symbol**: every carrier has the value exp(iπk² / 64).
 - **Data symbol** number `n` (from 0): the carriers with `(k − 3n) mod 8 = 0`
   are pilots with their training value; the other 56, in the order of `k`,
-  each take the next 2 or 4 bits of the block.
+  each take the next 2 or 4 bits on the air.
 - **Bits to value**: the first half of the bits of a carrier gives the real
   part, the second half the imaginary part. One bit: 0 → −1, 1 → +1. Two
   bits: 00 → −3, 01 → −1, 11 → +1, 10 → +3. The value is divided by √2 or
@@ -212,7 +221,7 @@ empty payload and unknown types are acknowledged and otherwise ignored.
 | ------- | --------------------------------------------------------------------------------------------------------------- |
 | 0 text  | UTF-8 text, cut into segments anywhere, also inside a character; at most 1000 bytes                             |
 | 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment |
-| 2 file  | a message of the file transfer ([below](#files-filesrs)), at most 1022 bytes                                    |
+| 2 file  | a message of the file transfer ([below](#files-filesrs)), at most 4091 bytes                                    |
 
 A receiver starts a message at a segment with the "first" flag and delivers
 it at the one without "more". A segment adds the bytes from its offset on
@@ -225,6 +234,13 @@ message, and segments that come without a first one are dropped.
   0.5 s after the frame ended, whether or not it has seen the frame before.
   It delivers a payload only if the frame number differs from the last one
   received from that address: a repeat means the acknowledgement was lost.
+- The receiver takes the blocks of a payload that arrived whole, up to the
+  first that did not, and says in the acknowledgement how many blocks at the
+  end it misses. The sender counts the blocks before those as received: the
+  rest of the segment goes as the next one. A message ends only with a
+  segment that arrived whole. A frame whose first block is damaged is not
+  acknowledged at all. A repeat is answered with what was missing the first
+  time, whatever arrived this time.
 - The sender waits for the acknowledgement until 0.5 s + the length of an
   acknowledgement + 1 s after its frame ended (10 s more with push-to-talk).
   Then it waits a random 0.2–1.2 s and sends the frame again under the same
@@ -239,11 +255,13 @@ message, and segments that come without a first one are dropped.
 
 ### Choosing the mode
 
-- A frame carries up to 64 bytes in R1, 128 in R2, 255 in R3 and R4 and
-  1023 in the fast modes: a frame has more than a second of preamble and
-  header, and a faster mode should not spend its time on those. A message is
-  cut as it is sent, each segment to the size of the mode at that moment; a
-  fast frame takes a whole text.
+- A frame carries as many blocks as last twelve seconds: one in R1, R2 and
+  R3 (64, 128 and 255 bytes, 8–9 s), two in R4 and F1 (510 and 2046 bytes),
+  four in F2 and F3 (4092 bytes, 12 s and 8 s). Every frame costs more than
+  a second of preamble and header and about 2.4 s for its acknowledgement
+  and the turn; a longer frame spends less of its time on those, but keeps a
+  text waiting longer. A message is cut as it is sent, each segment to the
+  size of the mode at that moment; a fast frame takes a whole text.
 - The modes a station chooses from are R1, R2, R3, F1, F2, F3, in this
   order. R4 is not among them: F1 is faster and withstands more noise and
   no less echo. R4 is for channels that carry tones but not phases, and is set
@@ -256,7 +274,8 @@ message, and segments that come without a first one are dropped.
   11 dB, F3 from 16 dB, and no more than R3 below that. Each is about 3 dB
   above where the mode stops in white noise and in a simulated room.
 - A station starts in R1. On an acknowledgement it moves to the advised mode
-  if that is slower, and one mode faster if the advice is faster. When a frame
+  if that is slower, and one mode faster if the advice is faster and the
+  frame arrived whole. When a frame
   is not acknowledged it is repeated one mode slower, and the mode that failed
   is not used again for a minute, whatever the advice. After two minutes
   without an acknowledgement it starts from R1 again.
@@ -301,9 +320,10 @@ number of the transfer, which the sender counts from 0 (0 again after 255):
   it as long as it takes.
 - Chunks go in order, one at a time, each acknowledged before the next
   (stop and wait, as everything on the link). A chunk is as long as one
-  frame of the mode of the moment takes: 57 bytes of the file in R1, 1016 in
-  a fast mode. If that frame is repeated in a slower mode, the link layer
-  cuts it into segments as it does a text.
+  frame of the mode of the moment takes: 57 bytes of the file in R1, 2039
+  in F1, 4085 in F2 and F3. If that frame is repeated in a slower mode, or
+  arrives in part, the link layer sends the rest as further segments, as it
+  does with a text.
 - A chunk is handed to the link layer only when nothing else waits there:
   **a text goes ahead of the rest of a file**. A station sends one file at a
   time; further ones wait, each offered when the one before is through.
@@ -335,15 +355,19 @@ energies, with the noise counted over the whole band up to 8 kHz (add 4.3 dB
 for the noise in a 3 kHz band). On a clean signal the estimate tops out near
 23–33 dB depending on the frame length. For a fast frame also the
 signal-to-noise ratio on its carriers: the power of a carrier over what the
-pilots were off by. In white noise the two agree.
+pilots were off by, up to the end of the last block that arrived whole — a
+burst of noise that took a later block says nothing about the channel. In
+white noise the two agree.
 
-A frame whose payload checksum fails, and a preamble that is unmistakable
+For a frame whose payload arrived in part: the blocks before the first
+damaged one and how many blocks are missing. A frame whose first block is
+damaged, and a preamble that is unmistakable
 (both chirps make up a quarter of the energy of their windows or more) but is
 followed by an unreadable header, are reported as "heard but not read".
 
 ## Not there yet
 
-More bits per carrier and bit loading by carrier, several frames per
-acknowledgement, tracking of the symbol clock inside a frame of tones,
+More bits per carrier and bit loading by carrier, keeping blocks that
+arrive after a damaged one, tracking of the symbol clock inside a frame of tones,
 addressed sessions, compression, files over a one-way channel and
 encryption: see [the plan](../plans/PLAN.md).

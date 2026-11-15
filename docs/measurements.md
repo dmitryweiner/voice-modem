@@ -191,6 +191,37 @@ to):
 
 Not measured: a file between real devices.
 
+## Several blocks per frame (2026-11-15)
+
+The same example after a frame took several blocks of its mode, each with
+its own checksum, and the acknowledgement learned to ask for the blocks at
+the end that were damaged: four blocks of 1023 bytes in F2 and F3, two in F1
+and R4. The robust modes keep one block per frame: one lasts 8–9 s.
+
+| Mode | 10 KB, before | 10 KB, now | Net speed, before | Net speed, now | Share |
+| ---- | ------------- | ---------- | ----------------- | -------------- | ----- |
+| R4   | 5 min         | 4 min      | 252 bit/s         | 334 bit/s      | 67%   |
+| F1   | 97 s          | 78 s       | 832 bit/s         | 1032 bit/s     | 74%   |
+| F2   | 68 s          | 41 s       | 1192 bit/s        | 2067 bit/s     | 74%   |
+| F3   | 58 s          | 31 s       | 1406 bit/s        | 2787 bit/s     | 66%   |
+
+- The longest frames do as well as short ones where the advice sends a
+  station: 3 dB above where each mode stops, in white noise and in the
+  simulated room, all of them arrived whole (`tests/link.rs` in `modem-sim`
+  guards it). 1.5 dB lower in the room one full F2 frame in 12 was lost, and
+  no short one. A frame that failed in the room failed from its first block:
+  echo is not a burst, and the blocks do not help against it.
+- A burst of noise 20 dB above the signal for 0.3 s in the third of four
+  blocks of F3 costs the third and the fourth: the first two arrive, and the
+  next frame carries the rest. The signal-to-noise ratio of the carriers,
+  which the advice in the acknowledgement follows, is counted up to the end
+  of the blocks that arrived: 20 dB, where the whole frame gave −4 dB and
+  the advice R3.
+- Clock offset: the longest frames (12 s of carriers in F1 and F2, 8 s in
+  F3) are received at ±200 ppm with noise 20 dB below.
+
+Not measured: long frames between real devices.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through

@@ -168,7 +168,11 @@ impl Modem {
             ..
         } = config;
         let lead_in = u64::from(tx.lead_in_ms) * u64::from(SAMPLE_RATE) / 1000;
-        let ack_len = frame_len(Kind::Ack { advice: Mode::R1 }, Mode::R1, 0) as u64 + lead_in;
+        let ack = Kind::Ack {
+            advice: Mode::R1,
+            missing: 0,
+        };
+        let ack_len = frame_len(ack, Mode::R1, 0) as u64 + lead_in;
         Ok(Self {
             tx_config: tx,
             rx_resampler: converts.then(|| Resampler::new(rate, SAMPLE_RATE)),
@@ -280,10 +284,16 @@ impl Modem {
 
         while let Some(event) = self.receiver.poll() {
             match event {
-                RxEvent::Frame { frame, stats, .. } => {
+                RxEvent::Frame {
+                    frame,
+                    stats,
+                    missing,
+                    ..
+                } => {
                     let heard = Heard {
                         snr_db: stats.snr_db,
                         carriers_snr_db: stats.carriers_snr_db,
+                        missing: u8::try_from(missing).unwrap_or(u8::MAX),
                     };
                     self.link.on_frame(&frame, heard, self.clock);
                     self.take_link_events(Some(stats));
@@ -847,8 +857,8 @@ mod tests {
     #[test]
     fn a_file_is_offered_accepted_and_arrives_whole() {
         let (mut alice, mut bob) = (modem(1), modem(2));
-        let (up, down) = offer_and_accept(&mut alice, &mut bob, 2000);
-        run(&mut [&mut alice, &mut bob], 60.0);
+        let (up, down) = offer_and_accept(&mut alice, &mut bob, 5000);
+        run(&mut [&mut alice, &mut bob], 90.0);
         let (at_alice, at_bob) = (events(&mut alice), events(&mut bob));
         // nothing of the link layer shows through: only the file is reported
         assert!(
@@ -858,7 +868,10 @@ mod tests {
             "{at_alice:?}"
         );
         assert_eq!(at_alice.last(), Some(&Event::FileDelivered { id: up }));
-        // the offer went in the slowest mode; the chunks fill the frames of the next three
+        // The offer went in the slowest mode; the chunks fill the frames of
+        // the next ones: a block of R2, one of R3, two of F1, and the rest
+        // in a frame of F2, which takes four.
+        assert_eq!(at_bob.len(), 4);
         assert_eq!(
             at_bob[..3]
                 .iter()
@@ -867,14 +880,14 @@ mod tests {
                     _ => 0,
                 })
                 .collect::<Vec<_>>(),
-            [121, 369, 1385]
+            [121, 369, 2408]
         );
         assert_eq!(
             at_bob.last(),
             Some(&Event::FileReceived {
                 id: down,
                 name: "notes.txt".into(),
-                bytes: file(2000)
+                bytes: file(5000)
             })
         );
         assert!(alice.is_idle() && bob.is_idle());

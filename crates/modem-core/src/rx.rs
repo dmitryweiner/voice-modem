@@ -1,6 +1,7 @@
 //! Receiver: a stream of samples → frames.
 //!
-//! Searches for the preamble, then demodulates the header and the payload.
+//! Searches for the preamble, then demodulates the header and the payload,
+//! whose blocks are checked one by one.
 //! Fed in pieces of any size, it gives the same frames as when fed at once.
 //!
 //! Once a header is read the receiver takes the whole announced payload and
@@ -12,7 +13,7 @@ use std::collections::VecDeque;
 use crate::SAMPLE_RATE;
 use crate::coding::{block_symbols, decode_block};
 use crate::crc::crc32;
-use crate::frame::{Frame, HEADER_BYTES, HEADER_MFSK, HEADER_MODE, Header, Mode, Scheme};
+use crate::frame::{Frame, HEADER_BYTES, HEADER_MFSK, HEADER_MODE, Header, Mode, Scheme, blocks};
 use crate::mfsk::{MfskParams, soft_bits, tone_energies};
 use crate::ofdm;
 use crate::sync::{CHIRP_LEN, HZ_PER_SAMPLE, PREAMBLE_LEN, Reference};
@@ -33,7 +34,7 @@ const CLEAR: f32 = 0.25;
 pub const MAX_FREQ_OFFSET_HZ: f32 = 250.0;
 /// How far the offset moves each chirp peak, samples.
 const MAX_SHIFT: usize = (MAX_FREQ_OFFSET_HZ / HZ_PER_SAMPLE) as usize;
-/// CRC-32 after the payload.
+/// CRC-32 after each block of the payload.
 const CHECKSUM_BYTES: usize = 4;
 
 /// Length of the header in samples.
@@ -56,12 +57,26 @@ pub fn payload_pause(mode: Mode) -> usize {
     }
 }
 
-/// Length in samples of a payload of `bytes` bytes with its checksum.
+/// The blocks of a payload of `bytes` bytes on the air: their lengths with the checksums.
+fn checked_blocks(mode: Mode, bytes: usize) -> Vec<usize> {
+    blocks(mode, bytes)
+        .into_iter()
+        .map(|len| len + CHECKSUM_BYTES)
+        .collect()
+}
+
+/// Length in samples of a payload of `bytes` bytes in its blocks with their checksums.
 pub fn payload_len(mode: Mode, bytes: usize) -> usize {
-    let bytes = bytes + CHECKSUM_BYTES;
+    let blocks = checked_blocks(mode, bytes);
     match mode.scheme() {
-        Scheme::Tones(mfsk) => block_symbols(bytes, mfsk.bits_per_symbol()) * mfsk.symbol_len,
-        Scheme::Carriers(params) => params.block_symbols(bytes) * ofdm::SYMBOL_LEN,
+        Scheme::Tones(mfsk) => {
+            let symbols: usize = blocks
+                .iter()
+                .map(|&bytes| block_symbols(bytes, mfsk.bits_per_symbol()))
+                .sum();
+            symbols * mfsk.symbol_len
+        }
+        Scheme::Carriers(params) => params.symbols(&blocks) * ofdm::SYMBOL_LEN,
     }
 }
 
@@ -82,13 +97,16 @@ pub struct RxStats {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RxEvent {
-    /// A frame with correct checksums.
+    /// A frame, or the beginning of one: its payload holds the blocks that
+    /// arrived whole up to the first that did not. `missing` counts that one
+    /// and those after it; 0 when the whole payload is there.
     Frame {
         frame: Frame,
         mode: Mode,
         stats: RxStats,
+        missing: usize,
     },
-    /// The header was read but the payload checksum is wrong.
+    /// The header was read but the first block of the payload is damaged.
     Damaged {
         station: u16,
         seq: u8,
@@ -316,19 +334,22 @@ impl Receiver {
         best_of(&mut around.into_iter(), coarse)
     }
 
-    /// Soft bits of the symbols from `start` on, or None until all of them have arrived.
+    /// Soft bits of the symbols from `start` on, or None until all of them
+    /// have arrived. `first` is the number of the first of them in its part
+    /// of the frame (the header, the payload): it chooses the set of tones.
     fn demodulate(
         &self,
         mfsk: &MfskParams,
         start: u64,
         symbols: usize,
+        first: usize,
         freq_offset_hz: f32,
     ) -> Option<(Vec<f32>, SnrEstimate)> {
         let samples = self.samples(start, symbols * mfsk.symbol_len)?;
         let mut soft = Vec::with_capacity(symbols * mfsk.bits_per_symbol());
         let mut snr = SnrEstimate::default();
         for (index, symbol) in samples.chunks_exact(mfsk.symbol_len).enumerate() {
-            let energies = tone_energies(mfsk, symbol, index, freq_offset_hz);
+            let energies = tone_energies(mfsk, symbol, first + index, freq_offset_hz);
             soft_bits(mfsk, &energies, &mut soft);
             snr.add(&energies, mfsk.tones(), mfsk.symbol_len);
         }
@@ -347,7 +368,7 @@ impl Receiver {
     fn header(&mut self, start: u64, freq_offset_hz: f32, resume: u64, clear: bool) -> bool {
         let mfsk = HEADER_MFSK;
         let symbols = block_symbols(HEADER_BYTES, mfsk.bits_per_symbol());
-        let Some((soft, header_snr)) = self.demodulate(&mfsk, start, symbols, freq_offset_hz)
+        let Some((soft, header_snr)) = self.demodulate(&mfsk, start, symbols, 0, freq_offset_hz)
         else {
             return false;
         };
@@ -372,7 +393,12 @@ impl Receiver {
                     seq,
                     payload: Vec::new(),
                 };
-                self.events.push_back(RxEvent::Frame { frame, mode, stats });
+                self.events.push_back(RxEvent::Frame {
+                    frame,
+                    mode,
+                    stats,
+                    missing: 0,
+                });
                 State::Search {
                     from: start + header_len() as u64,
                 }
@@ -395,35 +421,58 @@ impl Receiver {
         header: Header,
         header_snr: SnrEstimate,
     ) -> bool {
-        let bytes = usize::from(header.len) + CHECKSUM_BYTES;
+        let lens = blocks(header.mode, usize::from(header.len));
+        let sizes = checked_blocks(header.mode, usize::from(header.len));
         let start = header_start + (header_len() + payload_pause(header.mode)) as u64;
         let len = payload_len(header.mode, usize::from(header.len));
+        let Some(samples) = self.samples(start, len) else {
+            return false;
+        };
         let mut stats = self.stats(header_start, freq_offset_hz, header_snr);
-        let mut payload = match header.mode.scheme() {
+        // The signal-to-noise ratio on the carriers up to the end of each block.
+        let mut carriers_snr = Vec::new();
+        let decoded = match header.mode.scheme() {
             Scheme::Tones(mfsk) => {
-                let symbols = len / mfsk.symbol_len;
-                let Some((soft, payload_snr)) =
-                    self.demodulate(&mfsk, start, symbols, freq_offset_hz)
-                else {
-                    return false;
-                };
+                let (mut position, mut first) = (start, 0);
+                let mut payload_snr = SnrEstimate::default();
+                let mut decoded = Vec::with_capacity(sizes.len());
+                for &bytes in &sizes {
+                    let symbols = block_symbols(bytes, mfsk.bits_per_symbol());
+                    let (soft, snr) = self
+                        .demodulate(&mfsk, position, symbols, first, freq_offset_hz)
+                        .expect("all the samples of the payload are here");
+                    payload_snr = payload_snr.merged(snr);
+                    decoded.push(decode_block(&soft, bytes));
+                    position += (symbols * mfsk.symbol_len) as u64;
+                    first += symbols;
+                }
                 // The level is that of a single tone, as in the header: a payload of
                 // several tones at once has less power and would lower the estimate.
                 if mfsk.groups == 1 {
                     stats.snr_db = header_snr.merged(payload_snr).snr_db();
                 }
-                decode_block(&soft, bytes)
+                decoded
             }
             Scheme::Carriers(params) => {
-                let Some(samples) = self.samples(start, len) else {
-                    return false;
-                };
-                let block = ofdm::demodulate(&params, samples, bytes, freq_offset_hz);
-                stats.carriers_snr_db = Some(block.snr_db);
-                block.bytes
+                let demodulated = ofdm::demodulate(&params, samples, &sizes, freq_offset_hz);
+                carriers_snr = demodulated.snr_db;
+                demodulated.blocks
             }
         };
-        let checksum = payload.split_off(usize::from(header.len));
+        // The blocks that arrived whole, up to the first that did not: the
+        // payload is cut into segments in order, and a gap would break that.
+        let mut payload = Vec::with_capacity(usize::from(header.len));
+        let mut whole = 0;
+        for (mut block, &len) in decoded.into_iter().zip(&lens) {
+            let checksum = block.split_off(len);
+            if checksum != crc32(&block).to_be_bytes() {
+                break;
+            }
+            payload.extend(block);
+            whole += 1;
+        }
+        // Judged by what arrived: noise that took a block is not the channel.
+        stats.carriers_snr_db = carriers_snr.get(whole.max(1) - 1).copied();
         let Header {
             kind,
             mode,
@@ -431,26 +480,26 @@ impl Receiver {
             seq,
             ..
         } = header;
-        self.events
-            .push_back(if checksum == crc32(&payload).to_be_bytes() {
-                RxEvent::Frame {
-                    frame: Frame {
-                        kind,
-                        station,
-                        seq,
-                        payload,
-                    },
-                    mode,
-                    stats,
-                }
-            } else {
-                RxEvent::Damaged {
+        self.events.push_back(if whole > 0 {
+            RxEvent::Frame {
+                frame: Frame {
+                    kind,
                     station,
                     seq,
-                    mode,
-                    stats,
-                }
-            });
+                    payload,
+                },
+                mode,
+                stats,
+                missing: lens.len() - whole,
+            }
+        } else {
+            RxEvent::Damaged {
+                station,
+                seq,
+                mode,
+                stats,
+            }
+        });
         self.state = State::Search {
             from: start + len as u64,
         };
@@ -516,7 +565,7 @@ mod tests {
     fn receives_empty_and_full_frames() {
         let full: Vec<u8> = (0..=254).collect();
         assert_eq!(payloads(&receive(&frame(0, &[]))), [(0, vec![])]);
-        assert_eq!(payloads(&receive(&frame(63, &full))), [(63, full)]);
+        assert_eq!(payloads(&receive(&frame(15, &full))), [(15, full)]);
     }
 
     #[test]
@@ -713,9 +762,12 @@ mod tests {
     #[test]
     fn receives_an_acknowledgement_which_is_a_header_alone() {
         let ack = Frame {
-            kind: Kind::Ack { advice: Mode::R3 },
+            kind: Kind::Ack {
+                advice: Mode::R3,
+                missing: 2,
+            },
             station: 0xABCD,
-            seq: 37,
+            seq: 13,
             payload: vec![],
         };
         let mut samples = vec![0.0; 900];
@@ -806,6 +858,93 @@ mod tests {
             (stats.freq_offset_hz - 40.0).abs() < 1.0,
             "{}",
             stats.freq_offset_hz
+        );
+    }
+
+    #[test]
+    fn a_long_payload_goes_in_blocks_each_with_its_checksum() {
+        // 200 bytes in R1: blocks of 64, 64, 64 and 8 bytes, each coded on its own with its CRC-32
+        let payload: Vec<u8> = (0..200).map(|i| (i * 7) as u8).collect();
+        let samples = frame(2, &payload);
+        let symbols: usize = [68, 68, 68, 12]
+            .map(|bytes| block_symbols(bytes, 4))
+            .iter()
+            .sum();
+        assert_eq!(samples.len(), PREAMBLE_LEN + header_len() + symbols * 512);
+        assert_eq!(payload_len(Mode::R1, 200), symbols * 512);
+        let events = receive(&samples);
+        assert!(
+            matches!(&events[..], [RxEvent::Frame { frame, missing: 0, .. }] if frame.payload == payload),
+            "{events:?}"
+        );
+    }
+
+    /// Where block `index` of a frame of full blocks lies, in samples from the start of the frame.
+    fn block_at(mode: Mode, index: usize) -> std::ops::Range<usize> {
+        let start = PREAMBLE_LEN + header_len() + payload_pause(mode);
+        let bytes = mode.block_bytes() + CHECKSUM_BYTES;
+        match mode.scheme() {
+            Scheme::Tones(mfsk) => {
+                let len = block_symbols(bytes, mfsk.bits_per_symbol()) * mfsk.symbol_len;
+                start + index * len..start + (index + 1) * len
+            }
+            Scheme::Carriers(params) => {
+                let symbols = crate::ldpc::block_bits(params.rate, bytes) as f32
+                    / params.bits_per_symbol() as f32;
+                let at = |blocks: f32| {
+                    start
+                        + ((ofdm::TRAINING_SYMBOLS as f32 + blocks * symbols)
+                            * ofdm::SYMBOL_LEN as f32) as usize
+                };
+                at(index as f32)..at(index as f32 + 1.0)
+            }
+        }
+    }
+
+    fn jam(samples: &mut [f32]) {
+        let mut seed = 3u32;
+        for x in samples {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *x = (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
+        }
+    }
+
+    #[test]
+    fn the_blocks_before_a_damaged_one_are_delivered() {
+        for mode in [Mode::R1, Mode::R3, Mode::F1, Mode::F3] {
+            let block = mode.block_bytes();
+            let payload: Vec<u8> = (0..3 * block).map(|i| (i * 13 + 1) as u8).collect();
+            let mut samples = encode_frame(&data(4, &payload), mode, &TxConfig::default()).unwrap();
+            let second = block_at(mode, 1);
+            // the code fills in seconds of noise in a block of tones: all of it has to go;
+            // the carriers lose a block to 0.4 s
+            let noisy = if mode < Mode::F1 {
+                second
+            } else {
+                let middle = (second.start + second.end) / 2;
+                middle - 5 * ofdm::SYMBOL_LEN..middle + 5 * ofdm::SYMBOL_LEN
+            };
+            jam(&mut samples[noisy]);
+            let events = receive(&samples);
+            assert!(
+                matches!(
+                    &events[..],
+                    [RxEvent::Frame { frame, missing: 2, .. }] if frame.payload == payload[..block]
+                ),
+                "{mode:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_whose_first_block_is_damaged_gives_nothing() {
+        let payload = [0x55; 100];
+        let mut samples = frame(5, &payload);
+        jam(&mut samples[block_at(Mode::R1, 0)]);
+        let events = receive(&samples);
+        assert!(
+            matches!(events[..], [RxEvent::Damaged { seq: 5, .. }]),
+            "{events:?}"
         );
     }
 

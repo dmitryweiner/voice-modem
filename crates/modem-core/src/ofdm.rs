@@ -67,9 +67,13 @@ impl OfdmParams {
         DATA_CARRIERS * self.bits_per_carrier
     }
 
-    /// Symbols that carry a block of `bytes` bytes, training included.
-    pub fn block_symbols(&self, bytes: usize) -> usize {
-        TRAINING_SYMBOLS + ldpc::block_bits(self.rate, bytes).div_ceil(self.bits_per_symbol())
+    /// Symbols that carry blocks of these lengths in bytes, training included.
+    pub fn symbols(&self, blocks: &[usize]) -> usize {
+        let bits: usize = blocks
+            .iter()
+            .map(|&bytes| ldpc::block_bits(self.rate, bytes))
+            .sum();
+        TRAINING_SYMBOLS + bits.div_ceil(self.bits_per_symbol())
     }
 
     /// Bits of the block per second, while its data symbols last.
@@ -224,17 +228,25 @@ fn symbol(values: &[Complex; CARRIERS], amplitude: f32, out: &mut Vec<f32>) {
     }
 }
 
-/// Appends the samples of a block of bytes: the training symbols, then the
-/// data symbols with the coded bits.
-pub fn modulate(params: &OfdmParams, data: &[u8], amplitude: f32, out: &mut Vec<f32>) {
+/// Appends the samples of blocks of bytes: the training symbols, then the
+/// data symbols with the coded bits of one block after another.
+pub fn modulate(params: &OfdmParams, blocks: &[&[u8]], amplitude: f32, out: &mut Vec<f32>) {
     let training: [Complex; CARRIERS] = std::array::from_fn(known);
     for _ in 0..TRAINING_SYMBOLS {
         symbol(&training, amplitude, out);
     }
-    let mut bits = ldpc::encode_block(params.rate, data);
-    // Up to a whole symbol with more of the scrambler sequence.
+    let mut bits = Vec::new();
+    let mut last = 0;
+    for block in blocks {
+        let coded = ldpc::encode_block(params.rate, block);
+        last = coded.len();
+        bits.extend(coded);
+    }
+    // Up to a whole symbol with more of the scrambler sequence of the last block.
     let padded = bits.len().div_ceil(params.bits_per_symbol()) * params.bits_per_symbol();
-    let padding: Vec<u8> = scramble_bits(padded).skip(bits.len()).collect();
+    let padding: Vec<u8> = scramble_bits(last + padded - bits.len())
+        .skip(last)
+        .collect();
     bits.extend(padding);
     for (index, chunk) in bits.chunks_exact(params.bits_per_symbol()).enumerate() {
         let mut data_bits = chunk.chunks_exact(params.bits_per_carrier);
@@ -249,15 +261,23 @@ pub fn modulate(params: &OfdmParams, data: &[u8], amplitude: f32, out: &mut Vec<
     }
 }
 
-/// What the receiver made of a block.
+/// What the receiver made of the blocks of a payload.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Demodulated {
-    /// The bytes of the block, right or not: the caller has a checksum.
-    pub bytes: Vec<u8>,
-    /// Signal-to-noise ratio on the carriers, dB: the power of a carrier
-    /// over what the pilots were off by. Echo longer than the prefix and the
-    /// distortion of the speaker count as noise here.
-    pub snr_db: f32,
+    /// The bytes of each block, right or not: the caller has checksums.
+    pub blocks: Vec<Vec<u8>>,
+    /// Signal-to-noise ratio on the carriers, dB, from the first data symbol
+    /// to the end of each block: the power of a carrier over what the pilots
+    /// were off by. Echo longer than the prefix and the distortion of the
+    /// speaker count as noise here. The caller picks the end of the blocks
+    /// that arrived whole: a burst of noise in a later one tells nothing
+    /// about the channel.
+    pub snr_db: Vec<f32>,
+}
+
+fn decibels(signal: f32, noise: f32) -> f32 {
+    let ratio = signal / noise.max(f32::MIN_POSITIVE);
+    (10.0 * ratio.max(1e-4).log10()).min(60.0)
 }
 
 /// The carriers of the symbol whose samples start at `position` of the
@@ -310,16 +330,16 @@ fn turn_of(phase: &Loop, slope: &Loop, carrier: usize) -> Complex {
     Complex::from_angle(phase.value + slope.value * from_centre(carrier))
 }
 
-/// Demodulates and decodes a block of `bytes` bytes from its samples:
-/// `block_symbols(bytes) · SYMBOL_LEN` of them, the signal shifted up by
-/// `freq_offset_hz`.
+/// Demodulates and decodes blocks of these lengths in bytes from their
+/// samples: `symbols(blocks) · SYMBOL_LEN` of them, the signal shifted up
+/// by `freq_offset_hz`.
 pub fn demodulate(
     params: &OfdmParams,
     samples: &[f32],
-    bytes: usize,
+    blocks: &[usize],
     freq_offset_hz: f32,
 ) -> Demodulated {
-    let symbols = params.block_symbols(bytes);
+    let symbols = params.symbols(blocks);
     assert!(samples.len() >= symbols * SYMBOL_LEN, "not enough samples");
     let at = |index: usize| carriers(samples, index * SYMBOL_LEN, freq_offset_hz);
 
@@ -347,6 +367,8 @@ pub fn demodulate(
     let half = params.bits_per_carrier / 2;
     let mut soft = Vec::with_capacity((symbols - TRAINING_SYMBOLS) * params.bits_per_symbol());
     let (mut signal, mut noise) = (0.0f32, 0.0f32);
+    // The sums after each data symbol.
+    let mut sums = Vec::with_capacity(symbols - TRAINING_SYMBOLS);
     for index in 0..symbols - TRAINING_SYMBOLS {
         let received = at(TRAINING_SYMBOLS + index);
         phase.predict();
@@ -405,12 +427,24 @@ pub fn demodulate(
                 soft_axis(equalised.im, half, power, &mut soft);
             }
         }
+        sums.push((signal, noise));
     }
-    let ratio = signal / noise.max(f32::MIN_POSITIVE);
-    Demodulated {
-        bytes: ldpc::decode_block(params.rate, &soft, bytes),
-        snr_db: (10.0 * ratio.max(1e-4).log10()).min(60.0),
-    }
+    let mut taken = 0;
+    let (blocks, snr_db) = blocks
+        .iter()
+        .map(|&bytes| {
+            let len = ldpc::block_bits(params.rate, bytes);
+            taken += len;
+            // The symbol that holds the last bit of the block.
+            let last = (taken - 1) / params.bits_per_symbol();
+            let (signal, noise) = sums[last];
+            (
+                ldpc::decode_block(params.rate, &soft[taken - len..taken], bytes),
+                decibels(signal, noise),
+            )
+        })
+        .unzip();
+    Demodulated { blocks, snr_db }
 }
 
 #[cfg(test)]
@@ -437,7 +471,7 @@ mod tests {
 
     fn modulated(params: &OfdmParams, data: &[u8]) -> Vec<f32> {
         let mut samples = Vec::new();
-        modulate(params, data, 0.5, &mut samples);
+        modulate(params, &[data], 0.5, &mut samples);
         samples
     }
 
@@ -451,10 +485,12 @@ mod tests {
     #[test]
     fn block_lengths() {
         // 4 bytes: 32 + 324 coded bits in 4 symbols of 112, after the training
-        assert_eq!(QPSK.block_symbols(4), 2 + 4);
-        assert_eq!(QAM16.block_symbols(4), 2 + 2);
+        assert_eq!(QPSK.symbols(&[4]), 2 + 4);
+        assert_eq!(QAM16.symbols(&[4]), 2 + 2);
         // the longest block: 16 640 coded bits
-        assert_eq!(QPSK.block_symbols(1027), 2 + 149);
+        assert_eq!(QPSK.symbols(&[1027]), 2 + 149);
+        // two blocks share the training and the last symbol
+        assert_eq!(QPSK.symbols(&[4, 4]), 2 + 7);
         let samples = modulated(&QPSK, &data(4));
         assert_eq!(samples.len(), 6 * SYMBOL_LEN);
     }
@@ -549,10 +585,14 @@ mod tests {
             for len in [0usize, 1, 40, 41, 259, 1027] {
                 let sent = data(len);
                 let samples = modulated(&params, &sent);
-                assert_eq!(samples.len(), params.block_symbols(len) * SYMBOL_LEN);
-                let received = demodulate(&params, &samples, len, 0.0);
-                assert_eq!(received.bytes, sent, "{params:?}, {len} bytes");
-                assert!(received.snr_db > 25.0, "{params:?}: {}", received.snr_db);
+                assert_eq!(samples.len(), params.symbols(&[len]) * SYMBOL_LEN);
+                let received = demodulate(&params, &samples, &[len], 0.0);
+                assert_eq!(received.blocks, [sent], "{params:?}, {len} bytes");
+                assert!(
+                    received.snr_db[0] > 25.0,
+                    "{params:?}: {:?}",
+                    received.snr_db
+                );
             }
         }
     }
@@ -562,7 +602,11 @@ mod tests {
         let sent = data(100);
         for gain in [-1.0, 0.001, 1.9] {
             let samples: Vec<f32> = modulated(&QAM16, &sent).iter().map(|x| x * gain).collect();
-            assert_eq!(demodulate(&QAM16, &samples, 100, 0.0).bytes, sent, "{gain}");
+            assert_eq!(
+                demodulate(&QAM16, &samples, &[100], 0.0).blocks,
+                std::slice::from_ref(&sent),
+                "{gain}"
+            );
         }
     }
 
@@ -579,9 +623,9 @@ mod tests {
                 }
             }
         }
-        let received = demodulate(&QAM16_FAST, &samples, 200, 0.0);
-        assert_eq!(received.bytes, sent);
-        assert!(received.snr_db > 25.0, "{}", received.snr_db);
+        let received = demodulate(&QAM16_FAST, &samples, &[200], 0.0);
+        assert_eq!(received.blocks, [sent]);
+        assert!(received.snr_db[0] > 25.0, "{:?}", received.snr_db);
     }
 
     #[test]
@@ -599,7 +643,11 @@ mod tests {
                         .unwrap_or(0.0)
                 })
                 .collect();
-            assert_eq!(demodulate(&QAM16, &samples, 120, 0.0).bytes, sent, "{late}");
+            assert_eq!(
+                demodulate(&QAM16, &samples, &[120], 0.0).blocks,
+                std::slice::from_ref(&sent),
+                "{late}"
+            );
         }
     }
 
@@ -623,8 +671,78 @@ mod tests {
                 x + sigma * gaussian
             })
             .collect();
-        let received = demodulate(&QPSK, &noisy, 400, 0.0);
-        assert_eq!(received.bytes, sent);
-        assert!((received.snr_db - 16.0).abs() < 1.5, "{}", received.snr_db);
+        let received = demodulate(&QPSK, &noisy, &[400], 0.0);
+        assert_eq!(received.blocks, [sent]);
+        assert!(
+            (received.snr_db[0] - 16.0).abs() < 1.5,
+            "{:?}",
+            received.snr_db
+        );
+    }
+
+    #[test]
+    fn blocks_follow_each_other_after_one_training() {
+        let lens = [1027, 300, 5];
+        let blocks = lens.map(data);
+        for params in ALL {
+            let mut samples = Vec::new();
+            modulate(
+                &params,
+                &blocks.each_ref().map(Vec::as_slice),
+                0.5,
+                &mut samples,
+            );
+            // the bits of the blocks one after another, padded once at the end
+            let bits: usize = lens
+                .iter()
+                .map(|&len| ldpc::block_bits(params.rate, len))
+                .sum();
+            let symbols = TRAINING_SYMBOLS + bits.div_ceil(params.bits_per_symbol());
+            assert_eq!(params.symbols(&lens), symbols);
+            assert_eq!(samples.len(), symbols * SYMBOL_LEN);
+            assert_eq!(
+                demodulate(&params, &samples, &lens, 0.0).blocks,
+                blocks,
+                "{params:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_burst_of_noise_takes_one_block_and_leaves_the_others() {
+        let params = QAM16_FAST;
+        let lens = [1027; 3];
+        let blocks = lens.map(data);
+        let mut samples = Vec::new();
+        modulate(
+            &params,
+            &blocks.each_ref().map(Vec::as_slice),
+            0.5,
+            &mut samples,
+        );
+        // 0.4 s of noise twice as loud as the signal over the middle of the second block
+        let block_symbols =
+            ldpc::block_bits(params.rate, 1027) as f32 / params.bits_per_symbol() as f32;
+        let middle = TRAINING_SYMBOLS as f32 + 1.5 * block_symbols;
+        let from = (middle - 5.0) as usize * SYMBOL_LEN;
+        let mut seed = 7u32;
+        for x in &mut samples[from..from + 10 * SYMBOL_LEN] {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *x += (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
+        }
+        let received = demodulate(&params, &samples, &lens, 0.0);
+        assert_eq!(received.blocks[0], blocks[0]);
+        assert_ne!(received.blocks[1], blocks[1]);
+        // the phase loops and the picture of the channel recover from the burst
+        assert_eq!(received.blocks[2], blocks[2]);
+        // up to the end of the first block the carriers are clean; from there on the burst counts
+        let [first, second, third] = received.snr_db[..] else {
+            panic!("{:?}", received.snr_db);
+        };
+        assert!(
+            first > 25.0 && second < 10.0 && third < 10.0,
+            "{:?}",
+            received.snr_db
+        );
     }
 }

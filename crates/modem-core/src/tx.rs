@@ -5,7 +5,7 @@ use std::f32::consts::TAU;
 use crate::SAMPLE_RATE;
 use crate::coding::encode_block;
 use crate::crc::crc32;
-use crate::frame::{Frame, HEADER_MFSK, Header, Kind, MAX_PAYLOAD, Mode, Scheme};
+use crate::frame::{Frame, HEADER_MFSK, Header, Kind, MAX_PAYLOAD, Mode, Scheme, blocks};
 use crate::mfsk::Modulator;
 use crate::ofdm;
 use crate::rx::payload_pause;
@@ -48,7 +48,7 @@ pub fn frame_len(kind: Kind, mode: Mode, payload_len: usize) -> usize {
 }
 
 /// The samples of one frame: lead-in tone, preamble, header and, unless the
-/// frame is an acknowledgement, the payload with its CRC-32.
+/// frame is an acknowledgement, the payload in blocks, each with its CRC-32.
 pub fn encode_frame(
     frame: &Frame,
     mode: Mode,
@@ -94,8 +94,17 @@ pub fn encode_frame(
         fade(&mut samples[data_start..]);
         return Ok(samples);
     }
-    let mut block = payload.clone();
-    block.extend(crc32(payload).to_be_bytes());
+    let mut rest = &payload[..];
+    let blocks: Vec<Vec<u8>> = blocks(mode, payload.len())
+        .into_iter()
+        .map(|len| {
+            let (block, after) = rest.split_at(len);
+            rest = after;
+            let mut checked = block.to_vec();
+            checked.extend(crc32(block).to_be_bytes());
+            checked
+        })
+        .collect();
     // A payload in the mode of the header goes on where the header ends;
     // before any other the header falls silent for a moment.
     let mut tones_start = data_start;
@@ -106,15 +115,21 @@ pub fn encode_frame(
     }
     match mode.scheme() {
         Scheme::Tones(mfsk) => {
+            // One modulator for all the blocks: the sets of tones go on taking turns.
             let mut modulator = Modulator::new(mfsk, amplitude);
-            for value in encode_block(&block, mfsk.bits_per_symbol()) {
-                modulator.symbol(value, &mut samples);
+            for block in &blocks {
+                for value in encode_block(block, mfsk.bits_per_symbol()) {
+                    modulator.symbol(value, &mut samples);
+                }
             }
             fade(&mut samples[tones_start..]);
         }
         // The carriers start and stop at every symbol anyway, and a fade
         // would take a piece out of the last one.
-        Scheme::Carriers(params) => ofdm::modulate(&params, &block, amplitude, &mut samples),
+        Scheme::Carriers(params) => {
+            let blocks: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+            ofdm::modulate(&params, &blocks, amplitude, &mut samples);
+        }
     }
     Ok(samples)
 }
@@ -160,9 +175,9 @@ mod tests {
         // a pause, then 9 bytes: 72 + 324 coded bits in 4 symbols of 112 bits, after 2 of training
         assert_eq!(frame.len(), 4096 + 31 * 512 + 1024 + 6 * 640);
         assert_eq!(frame.len(), frame_len(Kind::Data, Mode::F1, 5));
-        // the longest frame is six seconds at the slowest of the fast modes
-        let longest = frame_len(Kind::Data, Mode::F1, MAX_PAYLOAD);
-        assert_eq!(longest, 4096 + 31 * 512 + 1024 + 151 * 640);
+        // a full block is six seconds at the slowest of the fast modes
+        let block = frame_len(Kind::Data, Mode::F1, 1023);
+        assert_eq!(block, 4096 + 31 * 512 + 1024 + 151 * 640);
         // the header keeps its level, the carriers are quieter on average
         let rms =
             |part: &[f32]| (part.iter().map(|x| x * x).sum::<f32>() / part.len() as f32).sqrt();
@@ -198,7 +213,10 @@ mod tests {
     #[test]
     fn an_acknowledgement_is_the_preamble_and_the_header() {
         let ack = Frame {
-            kind: Kind::Ack { advice: Mode::R3 },
+            kind: Kind::Ack {
+                advice: Mode::R3,
+                missing: 0,
+            },
             station: 7,
             seq: 3,
             payload: vec![],
@@ -240,6 +258,24 @@ mod tests {
         };
         let frame = encode(b"abc", &config);
         assert!(frame[0].abs() < 1e-3 && frame[frame.len() - 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_payload_of_several_blocks_is_one_frame() {
+        // 3000 bytes in F3: blocks of 1023, 1023 and 954 bytes after one training
+        let frame = encode_frame(&data(&[7; 3000]), Mode::F3, &TxConfig::default()).unwrap();
+        let Scheme::Carriers(params) = Mode::F3.scheme() else {
+            unreachable!()
+        };
+        let symbols = params.symbols(&[1027, 1027, 958]);
+        assert_eq!(frame.len(), 4096 + 31 * 512 + 1024 + symbols * 640);
+        assert_eq!(frame.len(), frame_len(Kind::Data, Mode::F3, 3000));
+        // in R1 every block of 64 bytes is a block of the code of its own
+        let symbols = 2 * crate::coding::block_symbols(68, 4) + crate::coding::block_symbols(8, 4);
+        assert_eq!(
+            frame_len(Kind::Data, Mode::R1, 132),
+            4096 + (31 + symbols) * 512
+        );
     }
 
     #[test]

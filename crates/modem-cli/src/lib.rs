@@ -225,11 +225,20 @@ pub fn decode(samples: &[f32]) -> (String, usize) {
     };
     while let Some(event) = receiver.poll() {
         match event {
-            RxEvent::Frame { frame, stats, .. } => {
+            RxEvent::Frame {
+                frame,
+                stats,
+                missing,
+                ..
+            } => {
                 let heard = Heard {
                     snr_db: stats.snr_db,
                     carriers_snr_db: stats.carriers_snr_db,
+                    missing: u8::try_from(missing).unwrap_or(u8::MAX),
                 };
+                if missing > 0 {
+                    line(stats, "(the end of a frame is damaged)");
+                }
                 link.on_frame(&frame, heard, stats.start);
                 while let Some(event) = link.poll_event() {
                     if let LinkEvent::Text { text, .. } = event {
