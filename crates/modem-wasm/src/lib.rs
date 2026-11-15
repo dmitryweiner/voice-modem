@@ -264,6 +264,13 @@ impl Modem {
         self.0.cancel_file(id)
     }
 
+    /// Bytes the file `id`, offered and not yet sent, goes on the air as:
+    /// fewer than it has when it deflates; undefined for any other id.
+    #[wasm_bindgen(js_name = fileSentBytes)]
+    pub fn file_sent_bytes(&self, id: u32) -> Option<u32> {
+        self.0.file_sent_bytes(id).map(|bytes| bytes as u32)
+    }
+
     /// Seconds a file of `size` bytes takes at the speed of the moment, once
     /// it is accepted and if no frame is lost.
     #[wasm_bindgen(js_name = fileSeconds)]
@@ -503,6 +510,7 @@ mod tests {
         assert_eq!((refused.kind.as_str(), refused.id), ("fileRefused", up));
 
         let lonely = send_file(&mut alice.0, "b.txt", vec![1, 2, 3]).unwrap();
+        assert_eq!(alice.file_sent_bytes(lonely), Some(3));
         assert!(alice.cancel_file(lonely));
         assert!(!alice.cancel_file(lonely));
     }

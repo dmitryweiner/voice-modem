@@ -16,7 +16,9 @@ other side and repeated until it is, up to five times; the sender sees
 name, and a radio with a push-to-talk button is supported: the app asks when
 to press it. A file is offered first and sent once the other side accepts it,
 with the progress and the time left on both screens; a transfer that broke
-off goes on from where it stopped when the file is sent again.
+off goes on from where it stopped when the file is sent again. Texts go
+packed (a Russian one in about 40% of its bytes), files deflated when that
+helps.
 
 Seven modes from 62.5 to 4200 bit/s, chosen by the modem itself from how well
 the other side hears it: tones for noise, distance and phone codecs, and

@@ -306,7 +306,8 @@ these places:
   capabilities field. Frames have a sender but no destination, so the link is
   for two stations. Addressed sessions are not scheduled yet: the first thing
   to need them is more than two stations on a channel.
-- Text is not compressed.
+- Text is packed in a fixed Huffman code over the characters of English and
+  Russian chat (stage 5): deflate gains nothing on texts this short.
 - The core's API is methods (`send_text`, `hello`, `ptt_pressed`), not a
   command enum.
 - The simulator has no fading, packet loss or time stretching yet (stage 6).
@@ -353,8 +354,15 @@ is due; a burst would need a way to tell where it ends. The price: a block
 that arrives after a damaged one is dropped too (go-back, not selective),
 and a frame whose header is lost loses all its blocks.
 
-Still to come in stage 5, each a PR: compression; broadcast with fountain
-codes; encryption.
+Then (2026-11-15) compression: a text goes in a fixed Huffman code with a
+code of its own after a Latin and after a Cyrillic letter when that is
+shorter than its UTF-8 — a Russian text in 36–44% of its bytes, an English
+one in 62–68%; a file goes deflated when that is shorter. Section 7 had
+compression of short messages without saying how; deflate needs repetition
+that a short text does not have.
+
+Still to come in stage 5, each a PR: broadcast with fountain codes;
+encryption.
 
 Where stage 5 started from:
 

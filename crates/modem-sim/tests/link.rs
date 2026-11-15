@@ -312,6 +312,17 @@ fn talk(
     }
 }
 
+/// Bytes that do not deflate, as those of a photo: the file goes on the air as it is.
+fn photo(len: usize) -> Vec<u8> {
+    let mut seed = 11u32;
+    (0..len)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect()
+}
+
 fn station(station: u16) -> Modem {
     Modem::new(Config {
         station,
@@ -440,7 +451,7 @@ fn the_speed_settles_where_the_noise_allows() {
 fn a_file_broken_off_by_interference_goes_on_from_where_it_stopped() {
     let (mut alice, mut bob) = (station(1), station(2));
     let mut noise = [Awgn::new(0.05, 1), Awgn::new(0.05, 2)];
-    let content: Vec<u8> = (0..6000u32).map(|i| (i * 31 + i / 256) as u8).collect();
+    let content = photo(6000);
     alice.send_file("photo.jpg", content.clone()).unwrap();
     let (mut at_alice, mut at_bob) = (Vec::new(), Vec::new());
     // the interference starts when the first chunk has arrived
@@ -538,7 +549,7 @@ fn two_modems_lose_to_a_burst_of_noise_only_what_it_hits() {
     };
     let (mut alice, mut bob) = (fast(1), fast(2));
     let mut noise = [Awgn::new(0.02, 1), Awgn::new(0.02, 2)];
-    let content: Vec<u8> = (0..8000u32).map(|i| (i * 31 + i / 256) as u8).collect();
+    let content = photo(8000);
     alice.send_file("photo.jpg", content.clone()).unwrap();
     let (mut at_alice, mut at_bob) = (Vec::new(), Vec::new());
     // The first frame of more than eight seconds is the first chunk: the

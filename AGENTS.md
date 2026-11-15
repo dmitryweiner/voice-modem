@@ -20,9 +20,10 @@ The shared conventions behind this setup are in `~/projects/CLAUDE.md` and
   modes R2–R4, coherent OFDM modes F1–F3 under an LDPC code, the choice of
   mode by the advice in acknowledgements) are done. Stage 5 (files,
   broadcast, encryption) is under way: file transfer over the two-way link
-  (offer, consent, chunks, cancelling, going on after a break) and several
-  blocks per frame under one acknowledgement are done; compression,
-  broadcast with fountain codes and encryption are next.
+  (offer, consent, chunks, cancelling, going on after a break), several
+  blocks per frame under one acknowledgement and compression (packed texts,
+  deflated files) are done; broadcast with fountain codes and encryption
+  are next.
 
 ## Commands
 
@@ -67,6 +68,9 @@ login shell may put an older one first). Rust — stable with the
 - `cargo run --release -p modem-sim --example files` — what a file costs in
   each mode: the time for 10 and 100 KB and the net speed against the speed
   of the mode. Source of the file table in `docs/measurements.md`.
+- `cargo run --release -p modem-sim --example packing` — chat texts in UTF-8
+  and packed, with their frames in R1; files as they are and deflated.
+  Source of the packing tables in `docs/measurements.md`.
 - `node scripts/codecs.mjs` — the modem through real speech codecs with
   ffmpeg (`--mode r3` or `f1` for another mode, `--keep` keeps the WAV files).
 - `npm run smoke` — the browser smoke, see above.
@@ -123,8 +127,9 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
   again for a slower mode, greetings, push-to-talk, cancelling, the ladder
   of modes and the advice, the blocks a frame takes and which of them
   arrived); `files.rs` — file transfer, pure logic on
-  messages and a clock (offers, consent, chunks, the checksum, going on
-  after a break, the time left); `tx.rs` / `rx.rs` — a frame to samples
+  messages and a clock (offers, consent, chunks, deflate, the checksum,
+  going on after a break, the time left); `text.rs` — texts packed in a
+  fixed Huffman code; `tx.rs` / `rx.rs` — a frame to samples
   and a stream of samples to frames; `sync.rs` — the chirp preamble;
   `mfsk.rs` — tones: several at once, sets of tones in turn against room
   echo; `ofdm.rs` — carriers: training, pilots, the phase loops, soft bits;
@@ -135,7 +140,8 @@ the worker with WASM, audio) → a step in `scripts/smoke.mjs`.
 - `crates/modem-sim` — channel models (noise, band-pass, echo, room
   reverberation, frequency and clock offset, clipping); `tests/link.rs` — the
   modem through them; `examples/sweep.rs`, `examples/modes.rs`,
-  `examples/pause.rs`, `examples/files.rs` — the measurements (see Scripts).
+  `examples/pause.rs`, `examples/files.rs`, `examples/packing.rs` — the
+  measurements (see Scripts).
 - `crates/modem-cli` — the native tool: `lib.rs` (arguments, commands),
   `wav.rs`.
 - `crates/modem-wasm` — the wasm-bindgen wrapper, a thin adapter: `Modem`,

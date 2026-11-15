@@ -236,6 +236,13 @@ impl Modem {
         self.files.cancel(id)
     }
 
+    /// Bytes the file `id`, offered and not yet sent, goes on the air as:
+    /// fewer than it has when it deflates. `file_seconds` of these is how
+    /// long it takes.
+    pub fn file_sent_bytes(&self, id: u32) -> Option<usize> {
+        self.files.sent_bytes(id)
+    }
+
     /// Seconds a file of `size` bytes takes at the speed of the moment, once
     /// it is accepted and if no frame is lost.
     pub fn file_seconds(&self, size: usize) -> u32 {
@@ -790,8 +797,8 @@ mod tests {
                 seconds += 0.02;
             }
             bob.push_rx(&vec![0.0; to as usize]);
-            // two frames of 3.0 and 2.6 s with pauses, whatever the rate
-            assert!((seconds - 6.0f32).abs() < 0.2, "{from}: {seconds} s");
+            // two frames of packed texts with their answers and pauses, whatever the rate
+            assert!((seconds - 5.46f32).abs() < 0.2, "{from}: {seconds} s");
             assert_eq!(
                 texts(&events(&mut bob)),
                 [(1, "any rate"), (1, "twice")],
@@ -828,8 +835,15 @@ mod tests {
         assert!(matches!(&events(&mut bob)[..], [Event::FrameLost { .. }]));
     }
 
+    /// Bytes that do not deflate: the file goes on the air as it is.
     fn file(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i * 31 + i / 256) as u8).collect()
+        let mut seed = 7u32;
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
     }
 
     /// The modem `from` offers a file and `to` accepts it; their ids of the file.
@@ -998,6 +1012,38 @@ mod tests {
         assert_eq!(
             one_way.send_file("notes.txt", file(10)),
             Err(CommandError::NoAnswers)
+        );
+    }
+
+    #[test]
+    fn a_file_that_deflates_takes_the_time_of_what_goes_on_the_air() {
+        let (mut alice, mut bob) = (modem(1), modem(2));
+        let log: Vec<u8> = (0..400)
+            .flat_map(|n| format!("{n:05} heard a frame, {} dB\n", n % 13).into_bytes())
+            .collect();
+        let up = alice.send_file("modem.log", log.clone()).unwrap();
+        let sent = alice.file_sent_bytes(up).unwrap();
+        assert!(sent * 4 < log.len(), "{sent} of {}", log.len());
+        assert_eq!(alice.file_sent_bytes(up + 1), None);
+        run(&mut [&mut alice, &mut bob], 8.0);
+        let Some(Event::FileOffered { id, size, .. }) = events(&mut bob).pop() else {
+            panic!("no offer");
+        };
+        // the receiver is offered the file, not what goes on the air
+        assert_eq!(size as usize, log.len());
+        assert!(bob.accept_file(id));
+        run(&mut [&mut alice, &mut bob], 60.0);
+        assert_eq!(
+            events(&mut bob).last(),
+            Some(&Event::FileReceived {
+                id,
+                name: "modem.log".into(),
+                bytes: log
+            })
+        );
+        assert_eq!(
+            events(&mut alice).last(),
+            Some(&Event::FileDelivered { id: up })
         );
     }
 }

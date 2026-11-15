@@ -133,7 +133,10 @@ try {
     const { page, context } = await app.open({ viewport: VIEWPORTS.phone });
     await coreReady(page);
     await page.click('#mic');
-    await page.locator('#file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('a'.repeat(3000)) });
+    // bytes that do not deflate, as those of a photo
+    let seed = 1;
+    const photo = Buffer.from(Array.from({ length: 3000 }, () => (seed = (seed * 1_664_525 + 1_013_904_223) % 2 ** 32) >>> 24));
+    await page.locator('#file').setInputFiles({ name: 'notes.txt', mimeType: 'application/octet-stream', buffer: photo });
     const note = page.locator('#feed .file.sent small');
     await note.waitFor({ timeout: 5000 }).catch(() => check(false, 'the file is not in the feed'));
     check((await page.locator('#feed .file .text').textContent()) === 'notes.txt', 'the name of the file is wrong');
