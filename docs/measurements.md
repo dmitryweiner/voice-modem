@@ -222,6 +222,36 @@ and R4. The robust modes keep one block per frame: one lasts 8–9 s.
 
 Not measured: long frames between real devices.
 
+## Packing texts and deflating files (2026-11-15)
+
+`cargo run --release -p modem-sim --example packing` — chat texts in UTF-8
+and in the code of `text.rs`, with the frames of R1 they take and the
+seconds of those frames (the acknowledgements come on top: about 2.4 s per
+frame):
+
+| Text                                                      | UTF-8 | Packed | R1 frames, s           |
+| --------------------------------------------------------- | ----- | ------ | ---------------------- |
+| ok                                                        | 2     | 3      | 1, 2.2 (sent as it is) |
+| How do you hear me? Over.                                 | 25    | 17     | 1, 5.2 → 4.2           |
+| Как слышно? Приём.                                        | 32    | 14     | 1, 6.1 → 3.8           |
+| Call me back when you get this message, thanks!           | 47    | 29     | 1, 8.0 → 5.7           |
+| Перезвони, когда получишь это сообщение, спасибо!         | 90    | 32     | 2 → 1, 15.7 → 6.1      |
+| Встречаемся завтра в 10:30 у входа в метро, не опаздывай. | 98    | 38     | 2 → 1, 16.8 → 6.8      |
+| Mixed: модем over the air, 62.5 бит/с — ok? 👍            | 59    | 39     | 1, 9.5 → 7.0           |
+
+- A Russian text takes 36–44% of its UTF-8, where a Cyrillic letter is two
+  bytes; an English one 62–68%. A short Russian message goes in one frame
+  of R1 instead of two: some 20 s of exchange with the acknowledgements
+  become under 10.
+- Files: a log of 63 KB goes as 6.9 KB, JSON of 22 KB as 2.5 KB; random
+  bytes, as a photo or an archive has, go as they are.
+- Found on the way, in the test where both stations send at once: after a
+  collision both waited a random 0.2–1.2 s, and a station hears another
+  only 0.3 s into its frame, so about half of the repeats collided again.
+  In the link model, 16 pairs of stations in 200 (different seeds) lost
+  both texts after five attempts. The wait before each further repeat now
+  doubles: none of the 200 lose them.
+
 ## Mode R1 through speech codecs (2026-11-10)
 
 `node scripts/codecs.mjs` — five messages of 2 to 255 bytes (64 s) through

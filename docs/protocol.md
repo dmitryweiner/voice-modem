@@ -222,11 +222,37 @@ empty payload and unknown types are acknowledged and otherwise ignored.
 | 0 text  | UTF-8 text, cut into segments anywhere, also inside a character; at most 1000 bytes                             |
 | 1 hello | capabilities, 2 bytes (none defined yet: 0), then the name of the station, up to 32 bytes of UTF-8; one segment |
 | 2 file  | a message of the file transfer ([below](#files-filesrs)), at most 4091 bytes                                    |
+| 3 text  | a text packed ([below](#packed-text-textrs)): sent when that is shorter than its UTF-8                          |
 
 A receiver starts a message at a segment with the "first" flag and delivers
 it at the one without "more". A segment adds the bytes from its offset on
 that are not there yet; one that starts beyond what was received drops the
 message, and segments that come without a first one are dropped.
+
+### Packed text (`text.rs`)
+
+Chat in English and Russian, character by character in a fixed Huffman code:
+a Russian text takes about 40% of its UTF-8, an English one 60–70%
+([measurements](measurements.md)). There are two codes, one for after a
+Latin letter (a–z, A–Z) and one for after a Cyrillic one (а–я, ё, А–Я, Ё);
+any other character keeps the code of the letter before it.
+
+- Symbols: 0 is the end of the text, 1 the escape, then the characters of
+  the table `CHARACTERS` in `text.rs`, in its order: space, line feed, the
+  Latin and the Cyrillic letters, digits and punctuation. A character not
+  in the table is the escape and 21 bits of its code point.
+- Each code comes from Huffman's algorithm over the weights of its column
+  in that table (and 2000 for the end, 300 for the escape): the two lightest
+  trees are joined, among equal weights the one made first; leaves are made
+  in the order of the symbols, before any tree. Codes are canonical, as in
+  deflate: shorter codes first, those of one length consecutive in the order
+  of the symbols. The weights are part of the protocol.
+- On the air, most significant bit first: one bit for the code of the start
+  (1: that of the Cyrillic letters; the code of the first letter of the text,
+  Latin when there is none),
+  the code of each character, the end, zero bits up to a whole byte.
+
+A packed text that does not unpack is acknowledged and dropped.
 
 ### Acknowledgement and repeats
 
@@ -245,7 +271,11 @@ message, and segments that come without a first one are dropped.
   acknowledgement + 1 s after its frame ended (10 s more with push-to-talk).
   Then it waits a random 0.2–1.2 s and sends the frame again under the same
   number — the same segment, or its beginning if the mode is slower now and
-  takes less (the rest follows as further segments). After five
+  takes less (the rest follows as further segments). Before each further
+  repeat it waits from 0.2 s up to twice as long as the time before: 2.2 s,
+  4.2 s, 8.2 s. A station hears another one's frame only some 0.3 s after
+  it started, so two stations that collided collide again whenever their
+  waits are that close; in a second, half of them are. After five
   transmissions of a frame the message has failed and what is left of it is
   dropped.
 - The next segment goes out only after the previous one was acknowledged
@@ -307,14 +337,19 @@ A file goes as messages of type 2 over the link layer, each acknowledged
 like a text. The first byte of such a message is its kind, the second the
 number of the transfer, which the sender counts from 0 (0 again after 255):
 
-| Kind     | From     | After the two bytes                                                                          |
-| -------- | -------- | -------------------------------------------------------------------------------------------- |
-| 0 offer  | sender   | length of the file, 4 bytes; CRC-32 of its content, 4 bytes; its name, up to 255 bytes UTF-8 |
-| 1 accept | receiver | the offset the content is wanted from, 4 bytes                                               |
-| 2 data   | sender   | the offset of the chunk in the file, 4 bytes; the chunk                                      |
-| 3 abort  | sender   | nothing: the sender gives the transfer up                                                    |
-| 4 refuse | receiver | nothing: the receiver declines the offer or gives the transfer up                            |
+| Kind     | From     | After the two bytes                                                                                                                        |
+| -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0 offer  | sender   | length of the file, 4 bytes; CRC-32 of its content, 4 bytes; encoding, 1 byte; length on the air, 4 bytes; its name, up to 255 bytes UTF-8 |
+| 1 accept | receiver | the offset on the air the content is wanted from, 4 bytes                                                                                  |
+| 2 data   | sender   | the offset of the chunk on the air, 4 bytes; the chunk                                                                                     |
+| 3 abort  | sender   | nothing: the sender gives the transfer up                                                                                                  |
+| 4 refuse | receiver | nothing: the receiver declines the offer or gives the transfer up                                                                          |
 
+- **On the air** the content goes deflated (RFC 1951, level 9) when that is
+  shorter (encoding 1), or as it is (encoding 0). Offsets and lengths of
+  chunks count the bytes on the air; the progress shown counts bytes of the
+  file in proportion. A receiver declines an offer of an encoding it does
+  not know.
 - The sender offers; nothing of the content goes before the **accept**,
   which is the decision of the human at the receiver. The sender waits for
   it as long as it takes.
@@ -331,13 +366,16 @@ number of the transfer, which the sender counts from 0 (0 again after 255):
   from beyond what it has it answers with an accept that names the offset it
   needs, and the sender goes on from there. To a chunk of a transfer it does
   not know it answers with a refuse.
-- When it has as many bytes as the offer said, the receiver checks the
-  CRC-32 and delivers the file, or drops it if the checksum is wrong. The
+- When it has as many bytes on the air as the offer said, the receiver
+  inflates them if they are deflated (never past the length of the file),
+  checks the length and the CRC-32 and delivers the file, or drops it if
+  either is wrong. The
   sender takes the file for delivered when its last chunk is acknowledged.
 - **Going on after a break.** When a message of the transfer is not
   acknowledged after every attempt, the transfer has failed at the sender;
-  the receiver keeps what it has. An offer with the same name, length and
-  checksum as a file the receiver has in part — from any station, under any
+  the receiver keeps what it has. An offer with the same name, length,
+  checksum, encoding and length on the air as a file the receiver has in
+  part — from any station, under any
   number — continues that file: if it was accepted before, the accept goes
   out at once, with the offset of the first byte that is missing.
 - A receiver keeps at most 8 files offered or unfinished; the oldest gives
@@ -369,5 +407,5 @@ followed by an unreadable header, are reported as "heard but not read".
 
 More bits per carrier and bit loading by carrier, keeping blocks that
 arrive after a damaged one, tracking of the symbol clock inside a frame of tones,
-addressed sessions, compression, files over a one-way channel and
-encryption: see [the plan](../plans/PLAN.md).
+addressed sessions, files over a one-way channel and encryption: see
+[the plan](../plans/PLAN.md).

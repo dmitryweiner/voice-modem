@@ -112,7 +112,10 @@ const PTT_ALLOWANCE: u64 = ms(10_000);
 /// A frame is transmitted at most this many times.
 pub const MAX_ATTEMPTS: u8 = 5;
 /// A repeat waits a random time in this range first, so that two stations
-/// that collided do not collide again.
+/// that collided do not collide again; each further repeat in a range twice
+/// as wide. A station hears another one's frame only some 0.3 s after it
+/// started: two waits closer than that collide again, and in a range of one
+/// second half of them are.
 const BACKOFF: (u64, u64) = (ms(200), ms(1200));
 /// A station that has just transmitted hears nothing for `GUARD_AFTER_TX`:
 /// whoever answers it must start later than that.
@@ -136,6 +139,8 @@ const TYPE_MASK: u8 = 0x0F;
 const TYPE_TEXT: u8 = 0;
 const TYPE_HELLO: u8 = 1;
 const TYPE_FILE: u8 = 2;
+/// A text in the code of `text.rs`, sent when that is shorter than its UTF-8.
+const TYPE_PACKED_TEXT: u8 = 3;
 /// The first segment of a message.
 const FLAG_FIRST: u8 = 0x40;
 /// More segments of the message follow.
@@ -371,10 +376,16 @@ impl Link {
         }
         let id = self.next_message;
         self.next_message += 1;
+        let packed = crate::text::pack(text);
+        let (kind, bytes) = if packed.len() < text.len() {
+            (TYPE_PACKED_TEXT, packed)
+        } else {
+            (TYPE_TEXT, text.as_bytes().to_vec())
+        };
         self.queue.push_back(Outgoing {
             message: Some(id),
-            kind: TYPE_TEXT,
-            bytes: text.as_bytes().to_vec(),
+            kind,
+            bytes,
             done: 0,
         });
         Ok(id)
@@ -597,7 +608,7 @@ impl Link {
             (offset, body) = (usize::from(u16::from_be_bytes(at)), rest);
         }
         match first & TYPE_MASK {
-            kind @ (TYPE_TEXT | TYPE_FILE) => {
+            kind @ (TYPE_TEXT | TYPE_PACKED_TEXT | TYPE_FILE) => {
                 if first & FLAG_FIRST != 0 {
                     peer.partial = Some(Vec::new());
                 }
@@ -616,12 +627,19 @@ impl Link {
                     && !cut
                     && let Some(bytes) = peer.partial.take()
                 {
-                    self.events.push_back(if kind == TYPE_TEXT {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        LinkEvent::Text { from, text }
-                    } else {
-                        LinkEvent::File { from, bytes }
-                    });
+                    let event = match kind {
+                        TYPE_TEXT => Some(LinkEvent::Text {
+                            from,
+                            text: String::from_utf8_lossy(&bytes).into_owned(),
+                        }),
+                        // Its checksums were right: only a station with
+                        // another code sends what does not unpack.
+                        TYPE_PACKED_TEXT => {
+                            crate::text::unpack(&bytes).map(|text| LinkEvent::Text { from, text })
+                        }
+                        _ => Some(LinkEvent::File { from, bytes }),
+                    };
+                    self.events.extend(event);
                 }
             }
             TYPE_HELLO if offset == 0 && !cut => {
@@ -775,7 +793,8 @@ impl Link {
         let id = self.queue.front().and_then(|outgoing| outgoing.message);
         if flight.attempts < MAX_ATTEMPTS {
             let attempt = flight.attempts + 1;
-            let at = now + self.random_in(BACKOFF);
+            let (from, to) = BACKOFF;
+            let at = now + self.random_in((from, from + ((to - from) << (attempt - 2))));
             // Whatever the reason, a slower mode has the better chance.
             if self.config.mode.is_none() {
                 let failed = rung(self.tx_mode);
@@ -945,6 +964,12 @@ mod tests {
         }
     }
 
+    /// A text of `len` bytes that goes as UTF-8: these letters take more
+    /// than eight bits each in the code of `text.rs`.
+    fn unpacked(len: usize) -> String {
+        "xqzj".chars().cycle().take(len).collect()
+    }
+
     fn text(from: u16, text: &str) -> LinkEvent {
         LinkEvent::Text {
             from,
@@ -968,10 +993,10 @@ mod tests {
         let mut air = Air::pair();
         air.links[0].send_text("hello").unwrap();
         air.run(ms(6000));
-        let (_, _, data_at) = air.log[0];
+        let (_, data, data_at) = &air.log[0];
         let (_, ack, ack_at) = &air.log[1];
         assert_eq!((ack.kind, ack.station, ack.seq), (ACK, 1, 0));
-        let pause = ack_at - (data_at + data_len(6));
+        let pause = ack_at - (data_at + data_len(data.payload.len()));
         assert!(
             (ACK_DELAY..ACK_DELAY + 2 * TICK).contains(&pause),
             "{pause}"
@@ -1057,14 +1082,15 @@ mod tests {
     #[test]
     fn a_long_text_goes_in_segments_and_arrives_whole() {
         let mut air = Air::pair();
-        let long: String = "Съешь же ещё этих мягких французских булок, да выпей чаю. ".repeat(4);
-        assert!(long.len() > 3 * 64);
+        let long: String = "Съешь же ещё этих мягких французских булок, да выпей чаю. ".repeat(8);
+        let packed = crate::text::pack(&long);
+        assert!(packed.len() > 3 * 64);
         let id = air.links[0].send_text(&long).unwrap();
-        air.run(ms(90_000));
+        air.run(ms(150_000));
         assert_eq!(air.events[1], [text(1, &long)]);
         assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
-        // 63 bytes in the first frame, 61 after their offset in each of the others
-        let segments = 1 + (long.len() - 63).div_ceil(61);
+        // of the packed text 63 bytes in the first frame, 61 after their offset in each of the others
+        let segments = 1 + (packed.len() - 63).div_ceil(61);
         assert_eq!(
             (air.sent(0, Kind::Data), air.sent(1, ACK)),
             (segments, segments)
@@ -1116,7 +1142,8 @@ mod tests {
     #[test]
     fn a_cancelled_text_is_not_repeated_and_the_next_one_goes() {
         let mut air = Air::pair();
-        air.hears = Box::new(|_, _, frame| frame.payload.last() != Some(&b'?'));
+        // the first data frame and its repeats are lost
+        air.hears = Box::new(|_, _, frame| !(frame.kind == Kind::Data && frame.seq == 0));
         let lost = air.links[0].send_text("anyone?").unwrap();
         let next = air.links[0].send_text("next").unwrap();
         // the first transmission and the wait for its acknowledgement are over, the repeat is not
@@ -1157,7 +1184,7 @@ mod tests {
     #[test]
     fn cancelling_a_long_text_drops_the_rest_of_it() {
         let mut air = Air::pair();
-        let long = air.links[0].send_text(&"a".repeat(180)).unwrap();
+        let long = air.links[0].send_text(&unpacked(180)).unwrap();
         let next = air.links[0].send_text("clean").unwrap();
         // the first segment is acknowledged, the second is on its way
         air.run(ms(13_000));
@@ -1686,9 +1713,7 @@ mod tests {
         });
         // only the tones get through from now on
         air.snr = 5.5;
-        let long: String = (0..600)
-            .map(|i| char::from(b'a' + (i % 26) as u8))
-            .collect();
+        let long = unpacked(600);
         let id = air.links[0].send_text(&long).unwrap();
         air.run(ms(60_000));
         assert_eq!(air.events[1].last(), Some(&text(1, &long)));
@@ -1714,9 +1739,7 @@ mod tests {
             losses -= usize::from(lost);
             !lost
         });
-        let long: String = (0..600)
-            .map(|i| char::from(b'a' + (i % 26) as u8))
-            .collect();
+        let long = unpacked(600);
         let id = air.links[0].send_text(&long).unwrap();
         let next = air.links[0].send_text("and one more").unwrap();
         air.run(ms(90_000));
@@ -1993,5 +2016,108 @@ mod tests {
         );
         link.on_frame(&piece(1, TYPE_TEXT, b"\0\x03de"), QUIET, ms(5000));
         assert_eq!(link.poll_event(), Some(text(2, "abcde")));
+    }
+
+    #[test]
+    fn a_text_goes_packed_when_that_is_shorter() {
+        let mut air = Air::pair();
+        let russian = "Как слышно? Я у окна, приём.";
+        let id = air.links[0].send_text(russian).unwrap();
+        air.run(ms(20_000));
+        assert_eq!(air.events[1], [text(1, russian)]);
+        assert_eq!(air.events[0], [LinkEvent::Delivered { id }]);
+        let (_, frame, _) = &air.log[0];
+        assert_eq!(frame.payload[0], TYPE_PACKED_TEXT | FLAG_FIRST);
+        assert_eq!(frame.payload[1..], crate::text::pack(russian));
+        // 48 bytes of UTF-8 in one frame of R1 instead of a frame and a half
+        assert_eq!(frame.payload.len(), 21);
+    }
+
+    #[test]
+    fn a_text_that_does_not_pack_goes_as_it_is() {
+        let mut air = Air::pair();
+        for unpacked in ["ok", "漢字の文"] {
+            air.links[0].send_text(unpacked).unwrap();
+        }
+        air.run(ms(30_000));
+        assert_eq!(air.events[1], [text(1, "ok"), text(1, "漢字の文")]);
+        let kinds: Vec<u8> = air
+            .log
+            .iter()
+            .filter(|(_, frame, _)| frame.kind == Kind::Data)
+            .map(|(_, frame, _)| frame.payload[0] & TYPE_MASK)
+            .collect();
+        assert_eq!(kinds, [TYPE_TEXT, TYPE_TEXT]);
+    }
+
+    #[test]
+    fn a_packed_text_that_does_not_unpack_is_acknowledged_and_dropped() {
+        let mut link = Link::new(config(1), ACK_LEN);
+        let frame = Frame {
+            kind: Kind::Data,
+            station: 2,
+            seq: 0,
+            // ends before the end of the text
+            payload: vec![TYPE_PACKED_TEXT | FLAG_FIRST, 0xFF],
+        };
+        link.on_frame(&frame, QUIET, 0);
+        assert_eq!(link.poll_event(), None);
+        assert_eq!(link.poll(ACK_DELAY, false).len(), 1);
+    }
+
+    #[test]
+    fn stations_that_collide_draw_apart() {
+        // Both have a text at the same moment: their frames collide, and so
+        // do the repeats while their random waits differ by less than it
+        // takes to hear a frame.
+        for seed in 0..20 {
+            let mut air = Air::new(vec![
+                LinkConfig {
+                    seed: 2 * seed + 1,
+                    ..config(1)
+                },
+                LinkConfig {
+                    seed: 2 * seed + 2,
+                    ..config(2)
+                },
+            ]);
+            let a = air.links[0].send_text("from one").unwrap();
+            let b = air.links[1].send_text("from two").unwrap();
+            air.run(ms(120_000));
+            assert!(
+                air.events[0].contains(&LinkEvent::Delivered { id: a })
+                    && air.events[1].contains(&LinkEvent::Delivered { id: b }),
+                "seed {seed}: {:?}",
+                air.events
+            );
+        }
+    }
+
+    #[test]
+    fn each_repeat_waits_up_to_twice_as_long_as_the_one_before() {
+        let mut longest = [0u64; MAX_ATTEMPTS as usize - 1];
+        for seed in 0..10 {
+            let mut alone = Air::new(vec![LinkConfig { seed, ..config(1) }]);
+            alone.links[0].send_text("anyone?").unwrap();
+            alone.run(ms(120_000));
+            let starts: Vec<u64> = alone.log.iter().map(|&(_, _, at)| at).collect();
+            assert_eq!(starts.len(), usize::from(MAX_ATTEMPTS));
+            let (_, frame, _) = &alone.log[0];
+            let deadline = data_len(frame.payload.len()) + ACK_DELAY + ACK_LEN + ACK_MARGIN;
+            for (repeat, pair) in starts.windows(2).enumerate() {
+                let wait = pair[1] - pair[0] - deadline;
+                let window = (BACKOFF.1 - BACKOFF.0) << repeat;
+                assert!(
+                    (BACKOFF.0..=BACKOFF.0 + window + 2 * TICK).contains(&wait),
+                    "seed {seed}, repeat {repeat}: {wait}"
+                );
+                longest[repeat] = longest[repeat].max(wait);
+            }
+        }
+        // the last waits go well beyond the first window
+        assert!(
+            longest[2] > BACKOFF.1 && longest[3] > 2 * BACKOFF.1,
+            "{longest:?}"
+        );
     }
 }

@@ -465,7 +465,8 @@ mod tests {
             amplitude: 0.5,
         })
         .unwrap();
-        assert_eq!(printed, format!("{clean}: 2 message(s), 8.6 s\n"));
+        // both texts packed: 6 and 10 bytes instead of 13 and 17
+        assert_eq!(printed, format!("{clean}: 2 message(s), 6.8 s\n"));
 
         run(Cli::Channel {
             input: clean.clone(),
@@ -530,8 +531,8 @@ mod tests {
             assert!(report.trim_end().ends_with(text[0].trim_end()), "{name}");
             lengths.push((samples.len() as f32 / 16_000.0).round());
         }
-        // 225 bytes: four frames in R1, two in R2, one in the others
-        assert_eq!(lengths, [38.0, 18.0, 9.0, 5.0, 3.0, 2.0, 2.0]);
+        // 225 bytes, 147 packed: three frames in R1, two in R2, one in the others
+        assert_eq!(lengths, [26.0, 13.0, 6.0, 4.0, 2.0, 2.0, 2.0]);
         assert_eq!(
             parse(args("encode x -o a.wav --mode r5")),
             Err("--mode: no mode \"r5\", there are r1 to r4 and f1 to f3".to_string())

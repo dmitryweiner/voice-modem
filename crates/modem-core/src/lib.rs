@@ -21,6 +21,7 @@ pub mod ofdm;
 pub mod resample;
 pub mod rx;
 pub mod sync;
+pub mod text;
 pub mod tx;
 
 pub use files::{MAX_FILE_BYTES, MAX_FILE_NAME_BYTES};

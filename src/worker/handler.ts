@@ -10,7 +10,9 @@ export interface CoreModem {
   acceptFile(id: number): boolean;
   /** Gives up a file, sent or received, or declines an offer; false when there is no such file any more. */
   cancelFile(id: number): boolean;
-  /** Seconds a file of this size takes at the speed of the moment. */
+  /** Bytes the file with this id, offered and not yet sent, goes on the air as: fewer when it deflates. */
+  fileSentBytes(id: number): number | undefined;
+  /** Seconds a file of this many bytes on the air takes at the speed of the moment. */
   fileSeconds(size: number): number;
   hello(): void;
   pttPressed(): void;
@@ -175,8 +177,9 @@ export function createSession(
         return { type: 'queued', jobId, id: running().modem.sendText(message.text) };
       case 'sendFile': {
         const { modem: current } = running();
-        const seconds = current.fileSeconds(message.bytes.length);
-        return { type: 'fileQueued', jobId, id: current.sendFile(message.name, message.bytes), seconds };
+        const id = current.sendFile(message.name, message.bytes);
+        const seconds = current.fileSeconds(current.fileSentBytes(id) ?? message.bytes.length);
+        return { type: 'fileQueued', jobId, id, seconds };
       }
       case 'acceptFile':
         running().modem.acceptFile(message.id);

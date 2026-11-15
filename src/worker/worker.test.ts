@@ -54,6 +54,10 @@ class FakeModem implements CoreModem {
     this.calls.push(['cancelFile', id]);
     return true;
   }
+  /** A file goes on the air as half of its bytes. */
+  fileSentBytes(id: number) {
+    return id > 40 && id <= 40 + this.files.length ? Math.ceil((this.files[id - 41]?.[1].length ?? 0) / 2) : undefined;
+  }
   fileSeconds(size: number) {
     return size * 2;
   }
@@ -351,12 +355,13 @@ describe('session', () => {
     expect(out).toEqual([{ type: 'done', jobId: 2 }]);
   });
 
-  it('offers a file and returns its id and the time it takes at the speed of the moment', async () => {
+  it('offers a file and returns its id and the time what goes on the air takes at the speed of the moment', async () => {
     const { handle, out, modem } = await startedSession();
     out.length = 0;
     const bytes = new Uint8Array([1, 2, 3]);
     await handle({ type: 'sendFile', jobId: 2, name: 'a.txt', bytes });
-    expect(out).toEqual([{ type: 'fileQueued', jobId: 2, id: 41, seconds: 6 }]);
+    // two bytes on the air, two seconds each
+    expect(out).toEqual([{ type: 'fileQueued', jobId: 2, id: 41, seconds: 4 }]);
     expect(modem.files).toEqual([['a.txt', bytes]]);
     await handle({ type: 'sendFile', jobId: 3, name: '', bytes });
     expect(out[1]).toEqual({ type: 'error', jobId: 3, message: 'a file needs a channel that answers' });
@@ -660,7 +665,8 @@ describe('the WASM core', () => {
       { kind: 'txStart', seconds: expect.closeTo(1.35, 1) },
     ]);
     expect(events(alice.out)).toEqual([
-      { kind: 'txStart', seconds: expect.closeTo(6.44, 1) },
+      // the text packed: 3.6 s of sound instead of 6.4 as UTF-8
+      { kind: 'txStart', seconds: expect.closeTo(3.62, 1) },
       { kind: 'delivered', id: 1 },
       // heard as through a cable: the other side advises the fastest mode, one step up for now
       { kind: 'txMode', mode: 1, bitRate: 125 },
@@ -681,8 +687,9 @@ describe('the WASM core', () => {
     const [alice, bob] = [await realSession('Alice', 100), await realSession('Bob', 200)];
     const bytes = Uint8Array.from({ length: 700 }, (_, index) => (index * 31) % 256);
     await alice.handle({ type: 'sendFile', jobId: 3, name: 'байты.bin', bytes });
-    // 700 bytes in the slowest mode, which is where a station starts
-    expect(alice.out.at(-1)).toEqual({ type: 'fileQueued', jobId: 3, id: 1, seconds: 157 });
+    // the bytes repeat every 256: deflated, they take 69 s in the slowest mode, where a
+    // station starts, instead of the 157 s of 700 bytes as they are
+    expect(alice.out.at(-1)).toEqual({ type: 'fileQueued', jobId: 3, id: 1, seconds: 69 });
     converse(alice, bob, 9);
     expect(events(bob.out).filter((event) => event.kind === 'fileOffer')).toEqual([
       { kind: 'fileOffer', id: 1, name: 'байты.bin', size: 700, station: 100 },
@@ -694,9 +701,8 @@ describe('the WASM core', () => {
     expect(files(bob).at(-1)).toEqual({ kind: 'fileReceived', id: 1, name: 'байты.bin', bytes });
     expect(files(alice)).toEqual([
       { kind: 'fileProgress', id: 1, done: 0, secondsLeft: null },
-      // the speed climbs with every frame: the time left shrinks faster than the clock runs
-      { kind: 'fileProgress', id: 1, done: 121, secondsLeft: expect.any(Number) },
-      { kind: 'fileProgress', id: 1, done: 369, secondsLeft: expect.any(Number) },
+      // the progress counts bytes of the file: the 121 deflated bytes of a frame of R2 are 288 of it
+      { kind: 'fileProgress', id: 1, done: 288, secondsLeft: expect.any(Number) },
       { kind: 'fileDelivered', id: 1 },
     ]);
   });

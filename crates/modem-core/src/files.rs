@@ -5,7 +5,8 @@
 //!
 //! A chunk is a message of its own, cut to one frame of the mode of the
 //! moment, and is handed over only when the link has nothing else to send:
-//! a text typed meanwhile goes first. See `docs/protocol.md`.
+//! a text typed meanwhile goes first. A file that deflates goes deflated.
+//! See `docs/protocol.md`.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -28,6 +29,14 @@ const OP_DATA: u8 = 2;
 const OP_ABORT: u8 = 3;
 /// The receiver declines the offer or gives the transfer up.
 const OP_REFUSE: u8 = 4;
+
+/// How the content goes on the air: the bytes of the file, or deflated
+/// (RFC 1951) when that is shorter.
+const AS_IT_IS: u8 = 0;
+const DEFLATE: u8 = 1;
+/// The level of deflate: the smallest output. A file of a megabyte takes a
+/// fraction of a second, its transfer hours.
+const DEFLATE_LEVEL: u8 = 9;
 
 /// Files offered or partly received that are kept at once.
 const MAX_DOWNLOADS: usize = 8;
@@ -102,15 +111,55 @@ enum Stage {
     Sending,
 }
 
+fn deflate(bytes: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(bytes, DEFLATE_LEVEL)
+}
+
+/// What an offer tells of a file besides its name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    /// Length of the file and the CRC-32 of its content.
+    size: usize,
+    crc: u32,
+    /// `AS_IT_IS` or `DEFLATE`.
+    encoding: u8,
+    /// Bytes of it on the air.
+    sent: usize,
+}
+
+impl Shape {
+    /// `done` bytes on the air as bytes of the file, for the progress.
+    fn in_file(self, done: usize) -> u32 {
+        if self.sent == 0 {
+            return 0;
+        }
+        (done as u64 * self.size as u64 / self.sent as u64) as u32
+    }
+
+    /// The file from the bytes on the air, if they are what the offer said.
+    fn decode(self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let content = match self.encoding {
+            AS_IT_IS => bytes,
+            DEFLATE => {
+                miniz_oxide::inflate::decompress_to_vec_with_limit(&bytes, self.size).ok()?
+            }
+            _ => return None,
+        };
+        (content.len() == self.size && crc32(&content) == self.crc).then_some(content)
+    }
+}
+
 /// A file this station sends.
 struct Upload {
     id: u32,
     /// The number of the transfer on the wire.
     wire: u8,
     name: String,
+    shape: Shape,
+    /// What goes on the air.
     bytes: Vec<u8>,
     stage: Stage,
-    /// Bytes the other side has.
+    /// Bytes on the air the other side has.
     done: usize,
     /// The message of this file the link has now: its token and, for a
     /// chunk, the byte of the file it ends at.
@@ -124,8 +173,8 @@ struct Download {
     from: u16,
     wire: u8,
     name: String,
-    size: usize,
-    crc: u32,
+    shape: Shape,
+    /// The bytes on the air received so far.
     bytes: Vec<u8>,
     accepted: bool,
     pace: Pace,
@@ -185,10 +234,23 @@ impl Files {
         let id = self.id();
         let wire = self.next_wire;
         self.next_wire = wire.wrapping_add(1);
+        let (size, crc) = (bytes.len(), crc32(&bytes));
+        let deflated = deflate(&bytes);
+        let (encoding, bytes) = if deflated.len() < size {
+            (DEFLATE, deflated)
+        } else {
+            (AS_IT_IS, bytes)
+        };
         self.uploads.push_back(Upload {
             id,
             wire,
             name: name[..end].to_owned(),
+            shape: Shape {
+                size,
+                crc,
+                encoding,
+                sent: bytes.len(),
+            },
             bytes,
             stage: Stage::Queued,
             done: 0,
@@ -196,6 +258,15 @@ impl Files {
             pace: Pace::start(0, 0),
         });
         Ok(id)
+    }
+
+    /// Bytes the file `id`, queued to be sent, goes on the air as: fewer
+    /// than it has when it deflates.
+    pub fn sent_bytes(&self, id: u32) -> Option<usize> {
+        self.uploads
+            .iter()
+            .find(|upload| upload.id == id)
+            .map(|upload| upload.shape.sent)
     }
 
     /// Consents to an offered file; false when there is no such offer.
@@ -251,8 +322,11 @@ impl Files {
             Stage::Queued => {
                 upload.stage = Stage::Offering;
                 self.polled = Some(0);
-                let mut bytes = message(OP_OFFER, upload.wire, upload.bytes.len());
-                bytes.extend(crc32(&upload.bytes).to_be_bytes());
+                let shape = upload.shape;
+                let mut bytes = message(OP_OFFER, upload.wire, shape.size);
+                bytes.extend(shape.crc.to_be_bytes());
+                bytes.push(shape.encoding);
+                bytes.extend((shape.sent as u32).to_be_bytes());
                 bytes.extend_from_slice(upload.name.as_bytes());
                 Some(bytes)
             }
@@ -311,12 +385,12 @@ impl Files {
             Stage::Offering => upload.stage = Stage::Offered,
             Stage::Sending => {
                 upload.done = end;
-                let (id, size) = (upload.id, upload.bytes.len());
-                if end < size {
-                    let seconds_left = upload.pace.seconds_left(now, end, size);
+                let (id, sent) = (upload.id, upload.bytes.len());
+                if end < sent {
+                    let seconds_left = upload.pace.seconds_left(now, end, sent);
                     self.events.push_back(FileEvent::Progress {
                         id,
-                        done: end as u32,
+                        done: upload.shape.in_file(end),
                         seconds_left,
                     });
                 } else {
@@ -354,10 +428,23 @@ impl Files {
         match *op {
             OP_OFFER => {
                 if let Some((size, rest)) = number(rest)
-                    && let Some((crc, name)) = rest.split_first_chunk::<4>()
+                    && let Some((crc, rest)) = rest.split_first_chunk::<4>()
+                    && let Some((&encoding, rest)) = rest.split_first()
+                    && let Some((sent, name)) = number(rest)
                 {
-                    let name = String::from_utf8_lossy(name).into_owned();
-                    self.on_offer(from, wire, name, size, u32::from_be_bytes(*crc), now);
+                    let shape = Shape {
+                        size,
+                        crc: u32::from_be_bytes(*crc),
+                        encoding,
+                        sent,
+                    };
+                    if matches!(encoding, AS_IT_IS | DEFLATE) {
+                        let name = String::from_utf8_lossy(name).into_owned();
+                        self.on_offer(from, wire, name, shape, now);
+                    } else {
+                        // From a later version: this one could not read it.
+                        self.outbox.push_back(vec![OP_REFUSE, wire]);
+                    }
                 }
             }
             OP_ACCEPT => {
@@ -396,13 +483,13 @@ impl Files {
             .position(|download| (download.from, download.wire) == (from, wire))
     }
 
-    fn on_offer(&mut self, from: u16, wire: u8, name: String, size: usize, crc: u32, now: u64) {
+    fn on_offer(&mut self, from: u16, wire: u8, name: String, shape: Shape, now: u64) {
         // The same file again: its sender gave up and starts anew. What is
         // here already is not asked for twice.
         if let Some(download) = self
             .downloads
             .iter_mut()
-            .find(|d| d.name == name && d.size == size && d.crc == crc)
+            .find(|d| d.name == name && d.shape == shape)
         {
             (download.from, download.wire) = (from, wire);
             if download.accepted {
@@ -422,8 +509,7 @@ impl Files {
             from,
             wire,
             name: name.clone(),
-            size,
-            crc,
+            shape,
             bytes: Vec::new(),
             accepted: false,
             pace: Pace::start(now, 0),
@@ -432,7 +518,7 @@ impl Files {
             id,
             from,
             name,
-            size: size as u32,
+            size: shape.size as u32,
         });
     }
 
@@ -454,7 +540,7 @@ impl Files {
         if offset < upload.bytes.len() {
             self.events.push_back(FileEvent::Progress {
                 id,
-                done: offset as u32,
+                done: upload.shape.in_file(offset),
                 seconds_left: None,
             });
         } else {
@@ -479,17 +565,17 @@ impl Files {
             return;
         };
         let new = content.get(known..).unwrap_or_default();
-        let new = &new[..new.len().min(download.size - have)];
+        let new = &new[..new.len().min(download.shape.sent - have)];
         if new.is_empty() {
             return;
         }
         download.bytes.extend_from_slice(new);
-        let (id, done, size) = (download.id, download.bytes.len(), download.size);
-        if done < size {
-            let seconds_left = download.pace.seconds_left(now, done, size);
+        let (id, done, shape) = (download.id, download.bytes.len(), download.shape);
+        if done < shape.sent {
+            let seconds_left = download.pace.seconds_left(now, done, shape.sent);
             self.events.push_back(FileEvent::Progress {
                 id,
-                done: done as u32,
+                done: shape.in_file(done),
                 seconds_left,
             });
         }
@@ -498,20 +584,19 @@ impl Files {
 
     fn finish_if_whole(&mut self, index: usize) {
         let download = &self.downloads[index];
-        if !download.accepted || download.bytes.len() < download.size {
+        if !download.accepted || download.bytes.len() < download.shape.sent {
             return;
         }
         let Download {
             id,
             name,
-            crc,
+            shape,
             bytes,
             ..
         } = self.downloads.remove(index);
-        self.events.push_back(if crc32(&bytes) == crc {
-            FileEvent::Received { id, name, bytes }
-        } else {
-            FileEvent::Failed { id }
+        self.events.push_back(match shape.decode(bytes) {
+            Some(bytes) => FileEvent::Received { id, name, bytes },
+            None => FileEvent::Failed { id },
         });
     }
 }
@@ -522,8 +607,15 @@ mod tests {
 
     const SECOND: u64 = SAMPLE_RATE as u64;
 
+    /// Bytes that do not deflate: they go on the air as they are.
     fn content(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i * 7 + i / 256) as u8).collect()
+        let mut seed = 1u32;
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
     }
 
     /// Decides whether a message of a side (0 or 1) is lost for good.
@@ -630,7 +722,10 @@ mod tests {
         assert_eq!(offer[..2], [OP_OFFER, 0]);
         assert_eq!(offer[2..6], 250u32.to_be_bytes());
         assert_eq!(offer[6..10], crc32(&content(250)).to_be_bytes());
-        assert_eq!(&offer[10..], b"notes.txt");
+        // it does not deflate: it goes as it is, as long as it is
+        assert_eq!(offer[10], AS_IT_IS);
+        assert_eq!(offer[11..15], 250u32.to_be_bytes());
+        assert_eq!(&offer[15..], b"notes.txt");
         assert_eq!(pair.events[0], []);
         assert_eq!(
             pair.events[1],
@@ -977,19 +1072,163 @@ mod tests {
         assert_eq!(pair.events[0].last(), Some(&FileEvent::Refused { id: up }));
     }
 
+    /// An offer as another station would send it.
+    fn offer(wire: u8, size: usize, crc: u32, encoding: u8, sent: usize) -> Vec<u8> {
+        let mut offer = message(OP_OFFER, wire, size);
+        offer.extend(crc.to_be_bytes());
+        offer.push(encoding);
+        offer.extend((sent as u32).to_be_bytes());
+        offer.extend_from_slice(b"name");
+        offer
+    }
+
+    /// What a receiver makes of an accepted offer and one chunk with all of the content.
+    fn received(offer: &[u8], content: &[u8]) -> Option<FileEvent> {
+        let mut files = Files::new();
+        files.on_message(2, offer, 0);
+        assert!(files.accept(1, 0));
+        let mut chunk = message(OP_DATA, offer[1], 0);
+        chunk.extend_from_slice(content);
+        files.on_message(2, &chunk, 0);
+        std::iter::from_fn(|| files.poll_event()).last()
+    }
+
     #[test]
     fn content_with_a_wrong_checksum_is_not_delivered() {
+        let offer = offer(3, 4, crc32(b"good"), AS_IT_IS, 4);
+        assert_eq!(received(&offer, b"evil"), Some(FileEvent::Failed { id: 1 }));
+    }
+
+    /// Text that deflates well: lines of a log.
+    fn log(lines: usize) -> Vec<u8> {
+        (0..lines)
+            .flat_map(|n| format!("{n:05} the modem heard a frame, {} dB\n", n % 17).into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_file_that_deflates_goes_deflated() {
+        let mut pair = Pair::new();
+        let content = log(300);
+        let up = pair.files[0].send("modem.log", content.clone()).unwrap();
+        pair.run();
+        let offer = pair.sent(0, OP_OFFER)[0].to_vec();
+        assert_eq!(offer[10], DEFLATE);
+        let sent = u32::from_be_bytes(offer[11..15].try_into().unwrap()) as usize;
+        assert_eq!(sent, deflate(&content).len());
+        assert!(sent * 4 < content.len(), "{sent} of {}", content.len());
+        assert!(pair.files[1].accept(1, pair.now));
+        pair.run();
+        // the chunks carry the deflated bytes
+        let chunks: usize = pair
+            .sent(0, OP_DATA)
+            .iter()
+            .map(|c| c.len() - CHUNK_HEADER)
+            .sum();
+        assert_eq!(chunks, sent);
+        assert_eq!(
+            pair.events[0].last(),
+            Some(&FileEvent::Delivered { id: up })
+        );
+        assert_eq!(
+            pair.events[1].last(),
+            Some(&FileEvent::Received {
+                id: 1,
+                name: "modem.log".into(),
+                bytes: content.clone()
+            })
+        );
+        // progress counts bytes of the file, not of the deflated stream
+        let done: Vec<u32> = pair.events[1]
+            .iter()
+            .filter_map(|e| match e {
+                FileEvent::Progress { done, .. } => Some(*done),
+                _ => None,
+            })
+            .collect();
+        let first = 100 * content.len() / sent;
+        assert!(
+            done[0] as usize + 1 >= first && done[0] as usize <= first,
+            "{done:?}"
+        );
+        assert!(done.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!((*done.last().unwrap() as usize) < content.len());
+    }
+
+    #[test]
+    fn a_file_that_does_not_deflate_goes_as_it_is() {
+        let mut pair = Pair::new();
+        pair.files[0].send("photo.jpg", content(3000)).unwrap();
+        pair.files[0].send("empty", Vec::new()).unwrap();
+        pair.run();
+        let offer = pair.sent(0, OP_OFFER)[0];
+        assert_eq!(
+            (offer[10], &offer[11..15]),
+            (AS_IT_IS, &3000u32.to_be_bytes()[..])
+        );
+    }
+
+    #[test]
+    fn a_deflated_file_goes_on_after_a_break_too() {
+        let mut pair = Pair::new();
+        let content = log(1000);
+        pair.files[0].send("modem.log", content.clone()).unwrap();
+        pair.run();
+        assert!(pair.files[1].accept(1, 0));
+        let mut chunks = 0;
+        pair.lost = Box::new(move |_, bytes| {
+            chunks += usize::from(bytes[0] == OP_DATA);
+            bytes[0] == OP_DATA && chunks == 3
+        });
+        pair.run();
+        let sent_before = pair.sent(0, OP_DATA).len();
+        pair.lost = Box::new(|_, _| false);
+        pair.files[0].send("modem.log", content.clone()).unwrap();
+        pair.run();
+        // asked once, and the first two chunks were not sent again
+        assert_eq!(pair.sent(0, OP_OFFER).len(), 2);
+        let resumed_at = pair.sent(1, OP_ACCEPT).last().unwrap()[2..6].to_vec();
+        assert_eq!(resumed_at, (2 * 100u32).to_be_bytes());
+        assert!(pair.sent(0, OP_DATA).len() > sent_before);
+        assert_eq!(
+            pair.events[1].last(),
+            Some(&FileEvent::Received {
+                id: 1,
+                name: "modem.log".into(),
+                bytes: content
+            })
+        );
+    }
+
+    #[test]
+    fn deflated_content_that_does_not_inflate_to_the_file_is_not_delivered() {
+        let content = log(50);
+        let crc = crc32(&content);
+        let deflated = deflate(&content);
+        // not a deflate stream
+        let junk = vec![0xFF; deflated.len()];
+        let bad = offer(0, content.len(), crc, DEFLATE, junk.len());
+        assert_eq!(received(&bad, &junk), Some(FileEvent::Failed { id: 1 }));
+        // more than the file: the receiver stops at its length
+        let short = offer(0, content.len() - 1, crc, DEFLATE, deflated.len());
+        assert_eq!(
+            received(&short, &deflated),
+            Some(FileEvent::Failed { id: 1 })
+        );
+        // and the right one
+        let good = offer(0, content.len(), crc, DEFLATE, deflated.len());
+        assert!(matches!(
+            received(&good, &deflated),
+            Some(FileEvent::Received { bytes, .. }) if bytes == content
+        ));
+    }
+
+    #[test]
+    fn an_encoding_from_a_later_version_is_declined() {
         let mut files = Files::new();
-        let mut offer = message(OP_OFFER, 3, 4);
-        offer.extend(crc32(b"good").to_be_bytes());
-        offer.extend_from_slice(b"name");
-        files.on_message(2, &offer, 0);
-        assert!(files.accept(1, 0));
-        let mut chunk = message(OP_DATA, 3, 0);
-        chunk.extend_from_slice(b"evil");
-        files.on_message(2, &chunk, 0);
-        let events: Vec<_> = std::iter::from_fn(|| files.poll_event()).collect();
-        assert_eq!(events.last(), Some(&FileEvent::Failed { id: 1 }));
+        files.on_message(2, &offer(4, 10, 0, 7, 10), 0);
+        assert_eq!(files.poll_event(), None);
+        assert_eq!(files.poll(106, true), Some(vec![OP_REFUSE, 4]));
     }
 
     #[test]
@@ -1056,6 +1295,7 @@ mod tests {
             &[][..],
             &[OP_OFFER],
             &[OP_OFFER, 0, 0, 0, 0, 1, 2, 3],
+            &[OP_OFFER, 0, 0, 0, 0, 1, 2, 3, 4, 5, 0, 0, 0],
             &[OP_ACCEPT, 0, 0],
             &[OP_ACCEPT, 0, 0, 0, 0, 9],
             &[OP_DATA, 0, 1],
